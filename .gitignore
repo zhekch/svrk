@@ -1,0 +1,36 @@
+# ---- Secrets ----
+SwissTransit/Resources/Secrets.plist
+.env
+
+# ---- macOS / editor cruft ----
+.DS_Store
+**/.DS_Store
+*.swp
+*~
+
+# ---- Finder / iCloud duplicates ("Foo 2.swift") ----
+* 2.*
+* 3.*
+
+# ---- Xcode & SwiftPM build output ----
+build/
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserdatad/
+*.xcscmblueprint
+*.xccheckout
+
+# ---- stray dir from a misplaced -Xcc flag ----
+SwissTransit.xcodeproj/-Xcc/
+
+# ---- Vendored Mapbox SDK: 297 MB, fetched + SHA-256 verified by
+#      fetch-mapbox-sdk.mjs. Never hand-edited, so never committed.
+Vendor/
+
+# ---- Generated app data: 176 MB of packed binaries, one of them over
+#      GitHub's 100 MB file limit. Produced by the data pipeline.
+SwissTransit/Resources/Data/
+
+# ---- Tests ----
+Packages/TransitCore/Tests/

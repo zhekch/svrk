@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96.48 62.0" width="289.44" height="186.0" color="#f2f2f2">
+  <rect width="100%" height="100%" fill="#161616"/>
+  <g transform="translate(6.0 6.0)">
+    <path d="M 16.73 14.90 Q 28.72 7.00 43.08 7.00 L 80.21 7.00 Q 84.48 7.00 84.48 11.27 L 84.48 33.23 Q 84.48 37.50 80.21 37.50 L 7.41 37.50 Q 2.53 37.50 1.49 32.73 L 1.27 31.70 Q 0.00 25.91 4.95 22.65 Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+    <path d="M 26.978634004086285 14.35632643599002 L 10.319178004086288 25.324126435990017" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity="0.75"/>
+    <circle cx="24.080704000000004" cy="43.5" r="3.6" fill="none" stroke="currentColor" stroke-width="1.3" opacity="0.65"/>
+    <circle cx="74.37" cy="43.5" r="3.6" fill="none" stroke="currentColor" stroke-width="1.3" opacity="0.65"/>
+    <text x="49.22535200000001" y="24.689999999999998" fill="currentColor" font-family="-apple-system, system-ui, sans-serif" font-size="14.639999999999999" font-weight="700" text-anchor="middle" dominant-baseline="central">2</text>
+  </g>
+</svg>
