@@ -155,7 +155,7 @@ public struct FormationKey: Hashable, Sendable {
 // MARK: - What a coach is
 
 /// What kind of vehicle it is, as the short string codes it.
-public enum CoachKind: String, Sendable, Equatable {
+public enum CoachKind: String, Sendable, Equatable, Hashable, Codable {
     case first = "1"
     case second = "2"
     case mixed = "12"

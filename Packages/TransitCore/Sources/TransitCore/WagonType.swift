@@ -52,7 +52,12 @@ public struct WagonType: Hashable, Sendable, Codable, CustomStringConvertible {
     /// its formation intact and its class names missing.
     public init?(_ name: String?) {
         guard let name else { return nil }
-        let folded = name.uppercased().filter { !$0.isWhitespace && $0 != "_" && $0 != "-" }
+        // Whitespace and dashes go; underscores stay. The register uses an
+        // underscore to mark a car's position in a set — `RABe511_6_3` is car
+        // three of a six-car 511 — and dropping it ran the numbers together
+        // into `RABE51163`, which is the same string to a computer and
+        // unreadable to the person the stored evidence is for.
+        let folded = name.uppercased().filter { !$0.isWhitespace && $0 != "-" }
         guard !folded.isEmpty else { return nil }
         self.raw = folded
     }
@@ -90,6 +95,65 @@ public struct WagonType: Hashable, Sendable, Codable, CustomStringConvertible {
     /// double-deck. `RABE511_6_1` and `RABE511_6_4` are one family;
     /// `A` and `A(2E)` are two, because one of them has another floor.
     public var family: String { WagonCatalogue.family(of: self) }
+}
+
+/// One wagon, as the database remembers it.
+///
+/// The whole of what is now written down about a vehicle, and it is worth being
+/// blunt about how little that is. A stored unit used to be fourteen fields —
+/// length, width, cabs, doors, pantographs, deck, joint, nose, stripe — and
+/// thirteen of them were *deductions*, made once from the class name and the
+/// vehicle's place in the train, then repeated on disk for every vehicle of
+/// every train in the country. Six and a half thousand of them came to most of
+/// a megabyte of the app saying what a coach already is.
+///
+/// So the deductions are gone and the evidence stays. `WagonCatalogue.units`
+/// makes all of them again at the moment of drawing, which is both smaller and
+/// strictly better: improve the reading of a name and every record ever
+/// stored improves with it, including ones written by an older build.
+///
+/// Two fields, not one, and the second earns its place twice over.
+///
+/// The register's name is silent about things the *service* states outright.
+/// It does not always say which vehicle is the locomotive — a rake can come
+/// back with every vehicle, engine included, named the same thing — and it
+/// cannot say which car of a multiple unit is the first-class one, because
+/// every car of a `RABe 511` is called a `RABe 511`. Both were being read off
+/// the name, and both were wrong: an engine drawn as a coach, and a whole
+/// train drawn as half first class.
+///
+/// So the service's own word for the vehicle is kept beside the name. One
+/// short enum — `LK`, `2`, `12`, `WR` — which carries the class, the
+/// locomotive and the luggage van in a single field, and which the name is
+/// only consulted about when it is missing.
+public struct StoredWagon: Sendable, Codable, Hashable {
+    /// The register's name for this vehicle — `RABe511_6_3`, `Bpm`, `A(2E)`.
+    /// Nil for a train the realtime system has and the register does not.
+    public var type: WagonType?
+    /// What the formation service called it. Nil falls back to reading the
+    /// name — see `WagonCatalogue.band(of:)` and `kind(of:)`.
+    public var kind: CoachKind?
+
+    public init(type: WagonType?, kind: CoachKind? = nil) {
+        self.type = type
+        self.kind = kind
+    }
+
+    enum CodingKeys: String, CodingKey { case type = "t", kind = "k" }
+
+    /// Written short, because there are thousands of these and the long
+    /// spellings were the file.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(type, forKey: .type)
+        try c.encodeIfPresent(kind, forKey: .kind)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = try c.decodeIfPresent(WagonType.self, forKey: .type)
+        kind = try c.decodeIfPresent(CoachKind.self, forKey: .kind)
+    }
 }
 
 /// What a class name says about the vehicle it names.
@@ -332,6 +396,190 @@ public enum WagonCatalogue {
         if powered { return 18.5 }
         if raw.hasPrefix("D") { return 18.0 }
         return doubleDeck ? 26.8 : 26.4
+    }
+
+    // MARK: - What the register calls a class
+
+    /// Which class a wagon carries, as far as its name gives it away.
+    ///
+    /// Swiss stock is named for what is inside it, which is most of why storing
+    /// the name is enough to draw from. `A` is first, `B` is second, `AB` is
+    /// both, `WR` is the dining car, `D` is the luggage van. A driving trailer
+    /// keeps its class letter and adds a `t`, so a `Bt` is a second-class
+    /// vehicle somebody drives from.
+    ///
+    /// The one case it cannot answer is a car *inside* a multiple unit: a
+    /// `RABe 511` is a first-and-second-class train, and the name of car three
+    /// does not say which of the two that car is. That is why `StoredWagon`
+    /// keeps the band the service reported alongside the name rather than
+    /// trusting this for everything — this is the fallback, not the authority.
+    static func band(of raw: String) -> ClassBand {
+        if isPowered(raw) { return .none }
+        // Checked first: `WR` would otherwise read as a second-class `R`-
+        // something, and the dining car is the one vehicle on a train that a
+        // passenger looks for by colour.
+        if raw.hasPrefix("WR") || raw.hasPrefix("WRB") { return .dining }
+
+        // Only the letters before the first digit or bracket describe the
+        // vehicle; `A4(LBT)` is a first-class coach and the `4` and the tunnel
+        // code say nothing about its class.
+        var prefix = ""
+        for character in raw {
+            guard character.isLetter else { break }
+            prefix.append(character)
+        }
+        let first = prefix.contains("A")
+        let second = prefix.contains("B")
+        switch (first, second) {
+        case (true, true): return .mixed
+        case (true, false): return .first
+        case (false, true): return .second
+        case (false, false): return prefix.hasPrefix("D") ? .none : .second
+        }
+    }
+
+    /// What class the service's own code says the vehicle carries.
+    static func band(of kind: CoachKind) -> ClassBand {
+        switch kind {
+        case .first: return .first
+        case .second: return .second
+        case .mixed: return .mixed
+        case .restaurant, .diningFirst, .diningSecond: return .dining
+        case .locomotive, .luggage, .fictitious, .parked: return .none
+        case .couchette, .sleeper, .family, .classless: return .second
+        }
+    }
+
+    /// What kind of body this is, as the outline cares about it.
+    ///
+    /// The service first, because it states outright what a name can only
+    /// imply — and sometimes contradicts. A rake can come back with every
+    /// vehicle named the same thing, engine included, and read off the name
+    /// alone the locomotive is drawn as one more coach.
+    static func kind(of wagon: StoredWagon) -> UnitKind {
+        switch wagon.kind {
+        case .locomotive: return .locomotive
+        case .luggage: return .van
+        case .some: return .coach
+        case nil: break
+        }
+        guard let type = wagon.type else { return .coach }
+        if traits(of: type).powered { return .locomotive }
+        // A luggage van is a `D` and nothing else — `AD` is a first-class coach
+        // with a luggage compartment, and is drawn as a coach.
+        return type.raw.hasPrefix("D") ? .van : .coach
+    }
+
+    // MARK: - The drawing, from the names alone
+
+    /// A train's wagons, as bodies to be drawn.
+    ///
+    /// The other half of the bargain the database now makes. It writes down
+    /// what each vehicle *is* and nothing about how to draw it, on the
+    /// understanding that this can reconstruct the drawing at any time — so a
+    /// better reading of the same names improves every record ever stored,
+    /// including the ones written by an older build.
+    ///
+    /// Everything positional is worked out here rather than remembered: which
+    /// ends have cabs, which vehicles carry a pantograph, where the couplings
+    /// are. None of that is a property of a wagon, all of it is a property of a
+    /// wagon's place in a train, and storing it per vehicle was storing the
+    /// same deduction several thousand times over.
+    /// - Parameter like: what to make a vehicle look like when its name is not
+    ///   known. A record migrated from an older file has the count and the
+    ///   classes of its wagons and no class names — version 2 never stored them
+    ///   — and drawn from nothing at all every such train came out as a rake of
+    ///   26.4 m coaches, which turns a hundred-metre regional unit into a
+    ///   hundred-and-sixty-metre intercity. The library already knows what the
+    ///   line normally runs, so its own body is a far better guess than a
+    ///   global average, and the count — which *is* real evidence — still
+    ///   comes from the observation. Ignored for any wagon that has a name.
+    public static func units(
+        from wagons: [StoredWagon], like template: VehicleUnit? = nil
+    ) -> [VehicleUnit] {
+        guard !wagons.isEmpty else { return [] }
+        let kinds = wagons.map { kind(of: $0) }
+        let hasLocomotive = kinds.contains(.locomotive)
+
+        /// Whether this end of the train is one somebody drives from.
+        ///
+        /// With no locomotive anywhere the train is a multiple unit and is
+        /// driven from both ends, whatever any vehicle is called — there is
+        /// nothing else in it that could drive it. Letting a name the prefix
+        /// table does not carry veto that is how an EC out of Milano came to be
+        /// drawn with a flat wall across its nose.
+        func driven(_ index: Int) -> Bool {
+            guard hasLocomotive else { return true }
+            if kinds[index] == .locomotive { return true }
+            return wagons[index].type.flatMap { traits(of: $0).driving } ?? true
+        }
+        let cabAtFront = driven(0)
+        let cabAtBack = driven(wagons.count - 1)
+
+        return wagons.enumerated().map { index, wagon in
+            let kind = kinds[index]
+            let leading = index == 0
+            let trailing = index == wagons.count - 1
+            // The name where there is one; the line's usual stock where there
+            // is not; a plain standard-gauge coach where there is neither.
+            let traits = wagon.type.map { self.traits(of: $0) }
+                ?? template.map {
+                    WagonTraits(
+                        doubleDeck: $0.doubleDeck, width: $0.width, nose: $0.nose,
+                        driving: nil, length: $0.length, powered: false
+                    )
+                }
+                ?? .unknown
+
+            // A locomotive has a cab at both ends wherever it is standing.
+            let cabFront = kind == .locomotive ? true : (leading && cabAtFront)
+            let cabBack = kind == .locomotive ? true : (trailing && cabAtBack)
+
+            return VehicleUnit(
+                kind: kind,
+                length: kind == .van ? 18.0 : traits.length,
+                width: traits.width,
+                cabFront: cabFront, cabBack: cabBack,
+                // Only on a vehicle that pulls. A driving trailer has a cab and
+                // no pantograph — it is the unpowered end of the train — so
+                // putting one on every end car drew a Bt as though it were a
+                // railcar.
+                pantographs: kind == .locomotive
+                    ? 2 : (!hasLocomotive && (leading || trailing) ? 1 : 0),
+                doubleDeck: traits.doubleDeck,
+                // What the service said this vehicle is; failing that, what
+                // its name implies; failing both, nothing.
+                band: wagon.kind.map { band(of: $0) }
+                    ?? wagon.type.map { band(of: $0.raw) } ?? .none,
+                doors: kind == .locomotive ? 0 : 2,
+                joint: leading ? .none : .coupler,
+                nose: (cabFront || cabBack) ? traits.nose : nil,
+                type: wagon.type
+            )
+        }
+    }
+
+    /// A whole train, drawn from its wagons' names.
+    public static func layout(
+        of wagons: [StoredWagon], livery: Livery, like template: VehicleUnit? = nil,
+        source: LayoutSource = .observed
+    ) -> VehicleLayout? {
+        let units = units(from: wagons, like: template)
+        guard !units.isEmpty else { return nil }
+        return VehicleLayout(
+            units: units, livery: livery, name: name(units: units), source: source
+        ).resolvingStripes()
+    }
+
+    /// What the train is, in words: "Locomotive + 8 coaches", "6-car unit".
+    public static func name(units: [VehicleUnit]) -> String {
+        let locomotives = units.count { $0.kind == .locomotive }
+        let coaches = units.count - locomotives
+        if locomotives > 0 {
+            let engine = locomotives == 1 ? "Locomotive" : "\(locomotives) locomotives"
+            return "\(engine) + \(coaches) coach\(coaches == 1 ? "" : "es")"
+        }
+        return "\(units.count)-car unit"
     }
 
     // MARK: - Paint

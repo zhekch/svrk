@@ -76,20 +76,28 @@ public struct PatternKey: Hashable, Sendable, Codable {
     }
 }
 
-/// What is known about one train.
+/// What is known about one train: what it was made of, and how often.
+///
+/// Three things, which is all the database turned out to need. The wagons it
+/// was made of, front first — as class names, not as a drawing. How many
+/// observations have agreed. When it was last seen.
+///
+/// Everything else that used to be here was either a deduction or a copy.
+/// The formation was stored as a finished drawing, fourteen fields per
+/// vehicle, thirteen of them read off the class name at the moment it arrived
+/// and then frozen; `WagonCatalogue.units` remakes all of them on demand, so
+/// a better reading now reaches records written months ago. A separate
+/// `matchedLibrary` flag existed only because a confirmation was stored as an
+/// absence rather than as a formation — now that every sighting writes its
+/// wagons down, "the guess held up" is simply an observation like any other,
+/// and the counting below no longer needs a special case for it.
 public struct LayoutRecord: Sendable, Codable, Equatable {
-    /// The formation as the service last gave it. Nil where it drew the same as
-    /// the library already thought, which is the common case and not worth a
-    /// second copy of.
-    public var layout: VehicleLayout?
-    /// Whether the library's guess was checked against a real formation and
-    /// held.
-    public var matchedLibrary: Bool
+    /// The vehicles, in the direction of travel, front first.
+    ///
+    /// Empty means the service was asked and had nothing — see `isSilence`.
+    public var wagons: [StoredWagon]
     /// When the service last answered about this train.
     public var seen: Date
-    /// How many units the service said it had, kept even for a match because it
-    /// is the one number worth showing a reader as evidence.
-    public var units: Int
     /// How many observations have agreed with this record.
     ///
     /// The reason a single odd working of the S42 cannot overwrite the line:
@@ -97,40 +105,27 @@ public struct LayoutRecord: Sendable, Codable, Equatable {
     /// once, and the count is what tells them apart.
     public var count: Int
 
-    public init(
-        layout: VehicleLayout?, matchedLibrary: Bool, seen: Date, units: Int,
-        count: Int = 1
-    ) {
-        self.layout = layout
-        self.matchedLibrary = matchedLibrary
+    public init(wagons: [StoredWagon], seen: Date, count: Int = 1) {
+        self.wagons = wagons
         self.seen = seen
-        self.units = units
         self.count = count
     }
 
+    /// How many vehicles the service said it had — the one number worth
+    /// showing a reader as evidence, and now simply a fact about the list
+    /// rather than a field that could disagree with it.
+    public var units: Int { wagons.count }
+
     /// Whether this is a record of the service having nothing to say.
     ///
-    /// Worth keeping, and worth keeping apart from a confirmation. The map asks
+    /// Worth keeping, and worth keeping apart from a sighting. The map asks
     /// about the trains in view a few at a time, and about a third of what it
     /// asks about — a working the realtime system has not filed, a train that
     /// is not running today — comes back empty. Without a note of that, every
     /// sweep asks the same questions again and the quota goes on silences.
-    public var isSilence: Bool { layout == nil && !matchedLibrary && units == 0 }
+    public var isSilence: Bool { wagons.isEmpty }
 
-    enum CodingKeys: String, CodingKey {
-        case layout, matchedLibrary, seen, units, count
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        layout = try c.decodeIfPresent(VehicleLayout.self, forKey: .layout)
-        matchedLibrary = try c.decode(Bool.self, forKey: .matchedLibrary)
-        seen = try c.decode(Date.self, forKey: .seen)
-        units = try c.decode(Int.self, forKey: .units)
-        // A file written before counts existed is one sighting of whatever it
-        // held — the honest default, and what lets the bundled seed load.
-        count = try c.decodeIfPresent(Int.self, forKey: .count) ?? 1
-    }
+    enum CodingKeys: String, CodingKey { case wagons = "w", seen = "s", count = "c" }
 }
 
 /// The learned half of the layout database.
@@ -227,10 +222,16 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         return records.count
     }
 
-    /// How many lines have a correction on file.
+    /// How many lines have a formation on file.
+    ///
+    /// Not "how many have a *correction*", which is what this counted while a
+    /// confirmation was stored as an absence. Every sighting is written down
+    /// now, agreeing ones included, so what this answers is how many lines the
+    /// app has ever been told about — which is the more useful number and the
+    /// one the offline sheet was already labelling it as.
     public var patternCount: Int {
         lock.lock(); defer { lock.unlock() }
-        return patterns.values.filter { $0.layout != nil }.count
+        return patterns.values.filter { !$0.isSilence }.count
     }
 
     // MARK: - Reading
@@ -309,21 +310,33 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         // The third tier is why adding the second cannot make the drawing
         // worse. An hour nobody has observed falls straight through to the
         // line-wide answer, which is exactly what the map drew before.
-        let learned = learnedKey.flatMap { journeys[$0] }
-            ?? pattern.flatMap { key in
-                slot.flatMap { slots[SlotKey(pattern: key, slot: $0)]?.layout }
-                    ?? patterns[key]?.layout
-            }
+        // This journey's own drawing is held exactly as the service gave it,
+        // measured lengths and all, so the train somebody has tapped is drawn
+        // from the register rather than from a class average. The tiers behind
+        // it are stored as names and rebuilt here.
+        let exact = learnedKey.flatMap { journeys[$0] }
+        let remembered: [StoredWagon]? = exact != nil ? nil : pattern.flatMap { key in
+            slot.flatMap { slots[SlotKey(pattern: key, slot: $0)]?.wagons }
+                ?? patterns[key]?.wagons
+        }
         lock.unlock()
 
         let paint = LayoutLibrary.livery(
             operatorName: vehicle.operatorName, mode: vehicle.mode,
             modeColour: modeColour, variant: variant
         )
-        let answer = learned?.painted(paint) ?? LayoutLibrary.layout(
+        // What the library thinks this line runs. Wanted either way: as the
+        // answer when nothing has been learned, and as the shape to lend to a
+        // remembered formation whose wagons have no class names — see the
+        // `like:` parameter on `WagonCatalogue.units`.
+        let guess = LayoutLibrary.layout(
             mode: vehicle.mode, category: vehicle.category, line: vehicle.line,
             operatorName: vehicle.operatorName, modeColour: modeColour, variant: variant
         )
+        let learned = exact ?? remembered.flatMap {
+            WagonCatalogue.layout(of: $0, livery: paint, like: Self.representative(of: guess))
+        }
+        let answer = learned?.painted(paint) ?? guess
 
         lock.lock()
         // A bound, not a measurement: the country cannot produce more distinct
@@ -336,6 +349,19 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         resolved[cacheKey] = answer
         lock.unlock()
         return answer
+    }
+
+    /// The body most typical of a train, for lending to a nameless wagon.
+    ///
+    /// The middle one, not the first. The leading vehicle of nearly every Swiss
+    /// train is the odd one out — a locomotive, a driving trailer, an end car
+    /// with a nose on it — and lending *that* to a rake would draw a train of
+    /// six locomotives. What is wanted is the ordinary coach in the middle,
+    /// which is what most of the train is made of.
+    static func representative(of layout: VehicleLayout) -> VehicleUnit? {
+        let coaches = layout.units.filter { $0.kind != .locomotive }
+        guard !coaches.isEmpty else { return layout.units.first }
+        return coaches[coaches.count / 2]
     }
 
     /// Which slot a working belongs to.
@@ -423,9 +449,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     /// Note that the service was asked about this train and had nothing.
     public func noteSilence(key: LayoutKey, at moment: Date) {
         lock.lock()
-        records[key] = LayoutRecord(
-            layout: nil, matchedLibrary: false, seen: moment, units: 0
-        )
+        records[key] = LayoutRecord(wagons: [], seen: moment)
         dirty = true
         lock.unlock()
     }
@@ -477,10 +501,19 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         mode: Mode, category: String?, line: String, operatorName: String?,
         modeColour: String, slot: TimeSlot? = nil
     ) -> Bool {
-        guard let observed = Self.layout(
-            from: formation, at: moment,
-            livery: LayoutLibrary.livery(operatorName: operatorName, mode: mode, modeColour: modeColour)
-        ) else { return false }
+        let paint = LayoutLibrary.livery(
+            operatorName: operatorName, mode: mode, modeColour: modeColour
+        )
+        // What the service actually said, kept exactly, with the register's own
+        // measured lengths in it. This is the drawing for *this* journey and it
+        // is never written to disk — see `journeys`.
+        guard let observed = Self.layout(from: formation, at: moment, livery: paint)
+        else { return false }
+
+        // What goes on file: the names, and nothing that can be deduced from
+        // them. `WagonCatalogue.units` puts the rest back at drawing time.
+        let wagons = Self.wagons(from: formation, at: moment)
+        guard !wagons.isEmpty else { return false }
 
         let guess = LayoutLibrary.layout(
             mode: mode, category: category, line: line,
@@ -488,10 +521,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         )
         let matches = guess.drawsAlike(observed)
 
-        let incoming = LayoutRecord(
-            layout: matches ? nil : observed, matchedLibrary: matches,
-            seen: moment, units: observed.units.count, count: 1
-        )
+        let incoming = LayoutRecord(wagons: wagons, seen: moment, count: 1)
 
         lock.lock()
         records[key] = incoming
@@ -504,11 +534,29 @@ public final class VehicleLayoutStore: @unchecked Sendable {
             // slots and is not meant to be: it is the answer for every hour
             // nobody has looked at yet, and it stays useful exactly as long as
             // that is most of them.
-            Self.tally(incoming, at: pattern, incumbents: &patterns, challengers: &challengers)
+            // On a tie, the formation the library already expects wins. That
+            // is what lets a line stop being drawn short: one odd working and
+            // one normal one is one sighting each, and without the tiebreak the
+            // odd one would hold the line for having got there first.
+            // Judged on what will actually be drawn, which means parsing the
+            // stored names exactly as the draw path does — the library's own
+            // body lent to any wagon the register did not name. Without the
+            // loan a formation of nameless wagons came out as a rake of 26.4 m
+            // coaches, matched nothing, and the tie never broke.
+            let template = Self.representative(of: guess)
+            let agrees: (LayoutRecord) -> Bool = { record in
+                WagonCatalogue.layout(of: record.wagons, livery: paint, like: template)
+                    .map(guess.drawsAlike) ?? false
+            }
+            Self.tally(
+                incoming, at: pattern, incumbents: &patterns,
+                challengers: &challengers, agreesWithLibrary: agrees
+            )
             if let slot {
                 Self.tally(
                     incoming, at: SlotKey(pattern: pattern, slot: slot),
-                    incumbents: &slots, challengers: &slotChallengers
+                    incumbents: &slots, challengers: &slotChallengers,
+                    agreesWithLibrary: agrees
                 )
             }
         }
@@ -536,7 +584,8 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     /// reason about overlapping access to `self`.
     static func tally<Key: Hashable>(
         _ incoming: LayoutRecord, at key: Key,
-        incumbents: inout [Key: LayoutRecord], challengers: inout [Key: LayoutRecord]
+        incumbents: inout [Key: LayoutRecord], challengers: inout [Key: LayoutRecord],
+        agreesWithLibrary: (LayoutRecord) -> Bool = { _ in false }
     ) {
         if var incumbent = incumbents[key], sameFormation(incumbent, incoming) {
             incumbent.count += 1
@@ -547,7 +596,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         if var rival = challengers[key], sameFormation(rival, incoming) {
             rival.count += 1
             rival.seen = incoming.seen
-            if let incumbent = incumbents[key], beats(rival, incumbent) {
+            if let incumbent = incumbents[key], beats(rival, incumbent, agreesWithLibrary) {
                 incumbents[key] = rival
                 challengers[key] = incumbent
             } else {
@@ -559,7 +608,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
             incumbents[key] = incoming
             return
         }
-        if let incumbent = incumbents[key], beats(incoming, incumbent) {
+        if let incumbent = incumbents[key], beats(incoming, incumbent, agreesWithLibrary) {
             incumbents[key] = incoming
             challengers[key] = incumbent
             return
@@ -569,28 +618,41 @@ public final class VehicleLayoutStore: @unchecked Sendable {
 
     /// Whether two records describe the same formation, for counting.
     ///
-    /// A library confirmation is a formation too: "the S42 is what we thought"
-    /// is the vote that should accumulate against a one-off strengthening.
+    /// A list of class names compared for equality, which is the whole of it.
+    /// This used to compare two finished drawings with a tolerance on every
+    /// length and a special case for "the library was right", because a
+    /// confirmation was stored as the *absence* of a formation. Storing what
+    /// was seen either way turned the question back into the simple one it
+    /// always was: were these the same vehicles, in the same order.
     static func sameFormation(_ a: LayoutRecord, _ b: LayoutRecord) -> Bool {
-        if a.matchedLibrary && b.matchedLibrary { return true }
-        if a.matchedLibrary || b.matchedLibrary { return false }
-        guard let left = a.layout, let right = b.layout else { return false }
-        return left.drawsAlike(right)
+        a.wagons == b.wagons
     }
 
     /// Whether a rival should replace the line's usual formation.
     ///
-    /// Strictly more sightings, with a tie going to the library — so one
-    /// short-formed train and one normal one leaves the line drawn as the
-    /// library already thought, which is the case a correction that is no
-    /// longer needed must not survive.
-    static func beats(_ rival: LayoutRecord, _ incumbent: LayoutRecord) -> Bool {
+    /// Strictly more sightings, with a tie going to whichever formation the
+    /// library already expects — so one short-formed train and one normal one
+    /// leaves the line drawn as the library thought, which is the case a
+    /// correction that is no longer needed must not survive.
+    static func beats(
+        _ rival: LayoutRecord, _ incumbent: LayoutRecord,
+        _ agreesWithLibrary: (LayoutRecord) -> Bool = { _ in false }
+    ) -> Bool {
         if rival.count > incumbent.count { return true }
         if rival.count < incumbent.count { return false }
-        return rival.matchedLibrary && !incumbent.matchedLibrary
+        return agreesWithLibrary(rival) && !agreesWithLibrary(incumbent)
     }
 
-    /// The formation as a drawing.
+    /// The formation as a drawing, exactly as the service gave it.
+    ///
+    /// The same parse every stored formation goes through, with the two things
+    /// the register knows and a class name cannot laid over the top: how long
+    /// this particular vehicle measured, and whether it is shut to passengers
+    /// today. Neither is written down — a length belongs to the class closely
+    /// enough for every other working of the line, and "shut today" is not a
+    /// fact about the line at all — so this is the one drawing in the app that
+    /// is better than what the database can reconstruct, and it is used for the
+    /// one train that has actually been looked up.
     ///
     /// Read at the stop nearest the moment asked about, because a train that
     /// splits is not the same train before and after — the service lists the
@@ -605,132 +667,48 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         else { return nil }
         guard !stop.coaches.isEmpty else { return nil }
 
-        // Which ends of this train are driven from.
-        //
-        // Nothing in the response says so — the service describes what a
-        // passenger finds inside a coach, and a cab is not something a
-        // passenger finds. So it is worked out from the shape of the train,
-        // which is enough because Swiss practice is so uniform.
-        //
-        // A train with no locomotive in it is a multiple unit and is driven
-        // from both ends. A train with one is worked push-pull: the locomotive
-        // end is a locomotive, and the *other* end is a driving trailer, which
-        // is how nearly every loco-hauled passenger train in the country runs.
-        // Both of those were got wrong first by asking only whether a
-        // locomotive was present anywhere: that put a plain wall on the far end
-        // of every hauled rake — the Bt a passenger is standing next to on the
-        // platform at Bern — and, on a rake drawn with its locomotive pushing
-        // at the back, on the front of the train as well.
-        //
-        // Where the rolling-stock register named the class, that wins: `Bt`,
-        // `ABt` and `BDt` are driving trailers by definition and `RABe`,
-        // `RABDe`, `RBDe` and `ETR` are units whose end cars always have a cab.
-        let hasLocomotive = stop.coaches.contains { $0.kind == .locomotive }
-        let leadingCoach = stop.coaches.first
-        let trailingCoach = stop.coaches.last
+        var units = WagonCatalogue.units(from: wagons(from: formation, at: moment))
+        // Both lists come from the same stop's coaches, so they are the same
+        // length; the guard is here so that a future change which breaks that
+        // gives up rather than pairing a coach with somebody else's body.
+        guard units.count == stop.coaches.count else { return nil }
 
-        /// Whether this end of the train is one somebody drives from.
-        ///
-        /// The class name only gets a say where the train has a locomotive in
-        /// it. That is the only case where the question is real — is the far
-        /// end a driving trailer or a plain coach — and it is the case the
-        /// register's names were consulted for.
-        ///
-        /// With no locomotive anywhere, the train is a multiple unit and is
-        /// driven from both ends, whatever any coach is called. There is
-        /// nothing else in it that could drive it. Letting the name veto that
-        /// is how an EC out of Milano came to be drawn with a flat wall across
-        /// its nose: the service named the leading vehicle something the
-        /// prefix table does not carry, the table answered "not driving stock",
-        /// and a seven-car unit lost the one end everybody looks at.
-        func driven(_ coach: Coach?) -> Bool {
-            guard hasLocomotive else { return true }
-            return coach?.kind == .locomotive || (Self.isDrivingStock(coach?.typeName) ?? true)
-        }
-        let cabAtFront = driven(leadingCoach)
-        let cabAtBack = driven(trailingCoach)
-
-        var units: [VehicleUnit] = []
         for (index, coach) in stop.coaches.enumerated() {
-            let isFirst = index == 0
-            let isLast = index == stop.coaches.count - 1
-            units.append(unit(
-                from: coach, leading: isFirst, trailing: isLast,
-                cabAtFront: cabAtFront, cabAtBack: cabAtBack,
-                selfPowered: !hasLocomotive, joint: isFirst ? .none : .coupler
-            ))
+            // The register's own length wherever it has one, which is what
+            // makes a fetched formation draw better than a remembered one: a
+            // real 26.4 m coach next to a real 18.7 m one is a difference the
+            // map can show and a class average can only smooth over.
+            if let measured = coach.length, measured > 4, measured < 60 {
+                units[index].length = measured
+            }
+            units[index].closed = coach.isClosed
         }
 
         return VehicleLayout(
             units: units, livery: livery,
-            name: name(units: units, formation: formation), source: .observed
+            name: WagonCatalogue.name(units: units), source: .observed
         ).resolvingStripes()
     }
 
-    /// One coach, as a body.
-    static func unit(
-        from coach: Coach, leading: Bool, trailing: Bool,
-        cabAtFront: Bool, cabAtBack: Bool, selfPowered: Bool, joint: Joint
-    ) -> VehicleUnit {
-        let kind: UnitKind
-        switch coach.kind {
-        case .locomotive: kind = .locomotive
-        case .luggage: kind = .van
-        default: kind = .coach
+    /// The vehicles of a train, as names to be written down.
+    ///
+    /// Read at the stop nearest the moment asked about, for the same reason
+    /// `layout(from:at:livery:)` is: a train that splits is not the same train
+    /// before and after, and taking the first stop would file the whole train
+    /// as what it is only until it divides.
+    static func wagons(from formation: TrainFormation, at moment: Date) -> [StoredWagon] {
+        let stops = formation.stops.filter { !$0.isEmpty }
+        guard let stop = stops.min(by: { $0.distance(from: moment) < $1.distance(from: moment) })
+            ?? stops.first
+        else { return [] }
+
+        return stop.coaches.map {
+            // The service's own code alongside the register's name. It states
+            // what a name can only imply — which vehicle is the engine, which
+            // car of a unit is the first-class one — and neither is knowable
+            // from the name of a `RABe 511` whose every car is a `RABe 511`.
+            StoredWagon(type: WagonType($0.typeName), kind: $0.kind)
         }
-
-        // See `layout(from:at:livery:)` for how the two ends were decided. A
-        // locomotive has a cab at both ends wherever it is standing.
-        let cabFront = kind == .locomotive ? true : (leading && cabAtFront)
-        let cabBack = kind == .locomotive ? true : (trailing && cabAtBack)
-
-        let band: ClassBand
-        switch coach.kind {
-        case .first: band = .first
-        case .second: band = .second
-        case .mixed: band = .mixed
-        case .restaurant, .diningFirst, .diningSecond: band = .dining
-        case .locomotive, .luggage, .fictitious, .parked: band = .none
-        case .couchette, .sleeper, .family, .classless: band = .second
-        }
-
-        // The class name, read once. Everything below that used to parse the
-        // string separately now reads a field off this — which is how the deck
-        // line, the gauge and the nose came to be able to disagree with each
-        // other about the same vehicle, each having its own copy of the rules.
-        let type = WagonType(coach.typeName)
-        let traits = type.map(WagonCatalogue.traits(of:)) ?? .unknown
-
-        // The register's own length wherever it has one, which is the whole
-        // reason a fetched formation draws better than a guessed one: a real
-        // 26.4 m coach next to a real 18.7 m one is a difference the map can
-        // show and the library can only average over.
-        let length = coach.length.flatMap { $0 > 4 && $0 < 60 ? $0 : nil }
-            ?? (kind == .locomotive ? 18.5 : kind == .van ? 18.0 : traits.length)
-
-        return VehicleUnit(
-            kind: kind, length: length,
-            width: traits.width,
-            cabFront: cabFront, cabBack: cabBack,
-            // Only on a vehicle that pulls. A driving trailer has a cab and no
-            // pantograph — it is the unpowered end of the train — so putting
-            // one on every end car drew a Bt as though it were a railcar.
-            pantographs: kind == .locomotive
-                ? 2 : (selfPowered && (leading || trailing) ? 1 : 0),
-            doubleDeck: traits.doubleDeck,
-            band: band, doors: kind == .locomotive ? 0 : 2,
-            closed: coach.isClosed, joint: joint,
-            // The service says what is inside a coach and never what it looks
-            // like, so the shape of the nose has to come off the class name —
-            // and without it a formation the app had *learned* was drawn worse
-            // than the one it had guessed: an ICE looked up by tapping it lost
-            // the long nose the library gives it untapped.
-            nose: (cabFront || cabBack) ? traits.nose : nil,
-            // The evidence, kept. Everything above is a reading of this, and a
-            // reading can be improved; the name cannot be recovered once it has
-            // been thrown away.
-            type: type
-        )
     }
 
     // MARK: - Reading a class name
@@ -891,13 +869,17 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     ///
     /// 3 is where the stored layout stopped carrying a `Livery` and its units
     /// started carrying a `WagonType`, and where lines gained the per-hour
-    /// tier. A version 2 file is not *wrong* — its formations still draw
-    /// exactly as they did, since every dimension the drawing needs was already
-    /// baked into the units — so rather than discard eight hundred learned
-    /// trains, `scripts/migrate-vehicle-layouts.py` lifts one to this version.
-    /// What it cannot invent is the class names, which version 2 never stored;
-    /// those fill in as each train is next observed.
-    static let version = 3
+    /// tier. 4 is where a unit stopped writing down the fields that hold their
+    /// default — which took the bundled database from 1.4 MB to 640 kB without
+    /// losing a fact, since an absent field is one that was ordinary.
+    ///
+    /// Neither older file is *wrong*: its formations still draw exactly as they
+    /// did, because every dimension the drawing needs was already baked into
+    /// the units. So rather than discard eight hundred learned trains,
+    /// `scripts/migrate-vehicle-layouts.py` lifts a version 2 or 3 file to this
+    /// one. What it cannot invent is the class names, which version 2 never
+    /// stored; those fill in as each train is next observed.
+    static let version = 5
 
     /// How long a "the service has nothing for this train" note stands.
     static let silenceLife: TimeInterval = 7 * 24 * 3600

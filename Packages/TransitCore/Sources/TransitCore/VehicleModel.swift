@@ -59,13 +59,22 @@ public struct VehicleModelKey: Hashable, Sendable {
         livery: Livery, headLamps: Bool = false, tailLamps: Bool = false
     ) {
         self.unit = unit
-        // Folded to the class, because the raw register name is finer than a
-        // shape. An eight-car unit arrives as eight names — `RABe515_6_1` up to
-        // `_6_8` — for what is at most two distinct bodies, and a key that kept
-        // them apart would bake, upload and hold eight copies of one mesh. The
-        // name is still on the unit in the layout, where it is evidence; here
-        // it is only allowed to be as specific as the drawing is.
-        self.unit.type = unit.type?.canonical
+        // The class name is dropped, not folded, and that is deliberate.
+        //
+        // A mesh is baked once per distinct key and held for the life of the
+        // process, so the key must contain exactly what changes the geometry
+        // and nothing else. `VehicleMesh` never reads a wagon's type: it builds
+        // a body from length, width, deck, nose, cabs, doors and pantographs,
+        // all of which the catalogue has already worked out from the type by
+        // the time a unit exists. Leaving the name in the key therefore bought
+        // nothing and cost real memory — two classes with the same dimensions
+        // would bake two byte-identical meshes and hold both.
+        //
+        // The day a per-class model arrives — an actual KISS silhouette rather
+        // than "a double-decker of this length" — this is where it goes back
+        // in, because then the type really will change the geometry. Until it
+        // does, the key stays as small as the drawing is.
+        self.unit.type = nil
         self.mode = mode
         self.front = front
         self.back = back

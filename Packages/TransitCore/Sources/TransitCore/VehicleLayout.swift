@@ -197,6 +197,73 @@ public struct VehicleUnit: Sendable, Codable, Hashable {
     public static let busWidth = 2.55
 }
 
+// MARK: - Writing a unit down
+
+// A unit written out in full is 185 bytes of JSON, and 6,500 of them are most
+// of a megabyte and a half. Nearly all of that is fields saying what a coach
+// already is: 2.9 metres wide, two doors, no pantograph, coupled to the one in
+// front, no cab, single-deck, no class band. The synthesised `Codable` has no
+// way of knowing which of those are worth saying, so it says all of them, for
+// every vehicle on every train in the country.
+//
+// So the encoding leaves out anything that already holds its default value and
+// the decoding puts it back. The median unit goes from twelve fields to four,
+// and the bundled database from 1.4 MB to about 640 kB, with not one fact lost:
+// a field that is absent is a field that was ordinary.
+//
+// This is the same idea as dropping the livery. The file should carry what is
+// true of *this* train and nothing that is true of trains in general.
+extension VehicleUnit {
+    enum CodingKeys: String, CodingKey {
+        case kind, length, width, cabFront, cabBack, pantographs, doubleDeck
+        case band, doors, closed, joint, nose, type, stripe
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        // The two that every unit has to state: nothing sensible to default a
+        // kind or a length to, and both differ on nearly every vehicle anyway.
+        try c.encode(kind, forKey: .kind)
+        try c.encode(length, forKey: .length)
+
+        if width != VehicleUnit.standardGaugeWidth { try c.encode(width, forKey: .width) }
+        if cabFront { try c.encode(cabFront, forKey: .cabFront) }
+        if cabBack { try c.encode(cabBack, forKey: .cabBack) }
+        if pantographs != 0 { try c.encode(pantographs, forKey: .pantographs) }
+        if doubleDeck { try c.encode(doubleDeck, forKey: .doubleDeck) }
+        if band != .none { try c.encode(band, forKey: .band) }
+        if doors != 2 { try c.encode(doors, forKey: .doors) }
+        if closed { try c.encode(closed, forKey: .closed) }
+        if joint != .coupler { try c.encode(joint, forKey: .joint) }
+        if stripe != .none { try c.encode(stripe, forKey: .stripe) }
+        try c.encodeIfPresent(nose, forKey: .nose)
+        try c.encodeIfPresent(type, forKey: .type)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // The defaults here must be the same defaults `encode(to:)` omits on,
+        // and the same ones `init(kind:length:...)` applies. Three copies of one
+        // list is how a format quietly starts losing things, so any change to a
+        // default belongs in all three at once.
+        kind = try c.decode(UnitKind.self, forKey: .kind)
+        length = try c.decode(Double.self, forKey: .length)
+        width = try c.decodeIfPresent(Double.self, forKey: .width)
+            ?? VehicleUnit.standardGaugeWidth
+        cabFront = try c.decodeIfPresent(Bool.self, forKey: .cabFront) ?? false
+        cabBack = try c.decodeIfPresent(Bool.self, forKey: .cabBack) ?? false
+        pantographs = try c.decodeIfPresent(Int.self, forKey: .pantographs) ?? 0
+        doubleDeck = try c.decodeIfPresent(Bool.self, forKey: .doubleDeck) ?? false
+        band = try c.decodeIfPresent(ClassBand.self, forKey: .band) ?? .none
+        doors = try c.decodeIfPresent(Int.self, forKey: .doors) ?? 2
+        closed = try c.decodeIfPresent(Bool.self, forKey: .closed) ?? false
+        joint = try c.decodeIfPresent(Joint.self, forKey: .joint) ?? .coupler
+        stripe = try c.decodeIfPresent(Stripe.self, forKey: .stripe) ?? .none
+        nose = try c.decodeIfPresent(Nose.self, forKey: .nose)
+        type = try c.decodeIfPresent(WagonType.self, forKey: .type)
+    }
+}
+
 /// The colours a vehicle is painted in.
 ///
 /// Held as CSS hex strings rather than as a colour type because the far end of
