@@ -76,7 +76,7 @@ struct TransitMap: UIViewRepresentable {
     func makeCoordinator() -> MapCoordinator { MapCoordinator(model: model) }
 
     func makeUIView(context: Context) -> MapView {
-        // Where the map was left, or where the phone already knows it is, or
+        // Where the phone already knows it is, or where the map was left, or
         // the country. Read from the model rather than resolved here, because
         // the fleet was drawn for this exact camera and the two disagreeing
         // would mean opening on a viewport the timetable was not expanded for.

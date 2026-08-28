@@ -14,16 +14,18 @@ import UIKit
 ///
 /// Three sources, in order, and the order is the point:
 ///
-/// - **Where the map was left.** Instant, needs no permission, and after the
-///   first session it is a better guess at where somebody is than a fix is —
-///   people open a transit app to look at the same few places.
-/// - **The last location the system already has.** `CLLocationManager.location`
-///   is a cached fix read synchronously; it is not a request, and it does not
-///   wait. Waiting for a real fix would put a GPS lock on the critical path of
-///   a launch, which is the opposite of the point.
-/// - **The country.** No stored camera, no fix, or no permission: the map opens
-///   the way it always did, and the timetable is expanded nationally because at
-///   zoom 7.4 there is nothing to clip away.
+/// - **Where the phone is.** `CLLocationManager.location` is a cached fix read
+///   synchronously; it is not a request, and it does not wait. Waiting for a
+///   real fix would put a GPS lock on the critical path of a launch, which is
+///   the opposite of the point. It comes first because somebody opening a
+///   transit map is nearly always asking what is around *them* now — the view
+///   they left is where they were looking, not where they are, and a map that
+///   opens on last night's city has to be dragged back before it is any use.
+/// - **Where the map was left.** Instant, needs no permission, and the only
+///   answer there is when the fix is missing, stale, refused, or abroad.
+/// - **The country.** No fix, no stored camera: the map opens the way it always
+///   did, and the timetable is expanded nationally because at zoom 7.4 there is
+///   nothing to clip away.
 struct OpeningCamera {
     var lat: Double
     var lon: Double
@@ -72,8 +74,12 @@ struct OpeningCamera {
     )
 
     static func resolve() -> OpeningCamera {
-        if let remembered = Settings.camera() { return remembered }
         if let fix = lastKnownFix() {
+            // North and flat, at the local zoom, rather than the angle and the
+            // zoom of the last session: this is a camera on a different place,
+            // and inheriting half of an old one would open somewhere nobody
+            // chose — a station-level zoom dropped on a valley, or a pitched
+            // view of a city the fix is not in the middle of.
             return OpeningCamera(
                 lat: fix.latitude, lon: fix.longitude, zoom: localZoom,
                 bearing: 0, pitch: 0,
@@ -81,6 +87,7 @@ struct OpeningCamera {
                 where_: .located
             )
         }
+        if let remembered = Settings.camera() { return remembered }
         return country
     }
 
