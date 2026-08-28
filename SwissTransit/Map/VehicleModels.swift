@@ -374,7 +374,8 @@ enum VehicleModels {
     ///
     /// `names` is what the style calls each mesh; a placement whose mesh has
     /// not been registered yet is simply left out, and its vehicle keeps its
-    /// flat drawing for another frame or two. See `VehicleModelStore.perTick`.
+    /// flat drawing for another frame or two while the mesh is built on a
+    /// background thread. See `VehicleModelStore.inFlight`.
     /// The second half of the answer is *which vehicles these are*, and the
     /// flat drawing needs it: a vehicle standing up as a model is not painted
     /// on the ground as well. It cannot be asked for in advance — a wagon whose
