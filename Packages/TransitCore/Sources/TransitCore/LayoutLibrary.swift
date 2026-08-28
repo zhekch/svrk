@@ -70,14 +70,29 @@ public enum LayoutLibrary {
         // side and a white flash. One colour, so no band.
         "THU": Livery(body: "#5aa832", roof: "#9aa1ab", trim: "#ffffff", glass: "#22332a", stroke: "#255214"),
         "THURBO": Livery(body: "#5aa832", roof: "#9aa1ab", trim: "#ffffff", glass: "#22332a", stroke: "#255214"),
-        "TPF": Livery(body: "#e30613", roof: "#9aa1ab", trim: "#ffffff", glass: "#2b3440", stroke: "#79070c"),
+        // Fribourg. A tpf vehicle is white with red on it, not a red
+        // vehicle: the buses carry a red front and a red tail on a white
+        // body, and the RER's FLIRTs are white under a red band.
+        "TPF": Livery(body: "#f1f3f5", roof: "#9aa1ab", trim: "#e3051b", glass: "#2b3440", stroke: "#8d1119", belt: "#e3051b"),
         "MOB": Livery(body: "#00539b", roof: "#9aa1ab", trim: "#f0c419", glass: "#22303f", stroke: "#00294d", belt: "#f0c419"),
         "ZB": Livery(body: "#e30613", roof: "#9aa1ab", trim: "#ffffff", glass: "#2b3440", stroke: "#79070c"),
-        "AB": Livery(body: "#005ca9", roof: "#9aa1ab", trim: "#ffffff", glass: "#22303f", stroke: "#003257", belt: "#eef1f4"),
-        "SZU": Livery(body: "#0069b4", roof: "#9aa1ab", trim: "#ffffff", glass: "#22303f", stroke: "#00395f", belt: "#eef1f4"),
-        "TRN": Livery(body: "#009ee0", roof: "#9aa1ab", trim: "#ffffff", glass: "#22303f", stroke: "#005a80"),
-        "MBC": Livery(body: "#005ca9", roof: "#9aa1ab", trim: "#ffffff", glass: "#22303f", stroke: "#003257"),
-        "TRAVYS": Livery(body: "#004f9f", roof: "#9aa1ab", trim: "#ffcc00", glass: "#22303f", stroke: "#002d5a"),
+        // Appenzeller Bahnen are red and always have been — the blue here
+        // was simply wrong. The Tango sets running through St. Gallen are red
+        // with a white flash along the skirt.
+        "AB": Livery(body: "#d3232e", roof: "#9aa1ab", trim: "#ffffff", glass: "#2b3440", stroke: "#7c1119", belt: "#f0f1f3"),
+        // The Sihltal and Uetliberg lines are red, top to bottom: a Re 456
+        // and a rake of red double-deckers, with white only around the
+        // windows. Blue was a guess and it was the wrong one.
+        "SZU": Livery(body: "#d5232a", roof: "#9aa1ab", trim: "#ffffff", glass: "#2b3440", stroke: "#7c1119"),
+        // transN: white with a lime green front and skirt, on the FLIRTs and
+        // the buses alike.
+        "TRN": Livery(body: "#f0f2f4", roof: "#9aa1ab", trim: "#78be20", glass: "#22332a", stroke: "#3f6b1a", belt: "#78be20"),
+        // Morges–Bière–Cossonay: white with a green band carried round the
+        // cab.
+        "MBC": Livery(body: "#f0f2f4", roof: "#9aa1ab", trim: "#00a04a", glass: "#22332a", stroke: "#1d5c33", belt: "#00a04a"),
+        // TRAVYS runs unpainted-looking silver-white stock with the red
+        // wordmark and nothing else on it.
+        "TRAVYS": Livery(body: "#e4e7ea", roof: "#9aa1ab", trim: "#d81e30", glass: "#2b3440", stroke: "#5b6169"),
         "RA": Livery(body: "#e2001a", roof: "#9aa1ab", trim: "#ffffff", glass: "#2b3440", stroke: "#7a000e"),
 
         // The road. PostAuto's yellow is the single most recognisable livery in
@@ -94,16 +109,78 @@ public enum LayoutLibrary {
         // Basel: BVB green under a cream band, which is the oldest continuous
         // livery in the country and has outlived four generations of tram.
         "BVB": Livery(body: "#009640", roof: "#a2a7ad", trim: "#f5efdd", glass: "#22332a", stroke: "#005524", belt: "#f5efdd"),
-        "BLT": Livery(body: "#ffd500", roof: "#c9b23b", trim: "#005ca9", glass: "#2b3440", stroke: "#8a7300"),
+        // Baselland Transport: yellow with a red waist stripe, which is what
+        // separates a BLT Tango from the BVB green it shares track with. The
+        // blue trim here belonged to no vehicle BLT has ever run.
+        "BLT": Livery(body: "#ffd400", roof: "#c9b23b", trim: "#e2001a", glass: "#2b3440", stroke: "#8a7300", belt: "#e2001a"),
         "TPG": Livery(body: "#f39200", roof: "#c08536", trim: "#ffffff", glass: "#2b3440", stroke: "#8a5300"),
-        "TL": Livery(body: "#e30613", roof: "#a2a7ad", trim: "#ffffff", glass: "#2b3440", stroke: "#79070c"),
-        "VBL": Livery(body: "#e2001a", roof: "#a2a7ad", trim: "#ffffff", glass: "#2b3440", stroke: "#7a000e"),
-        "VBSG": Livery(body: "#e2001a", roof: "#a2a7ad", trim: "#ffffff", glass: "#2b3440", stroke: "#7a000e"),
+        // Lausanne is not a red company. A tl trolleybus is white with a
+        // deep blue roof cap and a blue skirt at the front, and so is the rest
+        // of the fleet. See `stockLivery` for the two metro lines, which are
+        // different again.
+        "TL": Livery(body: "#f2f4f7", roof: "#a2a7ad", trim: "#1c3f94", glass: "#22303f", stroke: "#16305f", belt: "#1c3f94"),
+        // Lucerne is white and blue, and has been for forty years. The
+        // trolleybuses on the Seebrücke are a white body under a blue band —
+        // the fleet was mainly blue and is now mainly white — and drawing them
+        // red put a colour on the busiest square in central Switzerland that
+        // is not on any vehicle in it.
+        "VBL": Livery(body: "#f3f5f8", roof: "#a2a7ad", trim: "#0a4f9c", glass: "#22303f", stroke: "#0a3466", belt: "#0a4f9c"),
+        // St. Gallen: white with a red band at the waist and a dark cap over
+        // the windscreen. Red is the right colour and it is the *band*, not
+        // the vehicle.
+        "VBSG": Livery(body: "#f3f4f6", roof: "#a2a7ad", trim: "#e2001a", glass: "#2b3440", stroke: "#7a000e", belt: "#e2001a"),
         "AAR": Livery(body: "#005ca9", roof: "#a2a7ad", trim: "#ffffff", glass: "#22303f", stroke: "#003257"),
+
+        // The mountain, which until now had no colours at all — every rack
+        // railway and every gondola in the country fell through to the mode
+        // palette and came out the same orange. These are the fleets a visitor
+        // to Switzerland is most likely to be looking at, and no two of them
+        // are painted alike.
+        //
+        // Rigi Bahnen. Deep red bodies under a *cream roof* that is most of
+        // what one sees from above and from a hillside — the open-sided
+        // trailers are more roof than body. The two lines up the mountain are
+        // painted differently from each other (Vitznau red, Arth-Rigi blue and
+        // white) and the register files both under `RB`, so the red is the one
+        // that is right more often.
+        "RB": Livery(body: "#a01c22", roof: "#e6e1d2", trim: "#efe9d8", glass: "#2b3440", stroke: "#5e0f13"),
+        // The Pilatus railway: the steepest in the world, and a deep crimson.
+        "PB": Livery(body: "#b01329", roof: "#8d9298", trim: "#f2f2f2", glass: "#2b3440", stroke: "#66091a"),
+        // Jungfraubahn, in the cream-over-ochre it has worn up the Eiger since
+        // before anybody photographed it in colour.
+        "JB": Livery(body: "#c07a24", roof: "#9aa1ab", trim: "#e9dcb4", glass: "#2b3440", stroke: "#6d4413", belt: "#e9dcb4"),
+        // Wengernalpbahn: green under a cream band, with a yellow front.
+        "WAB": Livery(body: "#3f7d3a", roof: "#9aa1ab", trim: "#f0d64a", glass: "#22332a", stroke: "#22461f", belt: "#e6e2c4"),
+        // The Gornergrat, which is not red but a burnt copper-brown — a colour
+        // nothing else in the country wears, and unmistakable against snow.
+        "GGB": Livery(body: "#a8452a", roof: "#8d9298", trim: "#f0ece4", glass: "#2b3440", stroke: "#5f2415"),
+        // Matterhorn Gotthard: red over a white skirt.
+        "MGB": Livery(body: "#e2001a", roof: "#9aa1ab", trim: "#f2f2f2", glass: "#2b3440", stroke: "#7a000e"),
+        // Montreux–Vevey–Riviera, including the Rochers-de-Naye rack line:
+        // cream over navy.
+        "MVR": Livery(body: "#e8e0c8", roof: "#9aa1ab", trim: "#1e3a6e", glass: "#22303f", stroke: "#16264a", belt: "#1e3a6e"),
+        // Transports Publics du Chablais: a pale grass green.
+        "TPC": Livery(body: "#7ab648", roof: "#9aa1ab", trim: "#ffffff", glass: "#22332a", stroke: "#3f6b1a", belt: "#e6e8d8"),
+        // Brienz Rothorn: dark green carriages behind a steam locomotive.
+        "BRB": Livery(body: "#2f5236", roof: "#7d8489", trim: "#d8cfae", glass: "#22332a", stroke: "#1a2f1e"),
+
+        // The regional companies whose colours were missing rather than wrong.
+        // Zug: white under a blue band, on a fleet that is nearly all bus.
+        "ZVB": Livery(body: "#f2f4f7", roof: "#a2a7ad", trim: "#0a4f9c", glass: "#22303f", stroke: "#0a3466", belt: "#0a4f9c"),
+        // Regionalverkehr Bern-Solothurn: red with a silver band, which is
+        // near enough Bernmobil's colours to be confusing on the ground and
+        // exactly right on the map.
+        "RBS": Livery(body: "#d8232a", roof: "#a2a7ad", trim: "#ffffff", glass: "#2b3440", stroke: "#7a000e", belt: "#e8eaec"),
 
         // Foreign operators reaching into Switzerland, so an ICE through Basel
         // is not painted as an SBB train.
         "DB": Livery(body: "#f4f6f8", roof: "#b3b8bf", trim: "#ec0016", glass: "#2b3440", stroke: "#8c1018", powered: "#f4f6f8", belt: "#ec0016"),
+        // Both spellings. The federal register writes it `ÖBB`, and
+        // `uppercased()` leaves the umlaut alone — so the ASCII key here has
+        // never once matched a real journey, and every Railjet through Buchs
+        // was painted as whatever the mode palette said.
+        "ÖBB": Livery(body: "#f2f4f6", roof: "#b3b8bf", trim: "#e2002a", glass: "#2b3440", stroke: "#8c1018", powered: "#e2002a", belt: "#e2002a"),
+        "OEBB": Livery(body: "#f2f4f6", roof: "#b3b8bf", trim: "#e2002a", glass: "#2b3440", stroke: "#8c1018", powered: "#e2002a", belt: "#e2002a"),
         "OBB": Livery(body: "#f2f4f6", roof: "#b3b8bf", trim: "#e2002a", glass: "#2b3440", stroke: "#8c1018", powered: "#e2002a", belt: "#e2002a"),
         "SNCF": Livery(body: "#e4e8ee", roof: "#9aa1ab", trim: "#a8022a", glass: "#22303f", stroke: "#4b4f57", powered: "#a8022a", belt: "#8f1a3c"),
         "TI": Livery(body: "#d9dde3", roof: "#9aa1ab", trim: "#b5121b", glass: "#22303f", stroke: "#4b4f57"),
@@ -592,6 +669,12 @@ public enum LayoutLibrary {
         case "RHBRAKE": return (Stock.narrowRake(coaches: 6, coachLength: 16.4, panorama: true), "RhB Ge 4/4 + panorama coaches")
         case "GOLDENPASS": return (Stock.narrowRake(coaches: 5, coachLength: 15.0, panorama: true), "MOB panoramic")
         case "ADLER":   return (Stock.multipleUnit(cars: 4, carLength: 17.5, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "zb ABeh 150 ADLER")
+        case "KOMET":   return (Stock.multipleUnit(cars: 3, carLength: 17.4, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "MGB ABDeh 4/8 Komet")
+        // The catch-all for a metre-gauge company with no entry of its own,
+        // and much better than the standard-gauge FLIRT they used to fall
+        // through to: narrower, shorter, and lower at the roof, which on a
+        // valley floor beside an SBB train is the whole difference.
+        case "NARROW":  return (Stock.multipleUnit(cars: 3, carLength: 16.0, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "Narrow-gauge railcar")
 
         default: return nil
         }
@@ -641,6 +724,11 @@ public enum LayoutLibrary {
         "RHB": "CAPRICORN", "ZB": "ADLER", "MOB": "GOLDENPASS",
         "TPF": "FLIRT", "SZU": "FLIRT", "AB": "GTW", "TRN": "FLIRT",
         "RA": "DOMINO", "MBC": "GTW", "TRAVYS": "DOMINO",
+        // The metre-gauge companies, which used to fall through to a
+        // standard-gauge FLIRT — a vehicle three metres too long and a
+        // quarter of a metre too wide for every line they run on.
+        "MGB": "KOMET", "MVR": "NARROW", "TPC": "NARROW", "BOB": "NARROW",
+        "LEB": "NARROW", "NSTCM": "NARROW", "CJ": "NARROW", "ASM": "NARROW",
     ]
 
     /// Trams and buses, by the operator that runs them.
