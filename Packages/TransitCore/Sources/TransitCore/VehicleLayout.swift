@@ -114,6 +114,24 @@ public enum Nose: String, Sendable, Codable, Hashable {
     /// A tram's front: almost flat, with the corners taken well off. What a
     /// Cobra, a Flexity and a Bem 4/6 all look like from above.
     case blunt
+    /// The long, low nose of a double-deck unit — a KISS, a DTZ, an FV-Dosto.
+    ///
+    /// Its signature is not the plan at all, it is the elevation: the driving
+    /// end is a single storey and the body behind it is two, so the roof steps
+    /// up a metre and a half a few metres back from the windscreen. From a
+    /// tilted camera that step is the most recognisable thing about the
+    /// commonest train in the country, and drawn with the flat `cab` a KISS was
+    /// an IC2000 with a bevel on it. See `VehicleShape.rake`.
+    case wedge
+    /// The short, full, rounded nose Stadler puts on everything: a FLIRT, a
+    /// NINA, a Domino, an Allegra. Wider at the tip than a cab and rounder in
+    /// plan, which is exactly what a one-piece moulded front looks like from
+    /// above.
+    case bulb
+    /// An upright front with the corners rounded off, and nothing else: a rack
+    /// railcar, a funicular, an open trailer. These are vehicles built to climb
+    /// rather than to run, and none of them has a metre of nose to spare.
+    case slab
 }
 
 /// One rigid body in the vehicle.
@@ -152,6 +170,25 @@ public struct VehicleUnit: Sendable, Codable, Hashable {
     public var joint: Joint
     /// What the driving end looks like, where the kind does not decide it.
     public var nose: Nose?
+    /// What shape family this vehicle belongs to.
+    ///
+    /// The one field that changes the geometry which the dimensions do not
+    /// already say, and therefore the one that had to be added rather than
+    /// derived at the point of drawing. `length`, `width` and `doubleDeck`
+    /// describe a *box*; this says whether the box is a rack railcar, a
+    /// gondola, a GTW power module or an intercity coach, all of which stand
+    /// at different heights, are glazed differently and end differently.
+    ///
+    /// An archetype and not a class, deliberately — see `Silhouette`. It is
+    /// read off `type` by `WagonCatalogue` for an observed formation and set
+    /// outright by `LayoutLibrary` for a guessed one, so the two agree about
+    /// what a FLIRT looks like whichever of them drew it.
+    ///
+    /// `.generic` for a vehicle nothing is known about, which is not a
+    /// fallback shape but the *previous* shape: a record migrated from version
+    /// 2 of the database has no class names in it at all, and every such wagon
+    /// has to go on looking exactly as it did.
+    public var silhouette: Silhouette = .generic
     /// What the rolling-stock register calls this vehicle — `RABe511`, `Bt`,
     /// `A(2E)`.
     ///
@@ -172,8 +209,9 @@ public struct VehicleUnit: Sendable, Codable, Hashable {
         cabFront: Bool = false, cabBack: Bool = false, pantographs: Int = 0,
         doubleDeck: Bool = false, band: ClassBand = .none, doors: Int = 2,
         closed: Bool = false, joint: Joint = .coupler, nose: Nose? = nil,
-        type: WagonType? = nil
+        type: WagonType? = nil, silhouette: Silhouette = .generic
     ) {
+        self.silhouette = silhouette
         self.kind = kind
         self.length = length
         self.width = width
@@ -216,7 +254,7 @@ public struct VehicleUnit: Sendable, Codable, Hashable {
 extension VehicleUnit {
     enum CodingKeys: String, CodingKey {
         case kind, length, width, cabFront, cabBack, pantographs, doubleDeck
-        case band, doors, closed, joint, nose, type, stripe
+        case band, doors, closed, joint, nose, type, stripe, silhouette
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -236,6 +274,7 @@ extension VehicleUnit {
         if closed { try c.encode(closed, forKey: .closed) }
         if joint != .coupler { try c.encode(joint, forKey: .joint) }
         if stripe != .none { try c.encode(stripe, forKey: .stripe) }
+        if silhouette != .generic { try c.encode(silhouette, forKey: .silhouette) }
         try c.encodeIfPresent(nose, forKey: .nose)
         try c.encodeIfPresent(type, forKey: .type)
     }
@@ -259,6 +298,11 @@ extension VehicleUnit {
         closed = try c.decodeIfPresent(Bool.self, forKey: .closed) ?? false
         joint = try c.decodeIfPresent(Joint.self, forKey: .joint) ?? .coupler
         stripe = try c.decodeIfPresent(Stripe.self, forKey: .stripe) ?? .none
+        // A record written before this vocabulary existed has no silhouette in
+        // it, and `.generic` is exactly right for one: it says "nothing is
+        // claimed about the shape", which is the truth about a unit whose class
+        // was never stored.
+        silhouette = try c.decodeIfPresent(Silhouette.self, forKey: .silhouette) ?? .generic
         nose = try c.decodeIfPresent(Nose.self, forKey: .nose)
         type = try c.decodeIfPresent(WagonType.self, forKey: .type)
     }

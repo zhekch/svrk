@@ -370,7 +370,12 @@ extension VehicleShape {
         // black stripes". What is actually under a coach is bogies and air
         // tanks in shadow: a dark *gap* the body overhangs, not a plinth the
         // body sits on. Pulled in and lightened, it reads as the gap.
-        let underWidth = unit.kind == .bus ? 0.92 : 0.70
+        // The class's own proportions where the class is known, and the kind's
+        // where it is not. Read once, up here, because both the widths below
+        // and the choice of stack at the bottom want them.
+        let shape = unit.silhouette
+        let bands = shape.bands
+        let underWidth = bands?.underWidth ?? (unit.kind == .bus ? 0.92 : 0.70)
         // The step from the belt to the roof is narrow on purpose.
         //
         // Drawn at 0.76 against a shoulder of 0.93, the top face of the belt
@@ -379,13 +384,13 @@ extension VehicleShape {
         // cant rail on both sides at once, which is a red-roofed train rather
         // than a red-banded one. A real roof does start narrower than the body,
         // but by a gutter's width, not a foot.
-        let roofWidth = unit.doubleDeck ? 0.92 : 0.87
+        let roofWidth = bands?.roofWidth ?? (unit.doubleDeck ? 0.92 : 0.87)
 
         /// The ordinary five-band vehicle: under the floor, the lower side, the
         /// windows, the turn of the shoulder, the roof.
         func banded(
             floor: Double, waist: Double, cant: Double, shoulder: Double, roof: Double,
-            glazed: Bool = true
+            glazed: Bool = true, glassRoof: Bool = false
         ) -> Stack {
             Stack(levels: [
                 level(.chassis, 0, floor, width: underWidth, rake: 0.12, fill: .underframe),
@@ -393,7 +398,12 @@ extension VehicleShape {
                 level(.glazing, waist, cant, width: glazed ? 0.99 : 1.0, rake: 0.30,
                       fill: glazed ? .glass : .livery),
                 level(.shoulder, cant, shoulder, width: 0.965, rake: 0.62, fill: .belt),
-                level(.roof, shoulder, roof, width: roofWidth, rake: 1.0, fill: .roof),
+                // A panorama car's roof is a window, and on a tilted map the
+                // roof is the largest surface a vehicle has. Painted the grey
+                // every other roof gets, a Glacier Express is a rake of grey
+                // boxes with a red stripe — which is what it was.
+                level(.roof, shoulder, roof, width: roofWidth, rake: 1.0,
+                      fill: glassRoof ? .glass : .roof),
             ], beltTop: cant, roofTop: roof)
         }
 
@@ -414,6 +424,30 @@ extension VehicleShape {
                 level(.shoulder, upperCant, shoulder, width: 0.965, rake: 0.68, fill: .belt),
                 level(.roof, shoulder, roof, width: roofWidth, rake: 1.0, fill: .roof),
             ], beltTop: upperCant, roofTop: roof)
+        }
+
+        // The class's own bands win over everything the kind implies.
+        //
+        // Placed before the switch rather than inside it because the switch
+        // answers a coarser question — a coach in tram mode is a tram — and a
+        // class that is known is known more precisely than that. A Rigi rack
+        // railcar is `.coach` in `.cable` mode and it is neither a coach nor a
+        // funicular; a GTW power module is `.coach` and has no windows at all.
+        // Falling through is what `.generic` does, and `.generic` is every
+        // wagon whose class was never written down.
+        if let bands {
+            if let upperWaist = bands.upperWaist, let upperCant = bands.upperCant {
+                return doubleDecked(
+                    floor: bands.floor, lowerWaist: bands.waist, lowerCant: bands.cant,
+                    upperWaist: upperWaist, upperCant: upperCant,
+                    shoulder: bands.shoulder, roof: bands.roof
+                )
+            }
+            return banded(
+                floor: bands.floor, waist: bands.waist, cant: bands.cant,
+                shoulder: bands.shoulder, roof: bands.roof,
+                glazed: shape.isGlazed, glassRoof: shape.hasGlassRoof
+            )
         }
 
         switch unit.kind {
@@ -491,6 +525,20 @@ extension VehicleShape {
         case .cab: return min(2.4, length * 0.17)
         case .streamlined: return min(5.2, length * 0.23)
         case .locomotive: return min(1.5, length * 0.11)
+        // The largest number in this table, and it is the whole reason the
+        // profile exists. A double-deck unit's cab is one storey and its body
+        // is two, so the roof over the driving end is held back six metres from
+        // the tip while the floor is held back barely one — which is a roof
+        // that steps up, and is what a KISS, a DTZ and an FV-Dosto all look
+        // like from anywhere but directly overhead. Drawn with the cab's 2.4 m
+        // they were IC2000 coaches with a bevel.
+        case .wedge: return min(6.2, length * 0.27)
+        // Rounder than a cab and no deeper: the moulding on a FLIRT wraps the
+        // windscreen rather than raking a long way back from it.
+        case .bulb: return min(2.0, length * 0.15)
+        // Upright. A rack railcar's front leans back by about as much as a
+        // house's front door does, which is to say almost nothing.
+        case .slab: return min(0.65, length * 0.07)
         case .tramFront: return min(1.2, length * 0.21)
         case .busFront: return min(1.4, length * 0.13)
         case .busRear: return min(0.55, length * 0.06)
@@ -554,10 +602,26 @@ extension VehicleShape {
         out.reserveCapacity(12)
 
         let stack = stack(for: unit, mode: mode)
+        // What hangs rather than stands, lifted at the very end.
+        //
+        // Applied once here rather than added to every band, door and stripe
+        // above, because it applies to all of them without exception: a gondola
+        // is a rigid body that happens to be forty metres up, and every part of
+        // it is up there together. Doing it in one place is also what makes it
+        // impossible to forget on the next feature somebody adds.
+        let hover = unit.silhouette.hover * heightScale
         func finish() -> UnitMesh {
-            UnitMesh(
-                slabs: out, length: unit.length, width: width,
-                height: out.map(\.top).max() ?? (stack.roofTop * heightScale)
+            let slabs = hover > 0
+                ? out.map { slab -> LocalSlab in
+                    var raised = slab
+                    raised.base += hover
+                    raised.top += hover
+                    return raised
+                }
+                : out
+            return UnitMesh(
+                slabs: slabs, length: unit.length, width: width,
+                height: (out.map(\.top).max() ?? (stack.roofTop * heightScale)) + hover
             )
         }
 
@@ -592,7 +656,40 @@ extension VehicleShape {
         // every one of its nine bodies wearing headlights at the front and tail
         // lamps at the back, a train of nine trains. Where the lamps go is a
         // fact about the formation and only the formation knows it.
-        if lamps.head || lamps.tail,
+        // The arm that holds a gondola on its rope, and the grip on the end of
+        // it.
+        //
+        // Two small blocks, and they do more than any amount of shaping the
+        // cabin could. A rounded pod on its own at eight metres is an object
+        // that happens to be in the air; the same pod with a stalk over it
+        // reading up to a grip is a thing *hanging*, which is the single fact
+        // about an aerial cableway that the map has to get across. The rope
+        // itself is not drawn — it belongs to the line, not to the vehicle, and
+        // a wire one pixel wide is nothing a renderer at this scale can hold.
+        if unit.silhouette == .aerialCabin {
+            let mast = min(0.34, half * 0.30)
+            let along = min(0.5, unit.length * 0.10)
+            let mid = unit.length / 2
+            out.append(LocalSlab(
+                role: .pantograph,
+                rings: [box(x0: mid - mast, x1: mid + mast, y0: -mast, y1: mast)],
+                base: stack.roofTop * heightScale,
+                top: (stack.roofTop + 1.45) * heightScale,
+                fill: equipmentColour
+            ))
+            out.append(LocalSlab(
+                role: .dome,
+                rings: [box(x0: mid - along, x1: mid + along, y0: -mast * 0.8, y1: mast * 0.8)],
+                base: (stack.roofTop + 1.45) * heightScale,
+                top: (stack.roofTop + 1.85) * heightScale,
+                fill: runningGearColour
+            ))
+        }
+        // Not on something that hangs. A gondola carries no headlights and no
+        // tail lamps, and the halo the flat drawing paints over each one is
+        // placed off the ground rather than off the mesh — so a lit cabin would
+        // have had its lamps eight metres below itself.
+        if unit.silhouette.hover == 0, lamps.head || lamps.tail,
            let body = out.first(where: { $0.role == .body }) ?? out.first {
             let z = stack.lampHeight * heightScale
             for front in [true, false] where front ? lamps.head : lamps.tail {
@@ -622,7 +719,7 @@ extension VehicleShape {
         // Emitted from `.trim` rather than from `.full`, because it is doing
         // structural work and has to arrive before any decoration does.
         let solebar = stack.levels.first?.top ?? 0.9
-        if solebar > 0.12, unit.kind != .hull {
+        if solebar > 0.12, unit.kind != .hull, unit.silhouette.hasRunningGear {
             let along = onRoad ? min(2.0, length * 0.16) : min(3.4, length * 0.15)
             let inset = onRoad ? 0.18 : 0.21
             // Both of them in one slab, at the two ends of the same body, so

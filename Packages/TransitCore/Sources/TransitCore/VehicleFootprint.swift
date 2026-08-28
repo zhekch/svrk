@@ -607,7 +607,12 @@ public enum VehicleShape {
             // of the way into whatever end profile this body has, which is
             // where the taper is still wide enough for two lamps to sit on it
             // rather than beside it.
-            if index == 0 || index == layout.units.count - 1 {
+            // Nothing that hangs is lit. A gondola has no headlights, and the
+            // halo is placed off the ground under the vehicle rather than off
+            // the body — so on a cabin flying eight metres up it would be a
+            // pair of lights in the meadow underneath. The mesh makes the same
+            // exclusion; see `VehicleShape.mesh`.
+            if index == 0 || index == layout.units.count - 1, unit.silhouette.hover == 0 {
                 let half = width / 2
                 // The same exaggeration the solid is built with, so the lamps
                 // rise with the vehicle rather than sinking into a body that
@@ -1066,6 +1071,16 @@ public enum VehicleShape {
         /// A locomotive: the same idea as a cab over a much shorter distance,
         /// so the end is nearly flat and the corners are strongly cut.
         case locomotive
+        /// The nose of a double-deck unit: long in plan and, more to the point,
+        /// a storey lower than the body behind it. See `VehicleShape.rake`,
+        /// which is where the step in the roofline actually comes from.
+        case wedge
+        /// The full rounded front Stadler moulds onto a FLIRT, an Allegra or a
+        /// NINA: half as deep again as a cab and much blunter at the tip.
+        case bulb
+        /// An upright front with the corners rounded: a rack railcar, a
+        /// funicular car, an open-sided trailer.
+        case slab
         /// A tram's front: all but flat, with the corners well rounded. A
         /// Cobra, a Flexity, a Bem 4/6 — none of them has a nose.
         case tramFront
@@ -1105,10 +1120,18 @@ public enum VehicleShape {
                 if unit.kind == .bus { return .busRear }
                 return .square(chamfer: min(0.55, unit.width * 0.22))
             }
-            if let nose = unit.nose {
+            // The unit's own nose where it has one; failing that, the one its
+            // shape family implies. The fallback is what lets a class table
+            // state a silhouette once and have both ends of every unit of that
+            // class follow, without every builder in the library having to
+            // repeat the nose beside it.
+            if let nose = unit.nose ?? unit.silhouette.nose {
                 switch nose {
                 case .streamlined: return .streamlined
                 case .blunt: return .tramFront
+                case .wedge: return .wedge
+                case .bulb: return .bulb
+                case .slab: return .slab
                 }
             }
             switch unit.kind {
@@ -1164,6 +1187,18 @@ public enum VehicleShape {
         // train read as a run of identical boxes.
         case .streamlined: return min(max(7.6, corner), length * 0.42)
         case .locomotive: return min(max(2.2, corner), length * 0.28)
+        // Longer than a cab and shorter than a high-speed nose, which is what
+        // an FV-Dosto's front is: about five metres from the windscreen's foot
+        // to the step in the roof behind it.
+        case .wedge: return min(max(4.6, corner), length * 0.26)
+        // A hand deeper than a cab. A FLIRT's front is one moulding and it is
+        // *full* — the width is still most of the body a metre back from the
+        // tip, which is why the tip fraction below matters more than this does.
+        case .bulb: return min(max(3.0, corner), length * 0.24)
+        // Measured against the width, like the tram front it is a cousin of: a
+        // rack railcar's front is a wall with the corners taken off, and it
+        // stays that shape however wide the body is drawn.
+        case .slab: return min(width * 0.30, length * 0.22)
         // Half the width and a bit: the end of a tram is very nearly a
         // semicircle, and that is what it should stay however wide it is drawn.
         case .tramFront: return min(width * 0.5, length * 0.4)
@@ -1252,6 +1287,19 @@ public enum VehicleShape {
             return taper(depth: n, half: half, tip: 0.15, power: 0.58, steps: max(4, steps * 2))
         case .locomotive:
             return taper(depth: n, half: half, tip: 0.50, power: 0.85, steps: steps)
+        case .wedge:
+            // Wide at the tip because it is: the plan of a double-deck unit's
+            // nose is nearly a coach end. What makes it a wedge happens in
+            // elevation, not here.
+            return taper(depth: n, half: half, tip: 0.44, power: 0.70, steps: steps)
+        case .bulb:
+            // Full, and closing late. Below 0.6 the sides run at nearly the
+            // body's width and then turn in hard at the very end, which is
+            // exactly the one-piece moulding on the front of every Stadler
+            // product in the country.
+            return taper(depth: n, half: half, tip: 0.52, power: 0.52, steps: max(3, steps))
+        case .slab:
+            return taper(depth: n, half: half, tip: 0.80, power: 0.62, steps: max(2, steps))
         case .tramFront:
             return taper(depth: n, half: half, tip: 0.74, power: 0.55, steps: max(2, steps))
         case .busFront:
@@ -1538,6 +1586,11 @@ public enum VehicleShape {
     static func hasScreen(_ profile: EndProfile) -> Bool {
         switch profile {
         case .cab, .streamlined, .locomotive, .tramFront, .busFront: return true
+        // All three of the new ends are driving ends and nothing else is
+        // shaped like them: a wedge is the front of a double-deck unit, a bulb
+        // is a moulded railcar front, a slab is the upright face of something
+        // built to climb. None of them is ever drawn on a trailing end.
+        case .wedge, .bulb, .slab: return true
         case .busRear, .square, .gangway, .bow: return false
         }
     }

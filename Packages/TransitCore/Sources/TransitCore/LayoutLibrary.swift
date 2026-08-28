@@ -221,14 +221,21 @@ public enum LayoutLibrary {
         /// somebody is standing next to on a platform half the time.
         public static func pushPull(
             coaches: Int, doubleDeck: Bool = false, coachLength: Double = 26.4,
-            firstClassAtRear: Bool = true, dining: Bool = false
+            firstClassAtRear: Bool = true, dining: Bool = false,
+            coach: Silhouette? = nil, locomotive: Silhouette = .electricLoco
         ) -> [VehicleUnit] {
             var units: [VehicleUnit] = []
             let bodies = max(1, coaches)
+            // What the coaches are shaped like, said once. A deck flag is not
+            // a shape — an IC2000 coach and an EW IV are both "a coach" and
+            // stand half a metre apart at the roof — so the caller may name the
+            // silhouette outright and the deck flag decides it otherwise.
+            let body = coach ?? (doubleDeck ? .doubleDeckCoach : .intercityCoach)
             // The cab car is one of the coaches, not an extra one.
             units.append(VehicleUnit(
                 kind: .drivingCar, length: coachLength, cabFront: true,
-                doubleDeck: doubleDeck, band: .second, doors: doubleDeck ? 2 : 2
+                doubleDeck: doubleDeck, band: .second, doors: doubleDeck ? 2 : 2,
+                silhouette: body
             ))
             for index in 1..<bodies {
                 // First class rides next to the locomotive on nearly every
@@ -240,12 +247,13 @@ public enum LayoutLibrary {
                 else if firstClassAtRear && fromRear <= 2 { band = .first }
                 else { band = .second }
                 units.append(VehicleUnit(
-                    kind: .coach, length: coachLength, doubleDeck: doubleDeck, band: band
+                    kind: .coach, length: coachLength, doubleDeck: doubleDeck, band: band,
+                    silhouette: body
                 ))
             }
             units.append(VehicleUnit(
                 kind: .locomotive, length: 18.5, cabFront: true, cabBack: true,
-                pantographs: 2, band: .none, doors: 0
+                pantographs: 2, band: .none, doors: 0, silhouette: locomotive
             ))
             return units
         }
@@ -255,14 +263,22 @@ public enum LayoutLibrary {
         public static func multipleUnit(
             cars: Int, carLength: Double, width: Double = VehicleUnit.standardGaugeWidth,
             doubleDeck: Bool = false, doors: Int = 2, dining: Bool = false,
-            firstClassAtFront: Bool = true, nose: Nose? = nil
+            firstClassAtFront: Bool = true, nose: Nose? = nil,
+            silhouette: Silhouette? = nil
         ) -> [VehicleUnit] {
             let count = max(1, cars)
+            // Every car of a unit is the same shape, cabs aside — which is the
+            // whole idea of a multiple unit and the reason one silhouette
+            // covers the set. The deck flag decides it where the caller has
+            // not, so a table entry written before this existed still draws
+            // something better than a box.
+            let body = silhouette ?? (doubleDeck ? .doubleDeckUnit : .suburbanUnit)
             if count == 1 {
                 return [VehicleUnit(
                     kind: .drivingCar, length: carLength, width: width,
                     cabFront: true, cabBack: true, pantographs: 1,
-                    doubleDeck: doubleDeck, band: .mixed, doors: doors, nose: nose
+                    doubleDeck: doubleDeck, band: .mixed, doors: doors, nose: nose,
+                    silhouette: body
                 )]
             }
             var units: [VehicleUnit] = []
@@ -283,7 +299,8 @@ public enum LayoutLibrary {
                     doubleDeck: doubleDeck, band: band, doors: doors,
                     // Only the ends of a unit have a nose to shape; the cars in
                     // between are boxes whatever the train is.
-                    nose: isFirstCar || isLastCar ? nose : nil
+                    nose: isFirstCar || isLastCar ? nose : nil,
+                    silhouette: body
                 ))
             }
             return units
@@ -299,17 +316,23 @@ public enum LayoutLibrary {
             // recognise on the screen.
             var units: [VehicleUnit] = [VehicleUnit(
                 kind: .locomotive, length: powerCar, cabFront: true,
-                pantographs: 1, band: .none, doors: 0, nose: .streamlined
+                pantographs: 1, band: .none, doors: 0, nose: .streamlined,
+                silhouette: .highSpeedPower
             )]
             for index in 0..<max(1, coaches) {
                 units.append(VehicleUnit(
                     kind: .coach, length: coachLength,
-                    band: index < 2 ? .first : (index == 3 ? .dining : .second)
+                    band: index < 2 ? .first : (index == 3 ? .dining : .second),
+                    // Lower-roofed than an intercity coach, because everything
+                    // built for 300 km/h is. Next to an EW IV rake in the same
+                    // station it is the difference a platform actually shows.
+                    silhouette: .highSpeedCar
                 ))
             }
             units.append(VehicleUnit(
                 kind: .locomotive, length: powerCar, cabBack: true,
-                pantographs: 1, band: .none, doors: 0, nose: .streamlined
+                pantographs: 1, band: .none, doors: 0, nose: .streamlined,
+                silhouette: .highSpeedPower
             ))
             return units
         }
@@ -330,9 +353,141 @@ public enum LayoutLibrary {
                     // A tram is flat-fronted. Given the taper a railway driving
                     // car gets, a five-module Combino came out with a point at
                     // each end and read as a very short high-speed train.
-                    nose: .blunt
+                    nose: .blunt,
+                    silhouette: .tramCar
                 )
             }
+        }
+
+        /// A GTW: two long low-floor cars with the machinery standing between
+        /// them.
+        ///
+        /// Worth its own builder because the thing that makes a GTW
+        /// recognisable is not a dimension. It is a four-metre blank tower
+        /// between two low cars — the whole traction package in one container,
+        /// full height, no windows — and a `multipleUnit` of three equal cars
+        /// draws the one vehicle in the country with an obvious middle as three
+        /// identical boxes. Thurbo runs most of the eastern regional network
+        /// with these, so it is a shape a great many dots on this map ought to
+        /// have.
+        /// A GTW, which for now is three equal low-floor bodies.
+        ///
+        /// It should be two long cars with a four-metre blank tower between
+        /// them — that traction container is the whole of why a GTW is
+        /// recognisable — and it cannot be, for a reason worth writing down
+        /// because it will come up again.
+        ///
+        /// A library layout has to be *reproducible from what the database
+        /// stores*, and what it stores is a list of class names plus, per
+        /// class, one learned length (`ClassFacts`). Every car of a GTW is a
+        /// `RABe 526`, so a rebuilt observation gives all three bodies the same
+        /// length by construction; a guess with a short middle can therefore
+        /// never be confirmed by an observation of the very train it describes,
+        /// and `VehicleLayoutStore` would file every Thurbo working in the
+        /// country as a correction to a guess that was right. Unequal bodies
+        /// need a per-position fact the file does not carry.
+        ///
+        /// So the shape claimed here stays inside what can be checked: short,
+        /// low-floor, moulded front. Which is still most of a GTW, and is a
+        /// great deal more than the 26.4 m intercity box it used to be.
+        public static func gtw(
+            cars: Int = 3, carLength: Double = 18.0,
+            width: Double = VehicleUnit.standardGaugeWidth
+        ) -> [VehicleUnit] {
+            multipleUnit(
+                cars: cars, carLength: carLength, width: width, doors: 2,
+                silhouette: .lowFloorUnit
+            )
+        }
+
+        /// A metre-gauge locomotive and the coaches behind it.
+        ///
+        /// The Glacier Express, the GoldenPass and the Bernina line, which
+        /// between them are most of what a visitor to this country photographs.
+        /// `panorama` is what earns the builder: those coaches are glazed to
+        /// the centre line, and a roof that is a window is the one feature a
+        /// tilted camera sees more of than any other. Drawn with the grey roof
+        /// every other vehicle gets, a Glacier Express was a rake of grey boxes.
+        public static func narrowRake(
+            coaches: Int, coachLength: Double = 16.4, panorama: Bool = false,
+            width: Double = VehicleUnit.metreGaugeWidth
+        ) -> [VehicleUnit] {
+            let body: Silhouette = panorama ? .panoramaCoach : .intercityCoach
+            var units: [VehicleUnit] = [VehicleUnit(
+                kind: .locomotive, length: 12.9, width: width,
+                cabFront: true, cabBack: true, pantographs: 2,
+                band: .none, doors: 0, silhouette: .electricLoco
+            )]
+            for index in 0..<max(1, coaches) {
+                units.append(VehicleUnit(
+                    kind: .coach, length: coachLength, width: width,
+                    cabBack: index == max(1, coaches) - 1,
+                    band: index == 0 ? .first : .second, doors: 2,
+                    silhouette: body
+                ))
+            }
+            return units
+        }
+
+        /// A rack railway train: a railcar, and the trailers it pushes up the
+        /// hill in front of it.
+        ///
+        /// The shape the map was most obviously wrong about, and it was wrong
+        /// twice over. A Rigi, Pilatus, Jungfrau or Gornergrat working arrives
+        /// filed under category `CC`, which this app maps to `.cable` — and
+        /// `.cable` drew a twelve-metre funicular cabin. So the busiest
+        /// mountain railway in the country was a single grey pod, for a train
+        /// that is in fact two or three short red bodies with deep roofs, and
+        /// on the Rigi they are open-sided.
+        ///
+        /// Pushed rather than pulled, which is the whole of how a rack railway
+        /// is worked: the powered vehicle is always on the downhill end, so the
+        /// train is drawn trailers-first. Whether "first" is up the hill or
+        /// down it is the direction of travel and nothing this can know, but
+        /// getting the *order* right means the railcar is at one end rather
+        /// than in the middle.
+        public static func rackTrain(
+            railcar: Double, trailers: Int = 1, trailerLength: Double = 14.0,
+            width: Double = VehicleUnit.metreGaugeWidth, openSided: Bool = false
+        ) -> [VehicleUnit] {
+            var units: [VehicleUnit] = []
+            for index in 0..<max(0, trailers) {
+                units.append(VehicleUnit(
+                    kind: .coach, length: trailerLength, width: width,
+                    // The leading trailer is a driving trailer: somebody has to
+                    // see where the train is going when it is being pushed.
+                    cabFront: index == 0,
+                    band: .none, doors: 2, joint: index == 0 ? .none : .coupler,
+                    silhouette: openSided ? .rackTrailer : .rackTrainCar
+                ))
+            }
+            units.append(VehicleUnit(
+                kind: .drivingCar, length: railcar, width: width,
+                cabFront: units.isEmpty, cabBack: true, pantographs: 1,
+                band: .none, doors: 2, joint: units.isEmpty ? .none : .coupler,
+                silhouette: .rackTrainCar
+            ))
+            return units
+        }
+
+        /// A gondola, an aerial tramway cabin, or a chair on a lift.
+        ///
+        /// Not a train, which is what these were being drawn as. A cabin hangs
+        /// from a rope: it is small, it is narrow, it is rounded at both ends
+        /// and — the part no amount of shaping could substitute for — it is
+        /// eight metres above the ground rather than on it. See
+        /// `Silhouette.hover`, which is where the height lives, and
+        /// `VehicleShape.mesh`, which draws the arm and the grip over it.
+        ///
+        /// One body. A gondola line is a great many cabins and the feed reports
+        /// each as its own journey, so a "vehicle" here is one cabin and
+        /// drawing it as a coupled set would put a train in the sky.
+        public static func aerialCabin(length: Double, width: Double) -> [VehicleUnit] {
+            [VehicleUnit(
+                kind: .cabin, length: length, width: width,
+                cabFront: true, cabBack: true,
+                band: .none, doors: 1, silhouette: .aerialCabin
+            )]
         }
 
         /// A bus. One body, or two or three where it bends.
@@ -343,13 +498,22 @@ public enum LayoutLibrary {
         /// cross that stood in for them was the single strongest thing on the
         /// drawing saying "tram" about a vehicle that is not one. What tells
         /// them apart now is the wheels; see `VehicleShape.trim`.
-        public static func bus(length: Double, sections: Int = 1, trolley: Bool = false) -> [VehicleUnit] {
-            _ = trolley
+        public static func bus(
+            length: Double, sections: Int = 1, trolley: Bool = false,
+            silhouette: Silhouette? = nil
+        ) -> [VehicleUnit] {
             let count = max(1, sections)
+            // A trolleybus is a hand taller than a diesel one, because the
+            // traction gear a diesel keeps in its tail is on the roof — and on
+            // a street where both run that roofline is the only thing telling
+            // them apart, now that the poles are gone. Recording the flag and
+            // drawing nothing was the old answer; this is what it should have
+            // been spent on.
+            let body = silhouette ?? (trolley ? .trolleybus : .cityBus)
             if count == 1 {
                 return [VehicleUnit(
                     kind: .bus, length: length, width: VehicleUnit.busWidth,
-                    cabFront: true, band: .none, doors: 2
+                    cabFront: true, band: .none, doors: 2, silhouette: body
                 )]
             }
             let each = length / Double(count)
@@ -367,7 +531,8 @@ public enum LayoutLibrary {
                     // back to it; the ones before it end in a bellows.
                     cabBack: index == count - 1,
                     band: .none, doors: index == 0 ? 2 : 1,
-                    joint: index == 0 ? .none : .bellows
+                    joint: index == 0 ? .none : .bellows,
+                    silhouette: body
                 )
             }
         }
@@ -375,7 +540,7 @@ public enum LayoutLibrary {
         public static func boat(length: Double, beam: Double) -> [VehicleUnit] {
             [VehicleUnit(
                 kind: .hull, length: length, width: beam, cabFront: true,
-                band: .none, doors: 0
+                band: .none, doors: 0, silhouette: .boatHull
             )]
         }
 
@@ -384,7 +549,7 @@ public enum LayoutLibrary {
                 VehicleUnit(
                     kind: .cabin, length: length, width: width,
                     cabFront: index == 0, cabBack: index == max(1, cars) - 1,
-                    band: .none, doors: 2
+                    band: .none, doors: 2, silhouette: .funicularCar
                 )
             }
         }
@@ -399,9 +564,9 @@ public enum LayoutLibrary {
         // Standard-gauge main line.
         case "IC2000":  return (Stock.pushPull(coaches: 8, doubleDeck: true, coachLength: 26.8, dining: true), "Re 460 + IC2000")
         case "EWIV":    return (Stock.pushPull(coaches: 7, coachLength: 26.4, dining: true), "Re 460 + EW IV")
-        case "ICN":     return (Stock.multipleUnit(cars: 7, carLength: 26.9, dining: true, nose: .streamlined), "RABDe 500 ICN")
-        case "GIRUNO":  return (Stock.multipleUnit(cars: 11, carLength: 18.4, dining: true, nose: .streamlined), "RABe 501 Giruno")
-        case "ETR610":  return (Stock.multipleUnit(cars: 7, carLength: 26.9, dining: true, nose: .streamlined), "RABe 503 Astoro")
+        case "ICN":     return (Stock.multipleUnit(cars: 7, carLength: 26.9, dining: true, nose: .streamlined, silhouette: .highSpeedCar), "RABDe 500 ICN")
+        case "GIRUNO":  return (Stock.multipleUnit(cars: 11, carLength: 18.4, dining: true, nose: .streamlined, silhouette: .highSpeedCar), "RABe 501 Giruno")
+        case "ETR610":  return (Stock.multipleUnit(cars: 7, carLength: 26.9, dining: true, nose: .streamlined, silhouette: .highSpeedCar), "RABe 503 Astoro")
         case "DOSTO":   return (Stock.multipleUnit(cars: 8, carLength: 25.0, doubleDeck: true, dining: true), "RABe 502 FV-Dosto")
         case "DOSTO4":  return (Stock.multipleUnit(cars: 4, carLength: 25.0, doubleDeck: true), "RABDe 502 FV-Dosto")
         case "KISS":    return (Stock.multipleUnit(cars: 6, carLength: 25.0, doubleDeck: true), "RABe 511 KISS")
@@ -410,23 +575,23 @@ public enum LayoutLibrary {
         case "MUTZ":    return (Stock.multipleUnit(cars: 4, carLength: 26.2, doubleDeck: true, doors: 3), "RABe 515 MUTZ")
         case "FLIRT":   return (Stock.multipleUnit(cars: 4, carLength: 18.6, doors: 2), "RABe 523 FLIRT")
         case "FLIRT6":  return (Stock.multipleUnit(cars: 6, carLength: 17.6, doors: 2), "RABe 523 FLIRT, 6 cars")
-        case "TRAVERSO": return (Stock.multipleUnit(cars: 4, carLength: 18.6, dining: true), "RABe 526 Traverso")
+        case "TRAVERSO": return (Stock.multipleUnit(cars: 4, carLength: 18.6, dining: true, silhouette: .lowFloorUnit), "RABe 526 Traverso")
         case "NINA":    return (Stock.multipleUnit(cars: 3, carLength: 20.0, doors: 2), "RABe 525 NINA")
-        case "GTW":     return (Stock.multipleUnit(cars: 3, carLength: 18.0, doors: 2), "RABe 526 GTW")
-        case "DOMINO":  return (Stock.pushPull(coaches: 3, coachLength: 25.0, firstClassAtRear: false), "RBDe 560 Domino")
+        case "GTW":     return (Stock.gtw(), "RABe 526 GTW")
+        case "DOMINO":  return (Stock.pushPull(coaches: 3, coachLength: 25.0, firstClassAtRear: false, coach: .suburbanUnit, locomotive: .suburbanUnit), "RBDe 560 Domino")
         case "ICE":     return (Stock.powerCarSet(coaches: 12, coachLength: 26.4, powerCar: 20.6), "ICE 1")
-        case "ICE4":    return (Stock.multipleUnit(cars: 12, carLength: 28.8, dining: true, nose: .streamlined), "ICE 4")
+        case "ICE4":    return (Stock.multipleUnit(cars: 12, carLength: 28.8, dining: true, nose: .streamlined, silhouette: .highSpeedCar), "ICE 4")
         case "TGV":     return (Stock.powerCarSet(coaches: 8, coachLength: 18.7, powerCar: 22.2), "TGV Lyria 2N2")
-        case "RJX":     return (Stock.pushPull(coaches: 8, coachLength: 26.5, dining: true), "Railjet")
-        case "NIGHTJET": return (Stock.pushPull(coaches: 11, coachLength: 26.4), "Nightjet")
+        case "RJX":     return (Stock.pushPull(coaches: 8, coachLength: 26.5, dining: true, coach: .highSpeedCar), "Railjet")
+        case "NIGHTJET": return (Stock.pushPull(coaches: 11, coachLength: 26.4, coach: .sleeperCoach), "Nightjet")
 
         // Metre gauge. Narrower and shorter, which is the whole difference a
         // top view can show between an RhB train and an SBB one.
-        case "ALLEGRA": return (Stock.multipleUnit(cars: 3, carLength: 16.5, width: VehicleUnit.metreGaugeWidth), "RhB ABe 8/12 Allegra")
-        case "CAPRICORN": return (Stock.multipleUnit(cars: 4, carLength: 19.0, width: VehicleUnit.metreGaugeWidth), "RhB ABe 4/16 Capricorn")
-        case "RHBRAKE": return (Stock.pushPull(coaches: 6, coachLength: 16.4, firstClassAtRear: true), "RhB Ge 4/4 + coaches")
-        case "GOLDENPASS": return (Stock.multipleUnit(cars: 5, carLength: 15.0, width: VehicleUnit.metreGaugeWidth), "MOB panoramic")
-        case "ADLER":   return (Stock.multipleUnit(cars: 4, carLength: 17.5, width: VehicleUnit.metreGaugeWidth), "zb ABeh 150 ADLER")
+        case "ALLEGRA": return (Stock.multipleUnit(cars: 3, carLength: 16.5, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "RhB ABe 8/12 Allegra")
+        case "CAPRICORN": return (Stock.multipleUnit(cars: 4, carLength: 19.0, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "RhB ABe 4/16 Capricorn")
+        case "RHBRAKE": return (Stock.narrowRake(coaches: 6, coachLength: 16.4, panorama: true), "RhB Ge 4/4 + panorama coaches")
+        case "GOLDENPASS": return (Stock.narrowRake(coaches: 5, coachLength: 15.0, panorama: true), "MOB panoramic")
+        case "ADLER":   return (Stock.multipleUnit(cars: 4, carLength: 17.5, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "zb ABeh 150 ADLER")
 
         default: return nil
         }
@@ -483,7 +648,9 @@ public enum LayoutLibrary {
     /// A tram is its city's tram: Bern runs 32 m Combinos, Zürich 36 m Cobras
     /// and 43 m Flexitys, Basel 43 m. A bus is 12 m unless the operator is one
     /// of the four cities that run articulated fleets on most of their routes.
-    static func road(mode: Mode, operatorName: String?, line: String? = nil) -> ([VehicleUnit], String) {
+    static func road(
+        mode: Mode, operatorName: String?, line: String? = nil, category: String? = nil
+    ) -> ([VehicleUnit], String) {
         let code = operatorName?.uppercased() ?? ""
         switch mode {
         case .tram:
@@ -520,7 +687,7 @@ public enum LayoutLibrary {
             // of its two cars.
             return (Stock.multipleUnit(
                 cars: 2, carLength: 15.3, width: 2.5, doors: 3,
-                firstClassAtFront: false, nose: .blunt
+                firstClassAtFront: false, nose: .blunt, silhouette: .metroCar
             ), "MS2")
         case .boat:
             switch code {
@@ -529,16 +696,121 @@ public enum LayoutLibrary {
             default:    return (Stock.boat(length: 45.0, beam: 9.0), "Motorschiff")
             }
         case .cable:
-            return (Stock.cabin(length: 12.0, width: 3.0), "Funicular")
+            // `.cable` is four completely different vehicles wearing one word,
+            // and it used to draw one twelve-metre pod for all of them.
+            //
+            // The feed does say which. `Categories` folds `FUN`, `GB`, `LB`,
+            // `PB`, `SL`, `CC` and `ASC` into this mode because they all
+            // travel by something other than their own wheels on a level
+            // track — but a cog railway is a *train*, a funicular is a car on
+            // a slope, and a gondola is a box in the sky. Drawing them alike
+            // put a Rigi Bahnen working, which is two or three short red
+            // bodies with white roofs, on the map as a single grey pod; and it
+            // put every gondola in the Alps on the ground under its own rope.
+            //
+            // So the category is consulted here rather than thrown away at the
+            // parser. It costs one string comparison on a path that runs when
+            // a layout is first built, and it is the difference between four
+            // recognisable vehicles and one that is wrong about all of them.
+            switch normalise(category) {
+            case "CC":
+                return cogRailway(code)
+            case "GB", "SL":
+                // A gondola cabin seats six or eight and is a shade over two
+                // metres long; a chair on a lift is smaller still. Both hang.
+                return (Stock.aerialCabin(length: 2.4, width: 2.1), "Gondola")
+            case "LB", "PB", "AS":
+                // An aerial tramway car — a Pendelbahn or a Luftseilbahn —
+                // carries eighty people and is the size of a small bus, and it
+                // hangs from the same kind of rope.
+                return (Stock.aerialCabin(length: 6.4, width: 3.4), "Cable car")
+            default:
+                // A funicular, and the lifts filed as `ASC` with it: a car on
+                // rails on a hillside, which is the one thing in this mode
+                // that really does stand on the ground.
+                return (Stock.cabin(length: 12.0, width: 3.0), "Funicular")
+            }
         default:
             switch code {
             // The trolleybus cities, which run articulated and in Zürich,
             // Geneva and Lucerne double-articulated stock on the trunk routes.
-            case "VBZ", "TPG", "VBL": return (Stock.bus(length: 24.7, sections: 3, trolley: true), "Double-articulated trolleybus")
-            case "SVB", "BVB", "BLT", "TL", "VBSG": return (Stock.bus(length: 18.0, sections: 2, trolley: code == "SVB" || code == "VBSG"), "Articulated bus")
-            case "PAG", "PTT": return (Stock.bus(length: 12.0), "PostAuto")
+            // The trolleybus cities. The wires are not drawn — see `Stock.bus`
+            // — but the vehicle under them is a hand taller than a diesel one,
+            // and on a street carrying both that roofline is now the whole of
+            // how they are told apart.
+            case "VBZ", "TPG", "VBL", "TL":
+                return (Stock.bus(length: 24.7, sections: 3, trolley: true), "Double-articulated trolleybus")
+            case "SVB", "VBSG", "VBSH", "VB", "VMCV", "TPF":
+                return (Stock.bus(length: 18.0, sections: 2, trolley: true), "Articulated trolleybus")
+            case "BVB", "BLT", "ZVB", "RBS", "AVA", "BOS", "VZO", "RVBW", "TPL":
+                return (Stock.bus(length: 18.0, sections: 2), "Articulated bus")
+            // A PostAuto is not a city bus. It is a coach: high floor, luggage
+            // bays under it, and a metre taller at the sill than the low-floor
+            // stock a city runs — which is what a vehicle built to cross a pass
+            // and carry the skis has to be.
+            case "PAG", "PTT", "PAGT", "AFA", "AAGL", "AAGR", "AAGS", "AAGU":
+                return (Stock.bus(length: 12.0, silhouette: .coachBus), "PostAuto")
             default: return (Stock.bus(length: 12.0), "Bus")
             }
+        }
+    }
+
+    /// What each of the country's cog railways runs.
+    ///
+    /// Short trains, and the differences between them are large enough to be
+    /// worth naming: the Pilatus is 800 mm gauge and its cars are the size of a
+    /// minibus, the Rigi is standard gauge and pushes open-sided trailers, the
+    /// Jungfrau and Wengernalp cars are metre-gauge and nearly as long as a
+    /// tram module. Drawn at one size they would all be the Jungfrau, which on
+    /// the Pilatus is a vehicle three times too big for the mountain.
+    static func cogRailway(_ code: String) -> ([VehicleUnit], String) {
+        switch code {
+        // Rigi Bahnen: standard gauge — the only rack railway in the country
+        // that is — and the trailers behind the railcar are open at the sides.
+        case "RB":
+            return (
+                Stock.rackTrain(
+                    railcar: 16.6, trailers: 1, trailerLength: 14.4,
+                    width: 2.70, openSided: true
+                ),
+                "Rigi BDhe 4/4"
+            )
+        // The steepest rack railway in the world, and the smallest vehicle on
+        // it: 800 mm gauge, and a car that holds forty people.
+        case "PB":
+            return (
+                Stock.rackTrain(railcar: 6.6, trailers: 0, width: 2.10),
+                "Pilatus Bhe 1/2"
+            )
+        case "JB":
+            return (
+                Stock.rackTrain(railcar: 17.6, trailers: 1, trailerLength: 17.0, width: 2.70),
+                "Jungfraubahn BDhe 4/8"
+            )
+        case "WAB":
+            return (
+                Stock.rackTrain(railcar: 17.0, trailers: 1, trailerLength: 16.2, width: 2.66),
+                "Wengernalpbahn BDhe 4/8"
+            )
+        case "GGB":
+            return (
+                Stock.rackTrain(railcar: 16.2, trailers: 1, trailerLength: 15.6, width: 2.70),
+                "Gornergrat Bhe 4/8"
+            )
+        // 800 mm gauge and steam-hauled for most of the day: the shortest
+        // train on the network.
+        case "BRB":
+            return (
+                Stock.rackTrain(railcar: 7.6, trailers: 1, trailerLength: 7.2, width: 2.10),
+                "Brienz Rothorn Bahn"
+            )
+        case "MVR", "TPC", "MGB", "AB":
+            return (
+                Stock.rackTrain(railcar: 15.8, trailers: 1, trailerLength: 14.8),
+                "Rack railcar"
+            )
+        default:
+            return (Stock.rackTrain(railcar: 15.5, trailers: 1), "Rack railcar")
         }
     }
 
@@ -562,7 +834,9 @@ public enum LayoutLibrary {
         )
 
         guard mode == .train else {
-            let (units, name) = road(mode: mode, operatorName: operatorName, line: line)
+            let (units, name) = road(
+                mode: mode, operatorName: operatorName, line: line, category: category
+            )
             return VehicleLayout(units: units, livery: paint, name: name).resolvingStripes()
         }
 

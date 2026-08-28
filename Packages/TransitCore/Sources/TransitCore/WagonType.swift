@@ -235,10 +235,19 @@ public struct WagonTraits: Sendable, Hashable {
     /// Whether this is a vehicle that pulls, and so one painted in the
     /// company's locomotive colours rather than its coaching ones.
     public var powered: Bool
+    /// What shape family the class belongs to.
+    ///
+    /// The field that turned this table from a description of a *box* into a
+    /// description of a vehicle. Everything else here — how long, how wide, two
+    /// floors or one — could be satisfied by an extrusion, and for a long time
+    /// was: every wagon in the country was one box with a bevel on the front.
+    /// This is what says which box, and `Silhouette` is where the answer is
+    /// spelled out.
+    public var silhouette: Silhouette
 
     public static let unknown = WagonTraits(
         doubleDeck: false, width: VehicleUnit.standardGaugeWidth, nose: nil,
-        driving: nil, length: 26.4, powered: false
+        driving: nil, length: 26.4, powered: false, silhouette: .generic
     )
 }
 
@@ -306,13 +315,21 @@ public enum WagonCatalogue {
     static func parse(_ raw: String) -> WagonTraits {
         let deck = isDoubleDeck(raw)
         let powered = isPowered(raw)
+        let shape = silhouette(raw, powered: powered, doubleDeck: deck)
         return WagonTraits(
             doubleDeck: deck,
             width: isMetreGauge(raw) ? VehicleUnit.metreGaugeWidth : VehicleUnit.standardGaugeWidth,
-            nose: nose(raw),
+            // The class's own nose where the table names one; otherwise
+            // whatever the shape family implies, which is where nearly every
+            // answer now comes from. Kept as two fields rather than folded into
+            // one because they answer different questions: `nose` is an
+            // override a caller may set, and the silhouette is what the class
+            // *is*. See `VehicleShape.profiles`.
+            nose: nose(raw) ?? shape.nose,
             driving: isDrivingStock(raw),
             length: defaultLength(raw, powered: powered, doubleDeck: deck),
-            powered: powered
+            powered: powered,
+            silhouette: shape
         )
     }
 
@@ -437,6 +454,111 @@ public enum WagonCatalogue {
         let streamlined = ["ICE", "TGV", "ETR", "RABE501", "RABE503", "RABDE500"]
         if streamlined.contains(where: { raw.hasPrefix($0) }) { return .streamlined }
         return nil
+    }
+
+    // MARK: - What shape the class is
+
+    /// Which shape family a class name names.
+    ///
+    /// The table the whole exercise turns on, and it is worth saying what kind
+    /// of table it is. It is not a catalogue of Swiss rolling stock — that
+    /// would be several hundred rows, most of them guessed, and confidently
+    /// wrong is worse than uniformly approximate. It is a list of the
+    /// *silhouettes* the country runs, matched by the prefixes that reliably
+    /// identify them, with everything unmatched falling through to `.generic`
+    /// and being drawn exactly as it always was.
+    ///
+    /// Order is load-bearing throughout. `RABE511` has to be tested before
+    /// `RABE5`, `ABEH` before `ABE`, `WR` before `R`; and the double-deck test
+    /// runs first of all, because `Bt(2E)` is a driving trailer whose shape is
+    /// decided by the two floors behind the cab rather than by the `Bt`.
+    static func silhouette(_ raw: String, powered: Bool, doubleDeck: Bool) -> Silhouette {
+        guard !raw.isEmpty else { return .generic }
+
+        /// Whether the name begins with any of these.
+        func any(_ prefixes: [String]) -> Bool {
+            prefixes.contains { raw.hasPrefix($0) }
+        }
+
+        // The high-speed and tilting sets, before anything else looks at them:
+        // a `RABe 501` is a multiple unit by every structural test and it is
+        // not shaped like one.
+        if any(["RABE501", "RABE503", "RABDE500", "ETR"]) { return .highSpeedCar }
+        if any(["ICE", "TGV"]) {
+            // A power car and a coach of the same set are filed under the same
+            // name, and the register does not say which is which. The one that
+            // can be told apart is the driving vehicle, and the formation
+            // service says so — see `kind(of:)`, which is what actually decides
+            // it. This is the passenger body.
+            return .highSpeedCar
+        }
+
+        // Two floors. Checked before the unit and coach tests because it
+        // outranks both: an `AD(2E)` is a coach and a `Bt(2E)` is a driving
+        // trailer, and what makes each of them recognisable is the storey.
+        if doubleDeck {
+            // The units carry their class number; the hauled IC2000 stock is
+            // named for what is inside it and nothing else.
+            if any(["RABE", "RABDE", "RBDE"]) { return .doubleDeckUnit }
+            return .doubleDeckCoach
+        }
+
+        // The vehicles that pull. `isPowered` has already excluded every
+        // multiple unit and driving trailer, so what is left really is a
+        // machine — and the small ones are a different shape from the big ones.
+        if powered {
+            // A `Tm` is a tractor and an `Ee` is a yard shunter: both are half
+            // the height of a main-line locomotive and mostly bonnet.
+            if any(["TM", "EE", "EM"]) { return .shunter }
+            return .electricLoco
+        }
+
+        // Metre gauge, and the mountain.
+        //
+        // `H` is the letter that matters here: in Swiss practice it marks a
+        // rack drive, so `BDhe`, `Bhe`, `ABeh` and `HGe` are all vehicles built
+        // to climb. The rack railcars are short, tall and upright — a Rigi
+        // BDhe, a Pilatus Bhe, a Jungfrau or Wengernalp car, a Gornergrat Bhe —
+        // and drawn as ordinary railcars they were the flattest, longest thing
+        // on a mountain that has nothing flat or long on it.
+        if any(["BDHE", "BHE", "ABDHE", "BEH", "ABEH2", "ABEH4", "ABEH8", "HE"]) {
+            return .rackTrainCar
+        }
+        // The zb's Fink and Adler, and the RhB's Allegra and Capricorn: modern
+        // narrow-gauge units, low and short but not rack railcars.
+        if any(["ABEH15", "ABEH16", "ABE8/12", "ABE812", "ABE4/16", "ABE416", "ABEH"]) {
+            return .narrowGaugeUnit
+        }
+
+        // The multiple units, by class number. Every one of these is a
+        // single-deck unit with a low floor and a moulded front; what separates
+        // them is which Stadler product it is.
+        if any(["RABE526", "RABE527", "RABE528", "RABDE526"]) {
+            // The GTW and the Traverso. The power module in the middle of a GTW
+            // is a different shape again, and only the formation can say which
+            // car it is — see `kind(of:)`.
+            return .lowFloorUnit
+        }
+        if any(["RABE5", "RABDE5", "RBDE5", "RBE5", "RABE4", "RBE4"]) { return .suburbanUnit }
+        // A driving trailer takes the shape of the train it is on, and the only
+        // thing its name settles is that somebody drives from it. A `Bt` on the
+        // front of a Domino set is a suburban cab; the double-deck ones have
+        // already been caught above.
+        if any(["BT", "ABT", "BDT", "AT"]) { return .suburbanUnit }
+        if any(["RABE", "RABDE", "RBDE", "RBE", "ABE", "BDE"]) { return .suburbanUnit }
+
+        // Hauled stock, named for what is inside it.
+        if raw.hasPrefix("WR") { return .intercityCoach }
+        // Couchettes and sleepers, which run through Switzerland every night on
+        // the Nightjet and have small high windows because there are berths
+        // behind them.
+        if any(["BC", "WL", "AB3", "WLAB", "BCM"]) { return .sleeperCoach }
+        // A luggage van is a `D` and nothing else: `AD` is a first-class coach
+        // with a compartment in it, and is a coach.
+        if raw.hasPrefix("D") { return .luggageVan }
+        if any(["A", "B"]) { return .intercityCoach }
+
+        return .generic
     }
 
     /// How long a vehicle of this class is, for a formation that did not say.
@@ -584,7 +706,15 @@ public enum WagonCatalogue {
                 ?? template.map {
                     WagonTraits(
                         doubleDeck: $0.doubleDeck, width: $0.width, nose: $0.nose,
-                        driving: nil, length: $0.length, powered: false
+                        driving: nil, length: $0.length, powered: false,
+                        // The line's usual stock is a better guess at the shape
+                        // than nothing is, and it is the *only* guess available
+                        // for a record migrated from version 2 — those carry no
+                        // class names at all. A train the library thinks is a
+                        // MUTZ, observed with four vehicles and no names, is
+                        // then drawn as four double-deck unit bodies rather
+                        // than as four anonymous boxes.
+                        silhouette: $0.silhouette
                     )
                 }
                 ?? .unknown
@@ -617,7 +747,23 @@ public enum WagonCatalogue {
                 doors: kind == .locomotive ? 0 : 2,
                 joint: leading ? .none : .coupler,
                 nose: (cabFront || cabBack) ? traits.nose : nil,
-                type: wagon.type
+                type: wagon.type,
+                // The shape family, on every vehicle and not only the ends.
+                //
+                // Unlike the nose, this is a fact about the whole body: an
+                // intermediate KISS car has no cab and is still a double-deck
+                // unit car, four and a half metres tall with two window bands.
+                // The nose is what the *ends* wear and this is what the vehicle
+                // is, which is why the two are separate fields.
+                //
+                // Except for the one vehicle whose place in the train decides
+                // it: a locomotive at the head of a rake is a machine whatever
+                // the register calls the coaches around it, and a rake filed
+                // with every vehicle under one name would otherwise put a
+                // window band down the side of the engine.
+                silhouette: kind == .locomotive && !traits.powered
+                    ? (traits.silhouette == .highSpeedCar ? .highSpeedPower : .electricLoco)
+                    : traits.silhouette
             )
         }
     }
