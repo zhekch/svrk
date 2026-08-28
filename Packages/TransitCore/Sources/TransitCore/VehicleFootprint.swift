@@ -298,7 +298,45 @@ public enum VehicleShape {
     /// is more — which means the exaggeration shrinks as the map is zoomed in
     /// and disappears entirely around zoom 18, where the real width finally
     /// wins on its own.
-    public static let minWidthPoints = 7.0
+    ///
+    /// Four and a half rather than seven, which is what it was. Seven points is
+    /// a comfortable width for a two-hundred-metre train and an absurd one for
+    /// a tram: at zoom 14.6 a 36 m Cobra is 16.7 points long, so seven across
+    /// drew it at 2.4:1 — and an 18 m articulated bus at 1.2:1, which is a
+    /// square. See `maxWidthShare`, which is the other half of the fix.
+    public static let minWidthPoints = 4.5
+
+    /// The widest a vehicle may be drawn as a share of its own drawn length.
+    ///
+    /// **A minimum width alone cannot be right, because it says nothing about
+    /// the vehicle it is applied to.** The floor exists so a long train is not
+    /// a hairline; applied to a short one it is the opposite problem, and the
+    /// two need one rule between them. So the floor is itself bounded: nothing
+    /// is ever drawn fatter than this share of its length, however few points
+    /// that leaves.
+    ///
+    /// A quarter is about the proportion of a real city bus seen from above,
+    /// which is the stubbiest thing on this map. Everything longer than a bus
+    /// is drawn longer than a bus in proportion, which is the whole claim the
+    /// drawing makes.
+    public static let maxWidthShare = 0.25
+
+    /// How wide one vehicle's widest body is drawn, in metres of the ground.
+    ///
+    /// The floor is applied to the widest unit and every other body keeps its
+    /// proportion to it, so a locomotive stays wider than the coaches behind it
+    /// and a train and a bus are not made the same width merely because both
+    /// were too narrow to draw honestly.
+    public static func drawnWidth(
+        of layout: VehicleLayout, metresPerPoint: Double
+    ) -> (metres: Double, scale: Double) {
+        let widest = layout.widestUnit
+        guard widest > 0, metresPerPoint > 0 else { return (widest, 1) }
+        let lengthPoints = layout.length / metresPerPoint
+        let wanted = min(minWidthPoints, lengthPoints * maxWidthShare)
+        let scale = max(1, (wanted * metresPerPoint) / widest)
+        return (widest * scale, scale)
+    }
 
     /// How much detail to emit, which is a question about how many pixels one
     /// body has to spend rather than about zoom.
@@ -427,11 +465,9 @@ public enum VehicleShape {
         // to know about it, to save four coordinates against several hundred
         // polygons.
         var lamps: [VehicleLamp] = []
-        // A width floor applied per unit would make a bus and a train the same
-        // width even where both are wide enough to draw honestly, so it is
-        // applied to the widest unit and the rest keep their proportion to it.
-        let widest = layout.widestUnit
-        let scale = max(1, (minWidthPoints * metresPerPoint) / widest)
+        // How much the bodies are widened past the truth so that they read as
+        // bodies. See `drawnWidth`.
+        let scale = drawnWidth(of: layout, metresPerPoint: metresPerPoint).scale
 
         var offset = 0.0
         var lastHeading: Double?
@@ -467,7 +503,7 @@ public enum VehicleShape {
             let unitPoints = unit.length / metresPerPoint
             let ring = outline(
                 length: unit.length, width: width, front: ends.front, back: ends.back,
-                steps: smoothness(lengthPoints: unitPoints)
+                steps: smoothness(lengthPoints: unitPoints, widthPoints: width / metresPerPoint)
             )
             parts.append(FootprintPart(
                 role: .body, ring: frame.project(ring), fill: colour(of: unit, in: layout)
@@ -1094,19 +1130,45 @@ public enum VehicleShape {
     }
 
     /// How far back from the tip a profile reaches.
+    ///
+    /// **`width` is the width the body is *drawn* at, not the width it is**, and
+    /// the ends that are corner-rounding rather than nose are measured against
+    /// it. That is the fix for "the vehicles look low resolution". A tram front
+    /// is 1.3 m deep on a 2.4 m body — a semicircular end — and the widening
+    /// that makes a tram visible at all was drawing that same 1.3 m across a
+    /// body six times wider, which is a flat wall with a scratch on it. The
+    /// coach chamfer had it worse: half a metre of radius on a fifteen-metre
+    /// body is a hard right angle, so a train came out as a row of rectangles
+    /// with one 45° cut at the front. Written as shares of the drawn width they
+    /// are the same shapes at every exaggeration, and they are the honest
+    /// proportions of the real vehicle as well — a coach corner really is about
+    /// a fifth of the body's width, and a tram's front really is half of it.
+    ///
+    /// The noses are not. A cab, a high-speed nose, a locomotive end and a bow
+    /// are lengthwise facts about the vehicle — an ICE 4's nose is seven metres
+    /// whatever the map is doing — so they stay measured against length, with a
+    /// floor at the corner rounding they would otherwise fall below.
     public static func depth(of profile: EndProfile, length: Double, width: Double) -> Double {
+        /// What a plain rounded corner comes to on a body this wide, which is
+        /// the least any end can be shaped by.
+        let corner = min(width * 0.2, length * 0.35)
         switch profile {
-        case let .square(chamfer): return chamfer
-        case .cab: return min(3.6, length * 0.24)
+        // The chamfer the caller worked out is the real vehicle's, and it is
+        // kept as a floor: it is the one that wins at the zooms where the
+        // widening has run out and the body is drawn at its true width.
+        case let .square(chamfer): return min(max(chamfer, corner), length * 0.35)
+        case .cab: return min(max(3.6, corner), length * 0.32)
         // Long, because it really is. An ICE 4 end car is 28.8 m and the nose
         // is a quarter of it; drawn at the 3.6 m a cab gets, the front of a
         // three-hundred-metre train was a bevel four points deep and the whole
         // train read as a run of identical boxes.
-        case .streamlined: return min(7.6, length * 0.30)
-        case .locomotive: return min(2.2, length * 0.15)
-        case .tramFront: return min(1.3, length * 0.26)
-        case .busFront: return min(1.7, length * 0.16)
-        case .busRear: return min(0.9, length * 0.09)
+        case .streamlined: return min(max(7.6, corner), length * 0.42)
+        case .locomotive: return min(max(2.2, corner), length * 0.28)
+        // Half the width and a bit: the end of a tram is very nearly a
+        // semicircle, and that is what it should stay however wide it is drawn.
+        case .tramFront: return min(width * 0.5, length * 0.4)
+        case .busFront: return min(width * 0.42, length * 0.34)
+        case .busRear: return min(width * 0.24, length * 0.2)
         case .gangway: return 0
         case .bow: return min(length * 0.30, width * 2.1)
         }
@@ -1120,11 +1182,20 @@ public enum VehicleShape {
     /// bevel in the second. Vertices are the currency here: every one of them
     /// is emitted, projected, serialised and uploaded fifteen times a second
     /// for every vehicle on screen.
-    public static func smoothness(lengthPoints: Double) -> Int {
-        if lengthPoints >= 120 { return 8 }
-        if lengthPoints >= 45 { return 5 }
-        if lengthPoints >= 16 { return 3 }
-        return 2
+    ///
+    /// **From how big the body is on screen, and not from how long it is.** An
+    /// end is an arc across the body's *width*, so a body eleven points long
+    /// and seven wide was being given the two segments an eleven-point feature
+    /// deserves and spending them on a seven-point curve — which is a bevel,
+    /// and is most of why the coaches read as boxes with a corner cut off. The
+    /// larger of the two dimensions is what the eye is resolving.
+    public static func smoothness(lengthPoints: Double, widthPoints: Double = 0) -> Int {
+        let points = max(lengthPoints, widthPoints)
+        if points >= 120 { return 8 }
+        if points >= 45 { return 5 }
+        if points >= 16 { return 3 }
+        if points >= 5 { return 2 }
+        return 1
     }
 
     /// A nose as a curve rather than as a list of corners.

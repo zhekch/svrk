@@ -2131,6 +2131,34 @@ final class AppModel {
     /// a place, and redrawing it faster than once a second buys nothing.
     private static let stillZoom = 9.0
 
+    /// How close two vehicles have to be on the ground before the second of
+    /// them is only ever painted underneath the first.
+    ///
+    /// **Pulled back far enough, a dot stops being a position and becomes an
+    /// area.** At zoom 6 a point of screen covers a kilometre, so Zurich, Bern,
+    /// Geneva and Basel are two or three points wide apiece and each holds two
+    /// or three hundred services. Measured over the shipped timetable on a
+    /// weekday morning, 5,819 vehicles are in view and about 1,200 of them land
+    /// anywhere a reader could tell apart; the rest are built into features,
+    /// serialised, handed to the renderer, tessellated and painted, every tick,
+    /// to put colour inside a disc that was already that colour. Asking for one
+    /// dot per dot leaves 21% of the fleet at zoom 6 and 11% at zoom 5. See
+    /// `Fleet.thinTheHidden`, which does the dropping.
+    ///
+    /// The dot's own radius is the distance, read off the curve the layer is
+    /// drawn with so the two cannot drift apart.
+    ///
+    /// Nothing is thinned once a vehicle carries its line number: a dot behind
+    /// a dot is nothing, but a *number* behind a dot is a service missing from
+    /// the map. Eased out over the zoom below that rather than switched off at
+    /// it, so the dots it was holding back arrive across a pinch instead of all
+    /// in the one frame that crosses zoom 11.
+    private var dotSpacing: Double {
+        let room = min(1, max(0, VehicleDot.labelMinZoom - zoom))
+        guard room > 0 else { return 0 }
+        return VehicleDot.radius(atZoom: zoom) * metresPerPoint * room
+    }
+
     /// Whether a coalesced tick is running, and whether another was asked for
     /// while it was.
     private var tickRunning = false
@@ -2277,12 +2305,9 @@ final class AppModel {
         }()
         var found = await fleet.vehicles(
             in: query, at: now, fraction: fraction, withGeometry: detailed,
-            including: selectedId
+            including: selectedId, hiding: hiddenModes, noCloserThan: dotSpacing
         )
         let answeredAt = ContinuousClock.now
-        if !hiddenModes.isEmpty {
-            found.removeAll { hiddenModes.contains($0.mode) }
-        }
         found.sort { $0.mode.drawOrder < $1.mode.drawOrder }
         // What the next interval is paced off. See `pace`.
         var fastest = 0.0
@@ -2469,12 +2494,19 @@ final class AppModel {
         var restated = false
         if !stillInside {
             // Generously, so the next pan of a few points is inside the box
-            // already fetched rather than another walk of the grid.
-            let generous = box.padded(by: 0.25)
+            // already fetched rather than another walk of the grid — and over
+            // the circle the screen turns inside rather than over the screen,
+            // so that turning the map is not a pan at all. See `BBox.turned`.
+            let generous = box.turned().padded(by: 0.25)
             let foundStops: [StopPlace]
+            // The caps rise with the box, so the density at which they bite is
+            // the one they were chosen for rather than one two-and-a-half times
+            // tighter. They are a guard against a pathological ask, not a
+            // budget: at the zoom band 2 covers, a viewport holding two
+            // thousand stop places is a viewport of central Zurich.
             switch band {
-            case 2: foundStops = await fleet.stopPlaces.within(generous, limit: 1500)
-            case 1: foundStops = await fleet.stopPlaces.within(generous, railOnly: true, limit: 400)
+            case 2: foundStops = await fleet.stopPlaces.within(generous, limit: 3000)
+            case 1: foundStops = await fleet.stopPlaces.within(generous, railOnly: true, limit: 800)
             default: foundStops = []
             }
             stopsBand = band
@@ -4210,7 +4242,7 @@ final class AppModel {
            held.contains(lon: viewport.east, lat: viewport.north) {
             return
         }
-        let generous = viewport.padded(by: 0.25)
+        let generous = viewport.turned().padded(by: 0.25)
         platesZoom = zoom
         plates = await fleet.platformPlates(
             in: generous, zoom: zoom, hidingDrawnTracks: showRailwayShapes && railwayShapesDrawn
@@ -4256,7 +4288,7 @@ final class AppModel {
         // Lötschberg comes back as the two kilometres of it that happen to be
         // in view, its "portals" are wherever the box was cut, and a train
         // would be hung off an elevation taken from the middle of a mountain.
-        let generous = viewport.padded(by: 1.5)
+        let generous = viewport.turned().padded(by: 1.5)
         tunnels = await fleet.trackLines(
             in: generous, kindMask: trackTunnelBit
         ).map(\.points)
@@ -4284,7 +4316,7 @@ final class AppModel {
            held.contains(lon: viewport.east, lat: viewport.north) {
             return
         }
-        let generous = viewport.padded(by: 0.4)
+        let generous = viewport.turned().padded(by: 0.4)
         let mask = zoom < 11 ? await fleet.mainLineMask() : 0
         // The mask changes what is drawn, so crossing the threshold has to
         // rebuild even when the viewport has not moved.

@@ -1397,9 +1397,20 @@ public actor Fleet {
     /// those onto the timetable can move it kilometres in one tick — out of
     /// the viewport it was just drawn in. Without this, the map has nothing
     /// to pan to, and the train the reader tapped simply vanishes.
+    ///
+    /// `hiding` are the modes the reader has switched off. Applied here rather
+    /// than by the caller because it was the caller's *last* filter and it
+    /// belongs first: a bus nobody wants drawn should not be asked where it is,
+    /// and it must not be allowed to take a place from a train that is — see
+    /// `thinTheHidden`.
+    ///
+    /// `spacing` is how close together two vehicles have to be on the ground
+    /// before the second one is only ever painted underneath the first. Zero,
+    /// the default, draws every one of them. See `thinTheHidden`.
     public func vehicles(
         in bbox: BBox, at now: Timestamp, fraction: Double = 0, withGeometry detailed: Bool,
-        including extraId: String? = nil
+        including extraId: String? = nil, hiding: Set<Mode> = [],
+        noCloserThan spacing: Double = 0
     ) -> [VehicleSnapshot] {
         let moment = Double(now) + min(1, max(0, fraction))
         // A little margin keeps vehicles from popping in exactly at the edge.
@@ -1411,6 +1422,7 @@ public actor Fleet {
         // a vehicle that gets its track in this pass is drawn on it in this
         // frame rather than the next.
         var drawn: [(journey: Journey, position: VehiclePosition)] = []
+        let hidden = !hiding.isEmpty
         for journey in fleetByID().values {
             // Rejected on what the journey *is* before it is asked where it
             // is, because asking is the expensive half and the answer is
@@ -1431,6 +1443,15 @@ public actor Fleet {
             // journey in the country, including the ones that are not running
             // and were about to be dropped on the next line. See
             // `Journey.drawnWithin`.
+            //
+            // A mode the reader has switched off, before anything is spent on
+            // it, and ahead of `extraId` because a hidden mode is hidden: the
+            // caller used to drop these from the answer and this is the same
+            // rule moved to where it costs one comparison against a value
+            // already in hand instead of a position, a place in the thinning
+            // and a snapshot. On a map showing trains only it clears four
+            // fifths of the country before the clock test has to look at it.
+            if hidden, hiding.contains(journey.mode) { continue }
             var gated = false
             if journey.id != extraId {
                 // Exactly the bound `position` checks first, and checked here
@@ -1457,6 +1478,10 @@ public actor Fleet {
             drawn.append((journey, position))
         }
 
+        // Before anything is spent on where these vehicles *really* are, drop
+        // the ones that are going to be painted underneath another one.
+        thinTheHidden(&drawn, noCloserThan: spacing, keeping: extraId)
+
         alignToTrack(&drawn, across: padded, at: moment)
         let drift = keepContinuous(drawn, at: moment)
 
@@ -1481,6 +1506,186 @@ public actor Fleet {
             ))
         }
         return out
+    }
+
+    // MARK: - One dot per dot
+
+    /// Which vehicles survived the last thinning pass, so the same ones survive
+    /// this one. See `thinTheHidden`.
+    private var drawnLastFrame: Set<String> = []
+
+    /// Drop every vehicle that would be drawn underneath another vehicle.
+    ///
+    /// **A dot pulled back far enough stops being a position and becomes an
+    /// area.** At zoom 6 the country is about four hundred points across and a
+    /// point covers a kilometre, so Zurich, Bern, Geneva and Basel are each two
+    /// or three points wide — and each of them has two or three hundred
+    /// services standing in it. Six thousand vehicles are in view, of which
+    /// something like a thousand land anywhere a reader could tell apart; the
+    /// other five thousand are built into features, serialised, handed to the
+    /// renderer, tessellated and painted every tick to put colour inside a disc
+    /// that was already that colour.
+    ///
+    /// So they are not drawn. The rule is exact rather than a grid bucket: no
+    /// two drawn vehicles end up closer together than `metres`, which is the
+    /// caller's dot *radius* converted to ground — see `AppModel.dotSpacing`.
+    /// A grid of that size is cheaper and was tried, and it is the wrong shape:
+    /// two vehicles either side of a cell edge are a metre apart and both kept,
+    /// while two in opposite corners of one cell are a cell diagonal apart and
+    /// one is dropped. What is on screen is a property of the distance between
+    /// them and of nothing else.
+    ///
+    /// Which vehicles survive is decided in a fixed order, and the order is
+    /// the whole of whether the map flickers — see the sort below.
+    ///
+    /// Nothing is thinned when `metres` is zero, which is what the map asks for
+    /// the moment a vehicle is more than a dot: a footprint is not hidden by
+    /// the dot in front of it, two trains at one station are two trains, and a
+    /// line number behind a dot is a service missing from the map.
+    private func thinTheHidden(
+        _ drawn: inout [(journey: Journey, position: VehiclePosition)],
+        noCloserThan metres: Double, keeping extraId: String?
+    ) {
+        guard metres > 0, drawn.count > 1 else {
+            if !drawnLastFrame.isEmpty { drawnLastFrame = [] }
+            return
+        }
+        let count = drawn.count
+
+        // Degrees, so the test is two subtractions and a compare rather than a
+        // haversine per pair. Latitude is fixed at 111.32 km and longitude is
+        // taken once at the middle of what is drawn: over a country two degrees
+        // deep the cosine moves by three per cent, which is three per cent of a
+        // dot's radius and nothing a reader could find.
+        var midLat = 0.0
+        for row in drawn { midLat += row.position.lat }
+        midLat /= Double(count)
+        let perLat = metres / Geo.metresPerDegree
+        let perLon = metres / (Geo.metresPerDegree * max(0.2, cos(Geo.toRad(midLat))))
+
+        // Everything the two passes below read, lifted out of the rows into
+        // flat arrays first. Both of them are inner loops over tens of
+        // thousands of pairs, and a row is a tuple carrying a class reference —
+        // reaching through one to get at a `Double` is the difference between
+        // this costing a millisecond and costing ten.
+        var cellX = [Int32](repeating: 0, count: count)
+        var cellY = [Int32](repeating: 0, count: count)
+        var unitX = [Double](repeating: 0, count: count)
+        var unitY = [Double](repeating: 0, count: count)
+        // The order the survivors are chosen in, packed into one integer so
+        // that choosing it is a sort of numbers rather than of ids. See below
+        // for what the order has to be and why.
+        var rank = [UInt64](repeating: 0, count: count)
+        var forced = -1
+        for i in 0..<count {
+            let journey = drawn[i].journey, position = drawn[i].position
+            let x = position.lon / perLon, y = position.lat / perLat
+            unitX[i] = x
+            unitY[i] = y
+            cellX[i] = Int32(min(1e9, max(-1e9, x.rounded(.down))))
+            cellY[i] = Int32(min(1e9, max(-1e9, y.rounded(.down))))
+            let held = drawnLastFrame.contains(journey.id) ? 1 : 0
+            rank[i] = UInt64(held) << 35 | UInt64(journey.mode.drawOrder) << 32
+                | UInt64(UInt32.max - Self.settle(journey.id))
+            if journey.id == extraId { forced = i }
+        }
+
+        // **The order is what stops this flickering.** A greedy pass keeps
+        // whoever it reaches first, so left alone the survivors would be
+        // whatever order the fleet dictionary handed over — which is stable
+        // between ticks and *not* stable across a refresh, so every two and a
+        // half seconds a different thousand dots would be the drawn ones. The
+        // order here is fixed and, in front of it, hysteretic:
+        //
+        //  1. whatever was drawn last frame, so a dot that is on the map stays
+        //     on the map until something genuinely closes on it,
+        //  2. then `Mode.drawOrder`, because the vehicle painted on top is the
+        //     one the reader would have seen anyway — a train survives its bus,
+        //  3. then a hash of the id, which settles the rest the same way every
+        //     time. A hash rather than the id itself because this is the tie
+        //     nearly every pair falls to, and comparing six thousand strings
+        //     seventy-six thousand times is most of what the pass would cost.
+        //
+        // The fixed part does most of it and the hysteresis takes the rest:
+        // measured over the national timetable at zoom 6, the drawn set turns
+        // over about 1% a second with (1) in and about 2% without, the
+        // difference being vehicles that cross from one neighbourhood into
+        // another and would otherwise hand their place to whoever they landed
+        // beside.
+        var order = Array(0..<count)
+        order.sort { rank[$0] > rank[$1] }
+        // And the vehicle the caller named first of all, wherever it is and
+        // whatever is on top of it: it is the one being followed or read, and
+        // the camera has nothing to pan to without it. Moved to the front
+        // rather than exempted from the test, so it hides its neighbours
+        // instead of standing beside one of them.
+        if forced >= 0, let at = order.firstIndex(of: forced), at != 0 {
+            order.remove(at: at)
+            order.insert(forced, at: 0)
+        }
+
+        // A grid of exactly one radius, so everything within a radius of a
+        // candidate is in the nine cells around it and there is nothing else to
+        // look at. Chained through `next` rather than held as an array per
+        // cell: there are as many cells as there are vehicles, and six thousand
+        // one-element arrays cost more to allocate than the whole pass.
+        var head: [Int64: Int32] = [:]
+        head.reserveCapacity(count)
+        var next = [Int32](repeating: -1, count: count)
+
+        var keep = [Bool](repeating: false, count: count)
+        var drew = Set<String>()
+        drew.reserveCapacity(count / 4)
+
+        for i in order {
+            let x = unitX[i], y = unitY[i]
+            let cx = cellX[i], cy = cellY[i]
+            var covered = false
+            search: for dx in Int32(-1)...1 {
+                for dy in Int32(-1)...1 {
+                    var j = head[Int64(cx + dx) << 32 | Int64(UInt32(bitPattern: cy + dy))] ?? -1
+                    while j >= 0 {
+                        let k = Int(j)
+                        let dLon = unitX[k] - x, dLat = unitY[k] - y
+                        if dLon * dLon + dLat * dLat < 1 { covered = true; break search }
+                        j = next[k]
+                    }
+                }
+            }
+            if covered { continue }
+            keep[i] = true
+            drew.insert(drawn[i].journey.id)
+            let key = Int64(cx) << 32 | Int64(UInt32(bitPattern: cy))
+            next[i] = head[key] ?? -1
+            head[key] = Int32(i)
+        }
+
+        drawnLastFrame = drew
+        guard drew.count < count else { return }
+        // Rebuilt in the order it arrived in rather than in the order it was
+        // chosen in, because the caller sorts what comes back by draw order and
+        // a stable sort would otherwise carry the hysteresis into the paint
+        // order — the same two vehicles swapping which is on top.
+        var kept: [(journey: Journey, position: VehiclePosition)] = []
+        kept.reserveCapacity(drew.count)
+        for i in 0..<count where keep[i] { kept.append(drawn[i]) }
+        drawn = kept
+    }
+
+    /// A journey id as one number, for the tie-break in `thinTheHidden`.
+    ///
+    /// FNV-1a, and written out rather than taken from `hashValue` because
+    /// Swift seeds string hashing per process: the order two vehicles are
+    /// offered in would then be one thing in a test run and another in the next
+    /// one, which is not something to leave in the path that decides what the
+    /// map draws.
+    private static func settle(_ id: String) -> UInt32 {
+        var hash: UInt32 = 2_166_136_261
+        for byte in id.utf8 {
+            hash ^= UInt32(byte)
+            hash = hash &* 16_777_619
+        }
+        return hash
     }
 
     // MARK: - Nothing on the map jumps

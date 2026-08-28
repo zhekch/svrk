@@ -13,6 +13,7 @@
 		1CDEE9F26BC79310E3048B79 /* RegionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 429FBFB91881CB302473A345 /* RegionStore.swift */; };
 		1DE148E1122FD91596A78193 /* SearchBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A95FE371D8BFBDD2D07C884 /* SearchBar.swift */; };
 		1ED1341AC4420501BEE7D777 /* VehicleShapes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47700568D553B5AC7D7579E3 /* VehicleShapes.swift */; };
+		8D1B97DE371288605FD9A0BE /* VehicleDots.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75D825036B18AA88D77128E9 /* VehicleDots.swift */; };
 		23E1A4384DE72A5D45756DBC /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05A772071F7A9EAFBBBDFF2B /* Settings.swift */; };
 		2DD28A442559D1925A31F14E /* TransitCore in Frameworks */ = {isa = PBXBuildFile; productRef = 0A33270A1B6C3D4E1C3694F5 /* TransitCore */; };
 		304EA8B6AAC382973171B39C /* RideWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C0F3C928C7608E17BBC1FC7 /* RideWatch.swift */; };
@@ -59,6 +60,7 @@
 		3EC4541EA3E197AA85DCAE01 /* FeedActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedActivity.swift; sourceTree = "<group>"; };
 		429FBFB91881CB302473A345 /* RegionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RegionStore.swift; sourceTree = "<group>"; };
 		47700568D553B5AC7D7579E3 /* VehicleShapes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VehicleShapes.swift; sourceTree = "<group>"; };
+		75D825036B18AA88D77128E9 /* VehicleDots.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VehicleDots.swift; sourceTree = "<group>"; };
 		599F833C7E40B0A9A5D57C80 /* OccupancyMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OccupancyMeter.swift; sourceTree = "<group>"; };
 		5A95FE371D8BFBDD2D07C884 /* SearchBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchBar.swift; sourceTree = "<group>"; };
 		65C506F32C0623369D456F1E /* SwissTransitApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwissTransitApp.swift; sourceTree = "<group>"; };
@@ -146,6 +148,7 @@
 				E76AF30AEF7E7AF0C498BAC3 /* VehicleModelStore.swift */,
 				D58D69EBEA26E534118123B8 /* VehicleModels.swift */,
 				47700568D553B5AC7D7579E3 /* VehicleShapes.swift */,
+				75D825036B18AA88D77128E9 /* VehicleDots.swift */,
 			);
 			path = Map;
 			sourceTree = "<group>";
@@ -298,6 +301,7 @@
 				3A6FF81F34F84711827F43A4 /* VehicleModelStore.swift in Sources */,
 				40F10B124688BC5DFEFA1AEA /* VehicleModels.swift in Sources */,
 				1ED1341AC4420501BEE7D777 /* VehicleShapes.swift in Sources */,
+				8D1B97DE371288605FD9A0BE /* VehicleDots.swift in Sources */,
 				356FCCA55E5B6167365F68B7 /* OfflineSheet.swift in Sources */,
 				1CDEE9F26BC79310E3048B79 /* RegionStore.swift in Sources */,
 				4C66F15E1842B6CB3276DC1E /* BoardPanel.swift in Sources */,
