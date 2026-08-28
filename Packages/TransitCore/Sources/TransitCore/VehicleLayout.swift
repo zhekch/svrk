@@ -152,6 +152,17 @@ public struct VehicleUnit: Sendable, Codable, Hashable {
     public var joint: Joint
     /// What the driving end looks like, where the kind does not decide it.
     public var nose: Nose?
+    /// What the rolling-stock register calls this vehicle — `RABe511`, `Bt`,
+    /// `A(2E)`.
+    ///
+    /// The evidence behind every other field here, kept rather than discarded.
+    /// The dimensions above are *read off* this name at the moment a formation
+    /// arrives, so a database that stored only the dimensions remembered the
+    /// conclusions and threw away what they were drawn from — and a better
+    /// reading of the same names could never reach anything already on file.
+    /// Nil for a vehicle the app is guessing at rather than one it was told
+    /// about, which is every layout `LayoutLibrary` builds. See `WagonType`.
+    public var type: WagonType?
     /// Where the class band runs, once the train around it has been read.
     /// Written by `VehicleLayout.resolvingStripes()`, not by the caller.
     public var stripe: Stripe = .none
@@ -160,7 +171,8 @@ public struct VehicleUnit: Sendable, Codable, Hashable {
         kind: UnitKind, length: Double, width: Double = VehicleUnit.standardGaugeWidth,
         cabFront: Bool = false, cabBack: Bool = false, pantographs: Int = 0,
         doubleDeck: Bool = false, band: ClassBand = .none, doors: Int = 2,
-        closed: Bool = false, joint: Joint = .coupler, nose: Nose? = nil
+        closed: Bool = false, joint: Joint = .coupler, nose: Nose? = nil,
+        type: WagonType? = nil
     ) {
         self.kind = kind
         self.length = length
@@ -174,6 +186,7 @@ public struct VehicleUnit: Sendable, Codable, Hashable {
         self.closed = closed
         self.joint = joint
         self.nose = nose
+        self.type = type
     }
 
     /// The width of standard-gauge Swiss passenger stock, near enough.
@@ -257,6 +270,9 @@ public enum LayoutSource: String, Sendable, Codable, Equatable {
 /// One vehicle's composition, front first.
 public struct VehicleLayout: Sendable, Codable, Equatable {
     public var units: [VehicleUnit]
+    /// What this one is painted, for as long as it is being drawn.
+    ///
+    /// Runtime only, and deliberately not written down — see `CodingKeys`.
     public var livery: Livery
     /// What this is, in words — "Re 460 + 8 IC2000", "FLIRT, 4 cars". Shown on
     /// the panel, and the thing that makes a wrong entry in the library
@@ -273,6 +289,47 @@ public struct VehicleLayout: Sendable, Codable, Equatable {
         self.name = name
         self.source = source
     }
+
+    /// What a stored layout is: the train, and not its paint.
+    ///
+    /// `livery` is absent, and its absence is the point. Paint is a fact about
+    /// the *company*, which is known from the journey without asking anybody —
+    /// and every layout read back out of the store has always been repainted on
+    /// the way out (`VehicleLayoutStore.layout(for:modeColour:)` ends in
+    /// `.painted(_:)`), so the six colour strings on disk were written, read,
+    /// and then discarded unused. Worse than wasted: a fleet repainted between
+    /// two builds left every record on file asserting a colour that was no
+    /// longer true, in a field nothing would ever consult.
+    ///
+    /// What replaces it is on the units — each carries the register's name for
+    /// the vehicle, and `WagonCatalogue` turns that into paint and into a mesh
+    /// at the moment of drawing. So the file holds evidence and the app holds
+    /// the reading of it, which is the right way round.
+    enum CodingKeys: String, CodingKey {
+        case units, name, source
+    }
+
+    /// Decoded layouts arrive unpainted.
+    ///
+    /// The placeholder is never seen. Every path that reads a layout out of the
+    /// store repaints it from the operator before returning it, and the one
+    /// that does not — a hand-written seed loaded for a train nobody is looking
+    /// at — is not drawn either. It is grey rather than, say, red so that a
+    /// leak of it into the drawing would look like a fault instead of like a
+    /// plausible train.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        units = try container.decode([VehicleUnit].self, forKey: .units)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        source = try container.decode(LayoutSource.self, forKey: .source)
+        livery = VehicleLayout.unpainted
+    }
+
+    /// The colour a layout has before anybody has said who runs it.
+    public static let unpainted = Livery(
+        body: "#8b929b", roof: "#767c85", trim: "#c9ced4",
+        glass: "#2b3440", stroke: "rgba(0,0,0,0.75)"
+    )
 
     /// Over buffers, including the couplings between units.
     public var length: Double {

@@ -166,14 +166,59 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     /// for as long as it is on the map, and must not be what the database
     /// remembers the S42 as tomorrow.
     private var journeys: [LayoutKey: VehicleLayout] = [:]
+    /// What each line runs *at a given hour*, which is the tier that stops two
+    /// true observations of one line from being a contradiction.
+    ///
+    /// The RE1 is two units coupled at eight in the morning and one of them at
+    /// eleven. Filed against the line alone those are not two facts, they are
+    /// one fact seen twice and disagreeing with itself, and the count below
+    /// settles it by drawing whichever is more common over both. Filed against
+    /// the line *and the hour* they are two facts about two different trains,
+    /// which is what they always were. See `TimeSlot`.
+    private var slots: [SlotKey: LayoutRecord] = [:]
+    /// The losing formation for one slot, on the same terms as `challengers`.
+    private var slotChallengers: [SlotKey: LayoutRecord] = [:]
     /// Resolved layouts, so a screenful of vehicles is not a screenful of
     /// table lookups and string folding fifteen times a second.
-    private var resolved: [String: VehicleLayout] = [:]
+    private var resolved: [ResolvedKey: VehicleLayout] = [:]
+    /// The local offset from UTC, kept until the transition it lasts to.
+    ///
+    /// Worked out inside the same critical section the cache lookup already
+    /// takes, so placing a vehicle in its hour costs no extra locking and, on
+    /// all but two days a year, no work at all. See `ZoneOffset`.
+    private var zone: ZoneOffset?
+    /// Kept so the observer can be taken down with the store.
+    private var zoneWatch: (any NSObjectProtocol)?
     private var dirty = false
     private let url: URL?
 
     public init(url: URL? = nil) {
         self.url = url
+        // A phone carried across a border must stop filing trains in the hours
+        // of the country it left. Asked for once here rather than checked on
+        // every lookup: it is a thing that happens a handful of times in the
+        // life of an install, and checking for it per vehicle per frame was
+        // paying for it several thousand times a second.
+        //
+        // Only the cached offset is thrown away. What has already been learned
+        // stays — a formation observed at eight in the morning in Zurich was
+        // observed at eight in the morning, and is not retrospectively about
+        // some other hour because the reader has since flown somewhere.
+        zoneWatch = NotificationCenter.default.addObserver(
+            forName: .NSSystemTimeZoneDidChange, object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.lock.lock()
+            self.zone = nil
+            // The resolved answers were placed in hours read with the old
+            // offset, so they name the wrong slots now.
+            self.resolved.removeAll(keepingCapacity: true)
+            self.lock.unlock()
+        }
+    }
+
+    deinit {
+        if let zoneWatch { NotificationCenter.default.removeObserver(zoneWatch) }
     }
 
     /// How many individual workings are on file.
@@ -189,6 +234,31 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     }
 
     // MARK: - Reading
+
+    /// Everything a resolved layout depends on.
+    ///
+    /// A struct rather than the joined string this used to be, and the change
+    /// is worth a note because it sits on the hottest path in the app. Building
+    /// the key was `[String].joined(separator:)` — six strings, an array and one
+    /// more string, allocated per vehicle per frame purely to be hashed and
+    /// thrown away. A few hundred vehicles at fifteen frames a second is tens of
+    /// thousands of needless allocations a second, and that was the price of
+    /// looking something up in a dictionary.
+    ///
+    /// Hashing this hashes the strings the snapshot already holds and copies
+    /// none of them. That is what pays for the hour below: the slot makes the
+    /// key one field wider and the key as a whole considerably cheaper.
+    struct ResolvedKey: Hashable {
+        var mode: Mode
+        var category: String?
+        var line: String
+        var operatorName: String?
+        var learned: LayoutKey?
+        var variant: Int
+        /// Nil for anything with no timetable to place it in the day by, which
+        /// is every vehicle the slot tier does not apply to anyway.
+        var slot: TimeSlot?
+    }
 
     /// What to draw for a vehicle.
     ///
@@ -207,23 +277,43 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         let variant = LayoutLibrary.variant(
             operatorName: vehicle.operatorName, mode: vehicle.mode, seed: vehicle.id
         )
-        let cacheKey = [
-            vehicle.mode.rawValue, vehicle.category ?? "", vehicle.line,
-            vehicle.operatorName ?? "", learnedKey(of: vehicle).map(describe) ?? "",
-            String(variant),
-        ].joined(separator: "|")
+        let learnedKey = learnedKey(of: vehicle)
+        let pattern = PatternKey(operatorName: vehicle.operatorName, line: vehicle.line)
 
         lock.lock()
+        // Which hour of which kind of day this working belongs to. Read off the
+        // vehicle's own timetable rather than off the clock, so it is constant
+        // for the life of the journey — which is what lets it sit in a cache
+        // key at all. See `slot(of:)`.
+        let slot = pattern == nil ? nil : self.slot(of: vehicle)
+        let cacheKey = ResolvedKey(
+            mode: vehicle.mode, category: vehicle.category, line: vehicle.line,
+            operatorName: vehicle.operatorName, learned: learnedKey,
+            variant: variant, slot: slot
+        )
         if let held = resolved[cacheKey] {
             lock.unlock()
             return held
         }
-        // This journey first — a unique working is drawn as itself while it
-        // is on the map — then the line, which is what the rest of the
-        // workings of it should look like.
-        let learned = learnedKey(of: vehicle).flatMap { journeys[$0] }
-            ?? PatternKey(operatorName: vehicle.operatorName, line: vehicle.line)
-                .flatMap { patterns[$0]?.layout }
+        // Most specific first, and each tier is a strictly better answer than
+        // the one behind it:
+        //
+        // 1. this journey, because a unique working is drawn as itself for as
+        //    long as it is on the map;
+        // 2. this line at this hour — the eight o'clock RE1 and not the eleven
+        //    o'clock one, which is the whole reason slots exist;
+        // 3. this line, whenever, which is what it looked like before the app
+        //    had ever heard of hours;
+        // 4. the library, where everything starts.
+        //
+        // The third tier is why adding the second cannot make the drawing
+        // worse. An hour nobody has observed falls straight through to the
+        // line-wide answer, which is exactly what the map drew before.
+        let learned = learnedKey.flatMap { journeys[$0] }
+            ?? pattern.flatMap { key in
+                slot.flatMap { slots[SlotKey(pattern: key, slot: $0)]?.layout }
+                    ?? patterns[key]?.layout
+            }
         lock.unlock()
 
         let paint = LayoutLibrary.livery(
@@ -238,11 +328,68 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         lock.lock()
         // A bound, not a measurement: the country cannot produce more distinct
         // answers than this in one session, and an unbounded cache on a draw
-        // path is a leak waiting for a long day.
-        if resolved.count > 4_000 { resolved.removeAll(keepingCapacity: true) }
+        // path is a leak waiting for a long day. Raised along with the hour in
+        // the key — the same few hundred answers can now appear under any hour
+        // actually on screen, which even as the clock is scrubbed is a handful
+        // and never the whole forty-eight.
+        if resolved.count > 12_000 { resolved.removeAll(keepingCapacity: true) }
         resolved[cacheKey] = answer
         lock.unlock()
         return answer
+    }
+
+    /// Which slot a working belongs to.
+    ///
+    /// The train's own scheduled time at the call it is standing at or running
+    /// from, which is the honest reading of "when is this train". Not the wall
+    /// clock: the map can be scrubbed to another hour, and a vehicle shown at
+    /// eight in the morning is an eight-in-the-morning working whatever time it
+    /// is outside. Not the *delayed* time either — a train an hour late is
+    /// still the working it was booked as, and the formation it was
+    /// strengthened to is the one for the hour it was meant to run in.
+    ///
+    /// Callers hold `lock`.
+    private func slot(of vehicle: VehicleSnapshot) -> TimeSlot? {
+        guard let seconds = Self.scheduledSeconds(of: vehicle) else { return nil }
+        return TimeSlot(epochSeconds: seconds, offsetFromUTC: offset(at: seconds))
+    }
+
+    /// The booked time this working is at, in epoch seconds.
+    static func scheduledSeconds(of vehicle: VehicleSnapshot) -> Int? {
+        // The call being stood at, where the index points at one. A journey
+        // whose index has run off the end of its calls is finishing, and the
+        // last call is the right answer for it.
+        let call = vehicle.stops.indices.contains(vehicle.index)
+            ? vehicle.stops[vehicle.index]
+            : vehicle.stops.last
+        guard let call else { return nil }
+        // `sched` is the printed time, which is what the timetable repeats on.
+        // `dep` carries the delay and so drifts between polls — and a value
+        // that moves cannot sit in a cache key without invalidating it every
+        // time the feed refreshes.
+        let booked = call.sched ?? call.dep
+        // A call with no time at all is filed by nothing. Better no slot than a
+        // slot at the epoch, which would put every such train in one bucket and
+        // teach them things about each other.
+        return booked > 0 ? booked : nil
+    }
+
+    /// The local offset from UTC at a moment, remembered between calls.
+    ///
+    /// Two integer comparisons in the case that matters, which is every call
+    /// but the first and the two a year that cross a clock change. Reading
+    /// `TimeZone.current` here to notice a phone that had moved cost a retain
+    /// and two identifier strings compared per vehicle per frame; the same fact
+    /// is now learned by being told — see `init`.
+    ///
+    /// Callers hold `lock`.
+    private func offset(at epochSeconds: Int) -> Int {
+        if let zone, zone.covers(epochSeconds) { return zone.seconds }
+        let measured = ZoneOffset.around(
+            Date(timeIntervalSince1970: TimeInterval(epochSeconds)), zone: .current
+        )
+        zone = measured
+        return measured.seconds
     }
 
     /// What the store knows about one train, for the panel to say so.
@@ -255,6 +402,22 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     public func pattern(for key: PatternKey) -> LayoutRecord? {
         lock.lock(); defer { lock.unlock() }
         return patterns[key]
+    }
+
+    /// What the store has counted for a line at one hour of the day.
+    ///
+    /// Nil where that hour has never been observed, which is the ordinary case
+    /// for most of the day on most lines — and is not a gap, because the line's
+    /// own record answers for it. See the tiers in `layout(for:modeColour:)`.
+    public func slotRecord(for key: SlotKey) -> LayoutRecord? {
+        lock.lock(); defer { lock.unlock() }
+        return slots[key]
+    }
+
+    /// How many line-and-hour combinations have been observed.
+    public var slotCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return slots.count
     }
 
     /// Note that the service was asked about this train and had nothing.
@@ -299,11 +462,20 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     ///
     /// Returns whether anything was learned, so a caller can say "this is the
     /// real formation" rather than "this is what the line usually runs".
+    ///
+    /// `slot` is which working of the line this is — see `TimeSlot`. Handed in
+    /// rather than taken from `moment` because the two are not the same thing:
+    /// `moment` is when the app asked, and the slot is when the train runs. A
+    /// train tapped at half past eleven at night while the clock is scrubbed
+    /// back to the morning peak is a morning-peak working, and filing it under
+    /// the hour the phone happens to be showing would teach the database that
+    /// the RE1 runs eight coaches at midnight. Nil files against the line only,
+    /// which is what the app did before slots existed.
     @discardableResult
     public func learn(
         _ formation: TrainFormation, key: LayoutKey, at moment: Date,
         mode: Mode, category: String?, line: String, operatorName: String?,
-        modeColour: String
+        modeColour: String, slot: TimeSlot? = nil
     ) -> Bool {
         guard let observed = Self.layout(
             from: formation, at: moment,
@@ -327,7 +499,18 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         // when that is not what the line usually runs.
         journeys[key] = observed
         if let pattern = PatternKey(operatorName: operatorName, line: line) {
-            tally(incoming, against: pattern)
+            // Both tiers, from the one observation, and it is the same
+            // observation in each. The line-wide tally is not a summary of the
+            // slots and is not meant to be: it is the answer for every hour
+            // nobody has looked at yet, and it stays useful exactly as long as
+            // that is most of them.
+            Self.tally(incoming, at: pattern, incumbents: &patterns, challengers: &challengers)
+            if let slot {
+                Self.tally(
+                    incoming, at: SlotKey(pattern: pattern, slot: slot),
+                    incumbents: &slots, challengers: &slotChallengers
+                )
+            }
         }
         // The resolution cache holds answers built without any of this in it.
         resolved.removeAll(keepingCapacity: true)
@@ -336,36 +519,52 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         return !matches
     }
 
-    /// Count this observation against the line, without letting a single
-    /// different working replace what has been seen more often.
-    private func tally(_ incoming: LayoutRecord, against pattern: PatternKey) {
-        if var incumbent = patterns[pattern], Self.sameFormation(incumbent, incoming) {
+    /// Which slot a vehicle's working falls in, for a caller about to `learn`.
+    public func slot(for vehicle: VehicleSnapshot) -> TimeSlot? {
+        lock.lock(); defer { lock.unlock() }
+        return slot(of: vehicle)
+    }
+
+    /// Count this observation, without letting a single different working
+    /// replace what has been seen more often.
+    ///
+    /// Generic over the key, and static, because the rule is the same rule
+    /// whether it is being applied to a line or to one hour of one line — and
+    /// having written it twice would have been the surest way to end up with
+    /// two subtly different ideas of what beats what. Static so the two
+    /// dictionaries can be handed in as `inout` without the compiler having to
+    /// reason about overlapping access to `self`.
+    static func tally<Key: Hashable>(
+        _ incoming: LayoutRecord, at key: Key,
+        incumbents: inout [Key: LayoutRecord], challengers: inout [Key: LayoutRecord]
+    ) {
+        if var incumbent = incumbents[key], sameFormation(incumbent, incoming) {
             incumbent.count += 1
             incumbent.seen = incoming.seen
-            patterns[pattern] = incumbent
+            incumbents[key] = incumbent
             return
         }
-        if var rival = challengers[pattern], Self.sameFormation(rival, incoming) {
+        if var rival = challengers[key], sameFormation(rival, incoming) {
             rival.count += 1
             rival.seen = incoming.seen
-            if let incumbent = patterns[pattern], Self.beats(rival, incumbent) {
-                patterns[pattern] = rival
-                challengers[pattern] = incumbent
+            if let incumbent = incumbents[key], beats(rival, incumbent) {
+                incumbents[key] = rival
+                challengers[key] = incumbent
             } else {
-                challengers[pattern] = rival
+                challengers[key] = rival
             }
             return
         }
-        if patterns[pattern] == nil {
-            patterns[pattern] = incoming
+        if incumbents[key] == nil {
+            incumbents[key] = incoming
             return
         }
-        if let incumbent = patterns[pattern], Self.beats(incoming, incumbent) {
-            patterns[pattern] = incoming
-            challengers[pattern] = incumbent
+        if let incumbent = incumbents[key], beats(incoming, incumbent) {
+            incumbents[key] = incoming
+            challengers[key] = incumbent
             return
         }
-        challengers[pattern] = incoming
+        challengers[key] = incoming
     }
 
     /// Whether two records describe the same formation, for counting.
@@ -495,24 +694,30 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         case .couchette, .sleeper, .family, .classless: band = .second
         }
 
+        // The class name, read once. Everything below that used to parse the
+        // string separately now reads a field off this — which is how the deck
+        // line, the gauge and the nose came to be able to disagree with each
+        // other about the same vehicle, each having its own copy of the rules.
+        let type = WagonType(coach.typeName)
+        let traits = type.map(WagonCatalogue.traits(of:)) ?? .unknown
+
         // The register's own length wherever it has one, which is the whole
         // reason a fetched formation draws better than a guessed one: a real
         // 26.4 m coach next to a real 18.7 m one is a difference the map can
         // show and the library can only average over.
         let length = coach.length.flatMap { $0 > 4 && $0 < 60 ? $0 : nil }
-            ?? Self.defaultLength(kind: kind, typeName: coach.typeName)
+            ?? (kind == .locomotive ? 18.5 : kind == .van ? 18.0 : traits.length)
 
         return VehicleUnit(
             kind: kind, length: length,
-            width: Self.isMetreGauge(coach.typeName)
-                ? VehicleUnit.metreGaugeWidth : VehicleUnit.standardGaugeWidth,
+            width: traits.width,
             cabFront: cabFront, cabBack: cabBack,
             // Only on a vehicle that pulls. A driving trailer has a cab and no
             // pantograph — it is the unpowered end of the train — so putting
             // one on every end car drew a Bt as though it were a railcar.
             pantographs: kind == .locomotive
                 ? 2 : (selfPowered && (leading || trailing) ? 1 : 0),
-            doubleDeck: Self.isDoubleDeck(coach.typeName),
+            doubleDeck: traits.doubleDeck,
             band: band, doors: kind == .locomotive ? 0 : 2,
             closed: coach.isClosed, joint: joint,
             // The service says what is inside a coach and never what it looks
@@ -520,33 +725,28 @@ public final class VehicleLayoutStore: @unchecked Sendable {
             // and without it a formation the app had *learned* was drawn worse
             // than the one it had guessed: an ICE looked up by tapping it lost
             // the long nose the library gives it untapped.
-            nose: (cabFront || cabBack) ? Self.nose(for: coach.typeName) : nil
+            nose: (cabFront || cabBack) ? traits.nose : nil,
+            // The evidence, kept. Everything above is a reading of this, and a
+            // reading can be improved; the name cannot be recovered once it has
+            // been thrown away.
+            type: type
         )
     }
+
+    // MARK: - Reading a class name
+    //
+    // All of this used to live here, five static functions each parsing the
+    // same register string its own way. It lives in `WagonCatalogue` now, for
+    // one reason: the string is stored on the unit, so the reading has to be
+    // something the app can do at any time rather than only at the moment a
+    // formation arrives. What is left are the two spellings other files call
+    // by name, forwarded rather than deleted so nothing outside has to know
+    // that the parsing moved.
 
     /// Whether the class named is one with a cab in it, or nil where the class
     /// is not named at all.
     static func isDrivingStock(_ typeName: String?) -> Bool? {
-        guard let raw = typeName?.uppercased(), !raw.isEmpty else { return nil }
-        let prefixes = ["RABE", "RABDE", "RBDE", "RBE", "ABE", "BDE", "ETR", "ICE", "TGV", "BT", "ABT", "BDT", "AT"]
-        // Longest first: `ABT` and `ABE` both start with `AB`, and `BT` is a
-        // prefix of nothing but itself.
-        for prefix in prefixes.sorted(by: { $0.count > $1.count }) where raw.hasPrefix(prefix) {
-            return true
-        }
-        return false
-    }
-
-    /// The shape of the nose the named class carries, where it has one worth
-    /// drawing differently.
-    static func nose(for typeName: String?) -> Nose? {
-        guard let raw = typeName?.uppercased().filter({ !$0.isWhitespace }), !raw.isEmpty
-        else { return nil }
-        // The high-speed and tilting sets: an ICE, a TGV, a Giruno, an Astoro
-        // and an ICN all end in several metres of unbroken taper.
-        let streamlined = ["ICE", "TGV", "ETR", "RABE501", "RABE503", "RABDE500"]
-        if streamlined.contains(where: { raw.hasPrefix($0) }) { return .streamlined }
-        return nil
+        WagonType(typeName).flatMap { WagonCatalogue.traits(of: $0).driving }
     }
 
     /// Public because the formation panel draws the deck line off it: the
@@ -554,41 +754,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     /// exactly one place, and the side elevation must not answer it a second
     /// way and disagree with the map.
     public static func isDoubleDeck(_ typeName: String?) -> Bool {
-        guard let raw = typeName?.uppercased() else { return false }
-        // IC2000 stock carries `2E` — *zwei Etagen* — in a bracket after the
-        // class letter: `AD(2E)`, `A(2E)`, `BR(2E)`, `WRB(2E)`, `Bt(2E)Fam`.
-        // The `D` in `AD` is a luggage compartment, so reading a `D` for
-        // *Doppelstock* named the wrong letter and matched none of them, and
-        // every IC2000 the app had looked up was drawn as a single-decker.
-        //
-        // `(2E` and not `(2E)`, because the bracket does not always close after
-        // the two characters: the bicycle coach of an IC2000 rake is filed
-        // `B(2E/Velo)`. Matching the closing paren left exactly one coach of
-        // every such train without its deck line — a double-decker drawn among
-        // eight others as though it were the odd single-deck one.
-        //
-        // Nothing else in the register's naming uses that bracket: the EW IV
-        // coaches an IC2000 is strengthened with are `A4(LBT)`, `B4(LBT)-K` and
-        // `Bt4(GBT/Velo)`, and they are single-deck. `DD` is kept for the stock
-        // that spells it out. The FV-Dosto and the KISS are `RABe 502` and
-        // `RABe 511`, and the DTZ `RABe 514`.
-        return raw.contains("(2E") || raw.contains("DD") || raw.hasPrefix("RABE502") || raw.hasPrefix("RABDE502")
-            || raw.hasPrefix("RABE511") || raw.hasPrefix("RABE512") || raw.hasPrefix("RABE514")
-            || raw.hasPrefix("RABE515") || raw.hasPrefix("RABE516")
-    }
-
-    static func isMetreGauge(_ typeName: String?) -> Bool {
-        guard let raw = typeName?.uppercased() else { return false }
-        return raw.hasPrefix("ABE8/12") || raw.hasPrefix("ABE4/16") || raw.hasPrefix("GE")
-            || raw.hasPrefix("BEH") || raw.hasPrefix("ABEH")
-    }
-
-    static func defaultLength(kind: UnitKind, typeName: String?) -> Double {
-        switch kind {
-        case .locomotive: return 18.5
-        case .van: return 18.0
-        default: return isDoubleDeck(typeName) ? 26.8 : 26.4
-        }
+        WagonType(typeName).map { WagonCatalogue.traits(of: $0).doubleDeck } ?? false
     }
 
     /// What the train is, in words: "Locomotive + 8 coaches", "6-car unit".
@@ -621,6 +787,8 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         var loaded: [LayoutKey: LayoutRecord] = [:]
         var loadedPatterns: [PatternKey: LayoutRecord] = [:]
         var loadedChallengers: [PatternKey: LayoutRecord] = [:]
+        var loadedSlots: [SlotKey: LayoutRecord] = [:]
+        var loadedSlotChallengers: [SlotKey: LayoutRecord] = [:]
         // A silence goes stale in a way a formation does not. "Train 4021 is
         // not filed" is true of the day it was asked on; the train may well run
         // tomorrow. A drawing, by contrast, is the same set next week.
@@ -638,12 +806,18 @@ public final class VehicleLayoutStore: @unchecked Sendable {
                 loadedPatterns[entry.key] = entry.record
                 if let rival = entry.challenger { loadedChallengers[entry.key] = rival }
             }
+            for entry in file.slots {
+                loadedSlots[entry.key] = entry.record
+                if let rival = entry.challenger { loadedSlotChallengers[entry.key] = rival }
+            }
         }
 
         lock.lock()
         records = loaded
         patterns = loadedPatterns
         challengers = loadedChallengers
+        slots = loadedSlots
+        slotChallengers = loadedSlotChallengers
         journeys.removeAll(keepingCapacity: true)
         resolved.removeAll(keepingCapacity: true)
         dirty = false
@@ -668,6 +842,16 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         let lines = patterns
             .sorted { ($0.key.operatorName, $0.key.line) < ($1.key.operatorName, $1.key.line) }
             .map { Pattern(key: $0.key, record: $0.value, challenger: heldChallengers[$0.key]) }
+        let heldSlotChallengers = slotChallengers
+        // Sorted on the same three fields the key is, so a file written twice
+        // from the same knowledge is the same bytes — which is what makes one
+        // of these diffable when it is checked in as the bundled seed.
+        let hours = slots
+            .sorted {
+                ($0.key.pattern.operatorName, $0.key.pattern.line, $0.key.slot.weekend ? 1 : 0, $0.key.slot.hour)
+                    < ($1.key.pattern.operatorName, $1.key.pattern.line, $1.key.slot.weekend ? 1 : 0, $1.key.slot.hour)
+            }
+            .map { Slot(key: $0.key, record: $0.value, challenger: heldSlotChallengers[$0.key]) }
         let hadChanges = dirty
         dirty = false
         lock.unlock()
@@ -677,7 +861,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        let file = File(version: Self.version, entries: entries, patterns: lines)
+        let file = File(version: Self.version, entries: entries, patterns: lines, slots: hours)
         do {
             try JSONEncoder.layouts.encode(file).write(to: url, options: .atomic)
             lastError = nil
@@ -704,7 +888,16 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     /// Bump on any change of shape. A file written by an older version is
     /// discarded, which costs nothing: it is a record of questions that can be
     /// asked again.
-    static let version = 2
+    ///
+    /// 3 is where the stored layout stopped carrying a `Livery` and its units
+    /// started carrying a `WagonType`, and where lines gained the per-hour
+    /// tier. A version 2 file is not *wrong* — its formations still draw
+    /// exactly as they did, since every dimension the drawing needs was already
+    /// baked into the units — so rather than discard eight hundred learned
+    /// trains, `scripts/migrate-vehicle-layouts.py` lifts one to this version.
+    /// What it cannot invent is the class names, which version 2 never stored;
+    /// those fill in as each train is next observed.
+    static let version = 3
 
     /// How long a "the service has nothing for this train" note stands.
     static let silenceLife: TimeInterval = 7 * 24 * 3600
@@ -716,6 +909,11 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         /// workings, which the version check already rejects — defaulted so a
         /// hand-written seed need not carry an empty array.
         var patterns: [Pattern] = []
+        /// What each line runs at each hour. Defaulted for the same reason, and
+        /// legitimately empty for a long time after the format arrives: a slot
+        /// is only written once a train has actually been observed in it, and
+        /// until then every hour falls through to `patterns`.
+        var slots: [Slot] = []
     }
 
     struct Entry: Codable {
@@ -729,6 +927,16 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         /// The losing formation, where the line has been seen as more than one
         /// thing. Absent in a file written before counts, and in the common
         /// case of a line that only ever runs one set.
+        var challenger: LayoutRecord?
+    }
+
+    /// One line at one hour of one kind of day.
+    struct Slot: Codable {
+        var key: SlotKey
+        var record: LayoutRecord
+        /// The losing formation for this hour. Rarer than the line-wide one and
+        /// kept for the same reason: an hour whose stock genuinely changes has
+        /// to be able to change, without one relief working doing it.
         var challenger: LayoutRecord?
     }
 }

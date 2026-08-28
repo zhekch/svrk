@@ -1286,10 +1286,17 @@ public enum VehicleShape {
         // the train and not as part of the service, which is exactly what the
         // grey says.
         if unit.closed { return layout.livery.roof }
-        switch unit.kind {
-        case .locomotive: return layout.livery.powered
-        default: return layout.livery.body
+        // The kind first, because it is the formation service's own word and it
+        // is right about every locomotive the service files as one. The class
+        // name second, for the vehicles it is silent about: a power car at the
+        // end of a high-speed set is filed by what a passenger finds inside it,
+        // which is a luggage compartment or nothing, and it is nonetheless the
+        // vehicle that pulls and is painted like one. See `WagonCatalogue`.
+        if unit.kind == .locomotive { return layout.livery.powered }
+        if let type = unit.type, WagonCatalogue.traits(of: type).powered {
+            return layout.livery.powered
         }
+        return layout.livery.body
     }
 
     /// The roof band, the windscreens, the class stripes, and — where there is
