@@ -1083,6 +1083,9 @@ final class MapCoordinator: NSObject {
     /// carry the height itself — see `VehicleLamps` — and a tilt moves them no
     /// more than it moves the train under them.
     private var lampCamera = 0.0
+    /// When the turn last bought a tick, so a spin cannot buy one per camera
+    /// event. See `applySolidity`.
+    private var lampTickAt: CFTimeInterval = 0
 
     private func applySolidity() {
         guard styleReady, let mapView else { return }
@@ -1112,11 +1115,31 @@ final class MapCoordinator: NSObject {
             // the ground and rather less on the screen, which is under what a
             // frame can show — and the tick it would otherwise ask for is the
             // whole viewport rebuilt.
+            //
+            // **And no more than thirty of those a second, which is the whole
+            // of "rotating at zoom 20 drops the map to five frames".** The
+            // angle is the right threshold and it is not a rate: `requestTick`
+            // coalesces to one running and one queued, so it does not pile up —
+            // it runs ticks back to back as fast as they finish, and a spin at
+            // two hundred degrees a second clears a degree and a half every
+            // seven milliseconds. That asks the main actor for a hundred and
+            // thirty full ticks a second — the fleet queried, every footprint
+            // rebuilt, every source uploaded — on a loop that has never asked
+            // itself for more than thirty, and it asks for them *from inside a
+            // camera callback*, so the renderer is competing with them for the
+            // same thread. What the reader sees is the map stopping while they
+            // turn it.
+            //
+            // Capped, the lamps trail the turn by at most a thirtieth of a
+            // second mid-spin and are exact the moment it stops, because the
+            // camera event that ends the gesture finds the gate open.
             let turned = abs(
                 (camera.bearing - lampCamera).truncatingRemainder(dividingBy: 360)
             )
-            if min(turned, 360 - turned) > 1.5 {
+            let now = CACurrentMediaTime()
+            if min(turned, 360 - turned) > 1.5, now - lampTickAt > 1.0 / 30 {
                 lampCamera = camera.bearing
+                lampTickAt = now
                 model.requestTick()
             }
         }
@@ -2084,20 +2107,11 @@ final class MapCoordinator: NSObject {
             // and away as the shape draws in, and what a reader sees is one
             // marker changing into another.
             var halo = CircleLayer(id: "\(ID.vehicles)-halo", source: ID.vehicles)
-            // The shrink multiplies each *stop* rather than the curve as a
-            // whole, which reads worse and is the only form a style accepts: a
-            // `zoom` expression may only be the input to a top-level `step` or
-            // `interpolate`, so wrapping the interpolate in a `*` puts zoom one
-            // level down and the whole style is refused — every layer here,
-            // including the ones already added. The stops say the same thing.
-            halo.circleRadius = .expression(
-                Exp(.interpolate) {
-                    Exp(.linear); Exp(.zoom)
-                    6; Exp(.product) { 3.0; Exp(.get) { "shrink" } }
-                    11; Exp(.product) { 6.0; Exp(.get) { "shrink" } }
-                    16; Exp(.product) { 11.0; Exp(.get) { "shrink" } }
-                }
-            )
+            // Out of `VehicleDot` rather than written here, because the model
+            // reads the same curve to decide which of these dots are drawn
+            // underneath another one and can be left out altogether. See
+            // `AppModel.dotSpacing`.
+            halo.circleRadius = .expression(VehicleDot.radiusExpression(shrunkBy: "shrink"))
             halo.circleColor = .expression(Exp(.get) { "color" })
             halo.circleStrokeWidth = .expression(
                 Exp(.switchCase) { Exp(.get) { "selected" }; 3.0; 1.2 }
@@ -2166,7 +2180,7 @@ final class MapCoordinator: NSObject {
             labels.textOcclusionOpacity = .constant(1)
             labels.textEmissiveStrength = .constant(1)
             labels.symbolZElevate = .constant(true)
-            labels.minZoom = 11
+            labels.minZoom = VehicleDot.labelMinZoom
             try addLayer(labels, to: style)
 
             // Last, and above everything: where *you* are.

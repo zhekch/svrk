@@ -31,6 +31,25 @@ public enum Mode: String, CaseIterable, Sendable, Codable, Hashable {
     /// correcting it by re-routing over the graph is how a turning loop gets
     /// cut across. See `GeometryBuilder.reaches`.
     public var hasThroats: Bool { self == .train }
+
+    /// Draw order matters: rail modes sit above road modes so trains stay
+    /// readable in a city where a hundred buses share the same streets.
+    ///
+    /// In the module rather than beside the palette because it is no longer
+    /// only a paint order. When two vehicles are drawn at the same point the
+    /// one on top is the one the reader sees, so this is also what decides
+    /// which of them is worth keeping — see `Fleet.thinTheHidden`.
+    public var drawOrder: Int {
+        switch self {
+        case .train: return 6
+        case .metro: return 5
+        case .tram: return 4
+        case .cable: return 3
+        case .boat: return 2
+        case .bus: return 1
+        case .other: return 0
+        }
+    }
 }
 
 public enum Categories {

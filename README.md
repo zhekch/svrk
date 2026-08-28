@@ -150,6 +150,24 @@ seven-car tilting unit, a three-module tram, a twelve-metre PostAuto — each at
 its real length, on the track it is actually on, in the colours the company
 paints its stock.
 
+**Pulled back, a dot is an area, and most of them are under each other.** At
+zoom 6 a point of screen covers a kilometre, so Zurich, Bern, Geneva and Basel
+are two or three points wide apiece and each is standing two or three hundred
+services in that space. Measured over the shipped timetable on a weekday
+morning, 5,819 vehicles are in view and about 1,200 of them land anywhere a
+reader could tell apart. The rest were built into features, serialised, handed
+to the renderer, tessellated and painted every tick to put colour inside a disc
+that was already that colour, so they are no longer drawn: no two drawn
+vehicles end up closer together than the radius of the dot they are drawn as,
+which leaves 21% of the fleet at zoom 6 and 11% at zoom 5. It is an exact
+distance rather than a grid bucket, and the survivors are chosen in a fixed
+order — whatever was drawn last frame, then rail over road, then a hash of the
+id — because a greedy pass in whatever order the fleet was walked in would
+repaint a different thousand dots on every refresh. The drawn set turns over
+about one per cent a second. Nothing is thinned from zoom 11, where a vehicle
+starts carrying its line number: a dot behind a dot is nothing, but a number
+behind a dot is a service missing from the map. See `Fleet.thinTheHidden`.
+
 **The change is per vehicle, not per zoom.** A single threshold has to be set
 for the average vehicle, and there is no average vehicle: an IC is thirty times
 the length of a minibus. So each one arrives when *it* is long enough on screen

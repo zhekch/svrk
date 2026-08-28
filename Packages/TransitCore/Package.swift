@@ -19,5 +19,10 @@ let package = Package(
             name: "TransitCore",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .testTarget(
+            name: "TransitCoreTests",
+            dependencies: ["TransitCore"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

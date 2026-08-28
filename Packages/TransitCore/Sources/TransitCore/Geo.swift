@@ -79,6 +79,39 @@ public struct BBox: Hashable, Sendable, Codable {
         let lonPad = metres / (Geo.metresPerDegree * max(0.2, cos(Geo.toRad(midLat))))
         return BBox(west: west - lonPad, south: south - latPad, east: east + lonPad, north: north + latPad)
     }
+
+    /// The box this one sweeps out when the camera is turned about its centre.
+    ///
+    /// **A viewport is a function of the bearing as well as of the ground.** The
+    /// map reports what is on screen as the axis-aligned box around it, and a
+    /// tall screen turned forty-five degrees describes a box half as wide again
+    /// as the same screen turned none — over the very same piece of ground, with
+    /// the camera in the very same place.
+    ///
+    /// That matters because everything the map fetches by viewport and does not
+    /// redraw per frame — the rails, the tunnels, the platform plates, the stops
+    /// — is held against the box it was fetched for and refetched the moment the
+    /// view leaves it. Rotating on the spot moves the map not at all and walked
+    /// straight out of every one of those boxes, several times over in one
+    /// gesture, each time for ground that had already been fetched.
+    ///
+    /// So a hold is taken over the circle the screen turns inside: the square
+    /// around this box's own circumscribed circle, which every rotation about
+    /// the centre stays within. It costs about twice the area on a fetch that
+    /// happens when the map is panned or zoomed, and it makes a rotation free.
+    public func turned() -> BBox {
+        let midLat = (north + south) / 2
+        let perLon = Geo.metresPerDegree * max(0.2, cos(Geo.toRad(midLat)))
+        let halfWide = (east - west) / 2 * perLon
+        let halfHigh = (north - south) / 2 * Geo.metresPerDegree
+        let radius = (halfWide * halfWide + halfHigh * halfHigh).squareRoot()
+        let midLon = (west + east) / 2
+        let lon = radius / perLon, lat = radius / Geo.metresPerDegree
+        return BBox(
+            west: midLon - lon, south: midLat - lat,
+            east: midLon + lon, north: midLat + lat
+        )
+    }
 }
 
 public enum Geo {
