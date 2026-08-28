@@ -156,6 +156,59 @@ public struct StoredWagon: Sendable, Codable, Hashable {
     }
 }
 
+/// What has actually been measured about a class of stock.
+///
+/// The one number the catalogue cannot read off a name. `A(2E)` says
+/// double-deck and `RABe 525` says a three-car NINA, but neither says how long
+/// a car is, and the difference is not small: every multiple unit in the
+/// country was being drawn at intercity-coach length, which turns a 47-metre
+/// NINA into 79 metres of train. Length is the one thing a top view can say
+/// that a dot cannot, so getting it wrong is most of the drawing being wrong.
+///
+/// Guessing a table of them would have been worse than the average it replaced
+/// — a few hundred classes, hand-written from memory, confidently wrong. The
+/// register sends a real measurement with every formation, so this is learned
+/// instead, and it belongs to the *class* rather than to the formation: a
+/// `RABe 515` car is the same length on every train that has one, so it is
+/// stored once and not once per wagon per working.
+public struct ClassFacts: Sendable, Codable, Equatable {
+    /// Mean body length over couplers, in metres.
+    public var length: Double
+    /// How many vehicles have gone into that mean.
+    ///
+    /// A mean rather than the last value seen, because the register is not
+    /// perfect: a coach occasionally comes through with a length that belongs
+    /// to the whole train or to nothing at all, and one of those should move
+    /// the answer a little rather than replace it.
+    public var count: Int
+
+    public init(length: Double, count: Int = 1) {
+        self.length = length
+        self.count = count
+    }
+
+    /// This class, having seen one more vehicle of it.
+    public func adding(_ measured: Double) -> ClassFacts {
+        // Capped so a class the app has watched all year still moves when the
+        // stock genuinely changes, and so the arithmetic cannot drift.
+        let weight = min(count, 50)
+        return ClassFacts(
+            length: (length * Double(weight) + measured) / Double(weight + 1),
+            count: count + 1
+        )
+    }
+
+    /// Whether a length the register gave is worth believing.
+    ///
+    /// A vehicle shorter than a car or longer than two coaches is the register
+    /// answering a different question — the length of the whole train, or a
+    /// field left at zero.
+    public static func plausible(_ metres: Double?) -> Double? {
+        guard let metres, metres > 4, metres < 60 else { return nil }
+        return metres
+    }
+}
+
 /// What a class name says about the vehicle it names.
 ///
 /// Every field here was already being computed — scattered across five static
@@ -494,8 +547,13 @@ public enum WagonCatalogue {
     ///   line normally runs, so its own body is a far better guess than a
     ///   global average, and the count — which *is* real evidence — still
     ///   comes from the observation. Ignored for any wagon that has a name.
+    /// - Parameter measured: what a class of stock has actually been measured
+    ///   at, by family — see `ClassFacts`. Where a class is in here it wins
+    ///   over everything the name merely implies, because it is the one figure
+    ///   that was observed rather than deduced.
     public static func units(
-        from wagons: [StoredWagon], like template: VehicleUnit? = nil
+        from wagons: [StoredWagon], like template: VehicleUnit? = nil,
+        measured: [String: ClassFacts] = [:]
     ) -> [VehicleUnit] {
         guard !wagons.isEmpty else { return [] }
         let kinds = wagons.map { kind(of: $0) }
@@ -535,9 +593,14 @@ public enum WagonCatalogue {
             let cabFront = kind == .locomotive ? true : (leading && cabAtFront)
             let cabBack = kind == .locomotive ? true : (trailing && cabAtBack)
 
+            // Measured first, implied second. A class the app has watched is
+            // drawn at the length it was seen to be; one it has not is drawn at
+            // whatever its name suggests.
+            let observed = wagon.type.flatMap { measured[$0.family]?.length }
+
             return VehicleUnit(
                 kind: kind,
-                length: kind == .van ? 18.0 : traits.length,
+                length: observed ?? (kind == .van ? 18.0 : traits.length),
                 width: traits.width,
                 cabFront: cabFront, cabBack: cabBack,
                 // Only on a vehicle that pulls. A driving trailer has a cab and
@@ -562,9 +625,9 @@ public enum WagonCatalogue {
     /// A whole train, drawn from its wagons' names.
     public static func layout(
         of wagons: [StoredWagon], livery: Livery, like template: VehicleUnit? = nil,
-        source: LayoutSource = .observed
+        measured: [String: ClassFacts] = [:], source: LayoutSource = .observed
     ) -> VehicleLayout? {
-        let units = units(from: wagons, like: template)
+        let units = units(from: wagons, like: template, measured: measured)
         guard !units.isEmpty else { return nil }
         return VehicleLayout(
             units: units, livery: livery, name: name(units: units), source: source

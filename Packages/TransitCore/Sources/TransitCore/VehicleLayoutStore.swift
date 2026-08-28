@@ -173,6 +173,14 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     private var slots: [SlotKey: LayoutRecord] = [:]
     /// The losing formation for one slot, on the same terms as `challengers`.
     private var slotChallengers: [SlotKey: LayoutRecord] = [:]
+    /// What each class of stock has been measured at, by family.
+    ///
+    /// Kept apart from the formations on purpose. A length belongs to the
+    /// class, not to the working: a `RABe 515` car is the same length on every
+    /// train that has one, so it is worth storing once rather than once per
+    /// wagon per working — which is what the old per-unit dimensions were.
+    /// A few hundred numbers against six and a half thousand.
+    private var classes: [String: ClassFacts] = [:]
     /// Resolved layouts, so a screenful of vehicles is not a screenful of
     /// table lookups and string folding fifteen times a second.
     private var resolved: [ResolvedKey: VehicleLayout] = [:]
@@ -319,6 +327,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
             slot.flatMap { slots[SlotKey(pattern: key, slot: $0)]?.wagons }
                 ?? patterns[key]?.wagons
         }
+        let knownClasses = remembered == nil ? [:] : classes
         lock.unlock()
 
         let paint = LayoutLibrary.livery(
@@ -334,7 +343,10 @@ public final class VehicleLayoutStore: @unchecked Sendable {
             operatorName: vehicle.operatorName, modeColour: modeColour, variant: variant
         )
         let learned = exact ?? remembered.flatMap {
-            WagonCatalogue.layout(of: $0, livery: paint, like: Self.representative(of: guess))
+            WagonCatalogue.layout(
+                of: $0, livery: paint, like: Self.representative(of: guess),
+                measured: knownClasses
+            )
         }
         let answer = learned?.painted(paint) ?? guess
 
@@ -440,6 +452,19 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         return slots[key]
     }
 
+    /// What a class of stock has been measured at, for anything that wants to
+    /// know without going through a formation.
+    public func facts(forClass family: String) -> ClassFacts? {
+        lock.lock(); defer { lock.unlock() }
+        return classes[family]
+    }
+
+    /// How many classes of stock have been measured.
+    public var classCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return classes.count
+    }
+
     /// How many line-and-hour combinations have been observed.
     public var slotCount: Int {
         lock.lock(); defer { lock.unlock() }
@@ -523,7 +548,15 @@ public final class VehicleLayoutStore: @unchecked Sendable {
 
         let incoming = LayoutRecord(wagons: wagons, seen: moment, count: 1)
 
+        // What the register measured, filed against the class rather than the
+        // train. This is the only place a real dimension enters the database,
+        // and it is what lets a NINA stop being drawn at intercity length.
+        let measurements = Self.measurements(from: formation, at: moment)
+
         lock.lock()
+        for (family, metres) in measurements {
+            classes[family] = classes[family]?.adding(metres) ?? ClassFacts(length: metres)
+        }
         records[key] = incoming
         // This journey is always drawn as what the service just said, even
         // when that is not what the line usually runs.
@@ -544,9 +577,11 @@ public final class VehicleLayoutStore: @unchecked Sendable {
             // loan a formation of nameless wagons came out as a rake of 26.4 m
             // coaches, matched nothing, and the tie never broke.
             let template = Self.representative(of: guess)
+            let known = classes
             let agrees: (LayoutRecord) -> Bool = { record in
-                WagonCatalogue.layout(of: record.wagons, livery: paint, like: template)
-                    .map(guess.drawsAlike) ?? false
+                WagonCatalogue.layout(
+                    of: record.wagons, livery: paint, like: template, measured: known
+                ).map(guess.drawsAlike) ?? false
             }
             Self.tally(
                 incoming, at: pattern, incumbents: &patterns,
@@ -690,6 +725,33 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         ).resolvingStripes()
     }
 
+    /// What this formation measured, by class.
+    ///
+    /// One entry per class rather than per vehicle: eight cars of the same
+    /// class in one train are one measurement of that class, not eight, or a
+    /// long train would outvote every other sighting of the stock in it.
+    static func measurements(
+        from formation: TrainFormation, at moment: Date
+    ) -> [String: Double] {
+        let stops = formation.stops.filter { !$0.isEmpty }
+        guard let stop = stops.min(by: { $0.distance(from: moment) < $1.distance(from: moment) })
+            ?? stops.first
+        else { return [:] }
+
+        var found: [String: [Double]] = [:]
+        for coach in stop.coaches {
+            guard let type = WagonType(coach.typeName),
+                  let metres = ClassFacts.plausible(coach.length)
+            else { continue }
+            found[type.family, default: []].append(metres)
+        }
+        // The middle measurement of the class within this train, so one coach
+        // filed with the length of the whole rake does not carry the class.
+        return found.compactMapValues { lengths in
+            lengths.isEmpty ? nil : lengths.sorted()[lengths.count / 2]
+        }
+    }
+
     /// The vehicles of a train, as names to be written down.
     ///
     /// Read at the stop nearest the moment asked about, for the same reason
@@ -767,6 +829,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         var loadedChallengers: [PatternKey: LayoutRecord] = [:]
         var loadedSlots: [SlotKey: LayoutRecord] = [:]
         var loadedSlotChallengers: [SlotKey: LayoutRecord] = [:]
+        var loadedClasses: [String: ClassFacts] = [:]
         // A silence goes stale in a way a formation does not. "Train 4021 is
         // not filed" is true of the day it was asked on; the train may well run
         // tomorrow. A drawing, by contrast, is the same set next week.
@@ -788,6 +851,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
                 loadedSlots[entry.key] = entry.record
                 if let rival = entry.challenger { loadedSlotChallengers[entry.key] = rival }
             }
+            for entry in file.classes { loadedClasses[entry.family] = entry.facts }
         }
 
         lock.lock()
@@ -796,6 +860,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         challengers = loadedChallengers
         slots = loadedSlots
         slotChallengers = loadedSlotChallengers
+        classes = loadedClasses
         journeys.removeAll(keepingCapacity: true)
         resolved.removeAll(keepingCapacity: true)
         dirty = false
@@ -830,6 +895,9 @@ public final class VehicleLayoutStore: @unchecked Sendable {
                     < ($1.key.pattern.operatorName, $1.key.pattern.line, $1.key.slot.weekend ? 1 : 0, $1.key.slot.hour)
             }
             .map { Slot(key: $0.key, record: $0.value, challenger: heldSlotChallengers[$0.key]) }
+        let stock = classes
+            .sorted { $0.key < $1.key }
+            .map { Stock(family: $0.key, facts: $0.value) }
         let hadChanges = dirty
         dirty = false
         lock.unlock()
@@ -839,7 +907,10 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        let file = File(version: Self.version, entries: entries, patterns: lines, slots: hours)
+        let file = File(
+            version: Self.version, entries: entries, patterns: lines,
+            slots: hours, classes: stock
+        )
         do {
             try JSONEncoder.layouts.encode(file).write(to: url, options: .atomic)
             lastError = nil
@@ -896,6 +967,43 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         /// is only written once a train has actually been observed in it, and
         /// until then every hour falls through to `patterns`.
         var slots: [Slot] = []
+        /// What each class of stock has been measured at. A few hundred numbers
+        /// that make every formation in the file draw at the right length.
+        var classes: [Stock] = []
+
+        init(
+            version: Int, entries: [Entry], patterns: [Pattern] = [],
+            slots: [Slot] = [], classes: [Stock] = []
+        ) {
+            self.version = version
+            self.entries = entries
+            self.patterns = patterns
+            self.slots = slots
+            self.classes = classes
+        }
+
+        /// Every list but `entries` is optional, and written by hand rather
+        /// than synthesised because a default value does not make a synthesised
+        /// decoder tolerant of a missing key — it still throws, the file is
+        /// rejected whole, and a store that rejects its seed looks exactly like
+        /// one that has forgotten everything it was ever told. That is how
+        /// adding `classes` silently emptied a database of eight hundred
+        /// trains, and it is worth one explicit initialiser to make the next
+        /// addition harmless.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            version = try c.decode(Int.self, forKey: .version)
+            entries = try c.decodeIfPresent([Entry].self, forKey: .entries) ?? []
+            patterns = try c.decodeIfPresent([Pattern].self, forKey: .patterns) ?? []
+            slots = try c.decodeIfPresent([Slot].self, forKey: .slots) ?? []
+            classes = try c.decodeIfPresent([Stock].self, forKey: .classes) ?? []
+        }
+    }
+
+    /// One class of rolling stock, and what it measures.
+    struct Stock: Codable {
+        var family: String
+        var facts: ClassFacts
     }
 
     struct Entry: Codable {
