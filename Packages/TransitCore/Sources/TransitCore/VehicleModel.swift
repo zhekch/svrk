@@ -59,6 +59,13 @@ public struct VehicleModelKey: Hashable, Sendable {
         livery: Livery, headLamps: Bool = false, tailLamps: Bool = false
     ) {
         self.unit = unit
+        // Folded to the class, because the raw register name is finer than a
+        // shape. An eight-car unit arrives as eight names — `RABe515_6_1` up to
+        // `_6_8` — for what is at most two distinct bodies, and a key that kept
+        // them apart would bake, upload and hold eight copies of one mesh. The
+        // name is still on the unit in the layout, where it is evidence; here
+        // it is only allowed to be as specific as the drawing is.
+        self.unit.type = unit.type?.canonical
         self.mode = mode
         self.front = front
         self.back = back

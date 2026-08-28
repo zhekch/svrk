@@ -3153,7 +3153,8 @@ final class AppModel {
                 let learned = layouts.learn(
                     found, key: LayoutKey(key), at: Date(),
                     mode: vehicle.mode, category: vehicle.category, line: vehicle.line,
-                    operatorName: vehicle.operatorName, modeColour: vehicle.mode.hex
+                    operatorName: vehicle.operatorName, modeColour: vehicle.mode.hex,
+                    slot: layouts.slot(for: vehicle)
                 )
                 // At a terminus the panel describes the working the train
                 // *becomes*, and that is the number the formation was fetched
@@ -3166,7 +3167,13 @@ final class AppModel {
                     layouts.learn(
                         found, key: alsoKnownAs, at: Date(),
                         mode: arriving.mode, category: arriving.category, line: arriving.line,
-                        operatorName: arriving.operatorName, modeColour: arriving.mode.hex
+                        operatorName: arriving.operatorName, modeColour: arriving.mode.hex,
+                        // The arriving working's own hour, not the departing
+                        // one's. It is one physical train and two workings, and
+                        // the whole point of a slot is that those are filed
+                        // apart — a set that comes in at 09:58 and goes out at
+                        // 10:04 belongs to both hours, once each.
+                        slot: layouts.slot(for: arriving)
                     )
                 }
                 if learned { requestTick() }
@@ -3284,7 +3291,8 @@ final class AppModel {
             let changed = layouts.learn(
                 raw, key: stored, at: Date(), mode: vehicle.mode,
                 category: vehicle.category, line: vehicle.line,
-                operatorName: vehicle.operatorName, modeColour: vehicle.mode.hex
+                operatorName: vehicle.operatorName, modeColour: vehicle.mode.hex,
+                slot: layouts.slot(for: vehicle)
             )
             // Only where the drawing actually differs from what is on screen.
             // A confirmation changes nothing to redraw.
