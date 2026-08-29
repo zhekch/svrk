@@ -28,11 +28,38 @@ enum Format {
     ///
     /// With the "in". A bare "23 min" beside a clock time reads as a duration —
     /// a journey of twenty-three minutes — and the one word settles it.
+    ///
+    /// Past midnight it says which day instead of repeating the clock. A board
+    /// reads a day ahead now — the last boat of the evening, the first bus of
+    /// the morning — and `01:26` under `01:26` at eleven at night is the one
+    /// reading of it that is actually wrong.
     static func relative(_ stamp: Timestamp, from now: Timestamp) -> String {
         let minutes = Int(((Double(stamp - now)) / 60).rounded())
         if minutes == 0 { return "now" }
-        if minutes > 0 { return minutes < 60 ? "in \(minutes) min" : time(stamp) }
-        return "\(-minutes) min ago"
+        if minutes < 0 { return "\(-minutes) min ago" }
+        if minutes < 60 { return "in \(minutes) min" }
+        guard let days = calendarDays(from: now, to: stamp), days > 0 else { return time(stamp) }
+        return days == 1 ? "tomorrow" : weekday(stamp)
+    }
+
+    /// How many local midnights lie between two moments.
+    private static func calendarDays(from: Timestamp, to: Timestamp) -> Int? {
+        let calendar = Calendar.current
+        return calendar.dateComponents(
+            [.day],
+            from: calendar.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(from))),
+            to: calendar.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(to)))
+        ).day
+    }
+
+    private static let weekdayName: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("EEE")
+        return formatter
+    }()
+
+    static func weekday(_ stamp: Timestamp) -> String {
+        weekdayName.string(from: Date(timeIntervalSince1970: TimeInterval(stamp)))
     }
 
     /// A call note from the feed, in English, or nil where it says nothing.

@@ -389,6 +389,272 @@ public final class TimetableStore: @unchecked Sendable {
             && box.s <= clip.north && box.n >= clip.south
     }
 
+    // MARK: - Stations
+
+    /// Which station each stop slot belongs to, as an id into `stationSlots`.
+    ///
+    /// A departure board asks the opposite question to the map's: not "what is
+    /// running in this hour" but "what calls at this stop, whenever it next
+    /// does", and the packed file is laid out for the first one — trips sorted
+    /// by start minute, calls reachable only through their pattern. Answering
+    /// the second without reading three million calls on every tap needs the
+    /// inverse, and it is built here in two steps, both lazily because a map
+    /// that is only being drawn never asks:
+    ///
+    /// - **Slot to station.** One pass over the 81,756 stop slots, interning the
+    ///   station each belongs to. `ch:1:sloid:7000:1:21` and `ch:1:sloid:7000`
+    ///   are the same station, which is exactly the join a board is made of.
+    /// - **Station to patterns.** A pass over every pattern's calls, kept per
+    ///   station once it has been asked for. A pattern runs a dozen times a day
+    ///   and a reader taps a handful of stops, so this is paid once and read
+    ///   back on every later board for the same place.
+    private var stationOfSlot: [Int32] = []
+    private var stationSlots: [String: Int32] = [:]
+    private var patternsByKey: [String: [Int32]] = [:]
+
+    private func prepareStations() {
+        guard stationOfSlot.count != stopCount else { return }
+        var ids: [String: Int32] = [:]
+        var out = [Int32](repeating: -1, count: stopCount)
+        for slot in 0..<stopCount {
+            let station = Self.station(ofSlotRef: stopRef(slot))
+            guard !station.isEmpty else { continue }
+            if let id = ids[station] {
+                out[slot] = id
+            } else {
+                let id = Int32(ids.count)
+                ids[station] = id
+                out[slot] = id
+            }
+        }
+        stationOfSlot = out
+        stationSlots = ids
+    }
+
+    /// `StopRegister.stationOf`, over the whole stop table without the litter.
+    ///
+    /// The register's own version splits on every colon and joins the first
+    /// four back together, which is three allocations for a string that is a
+    /// prefix of the one it was given. Run 68,445 times — once per slot — that
+    /// is most of the cost of the pass, and the answer is the same: everything
+    /// up to the fourth colon, with a `_gen` suffix cut off first.
+    static func station(ofSlotRef ref: String) -> String {
+        var colons = 0
+        var end = ref.utf8.count
+        var index = 0
+        for byte in ref.utf8 {
+            if byte == 0x3a { // ':'
+                colons += 1
+                if colons == 4 { end = index; break }
+            }
+            index += 1
+        }
+        if colons < 4 {
+            // Fewer than four parts is a station reference already. `_gen` is
+            // the register's own marker for a generated row and never belongs
+            // to the identifier.
+            guard let cut = ref.range(of: "_gen") else { return ref }
+            return String(ref[ref.startIndex..<cut.lowerBound])
+        }
+        return String(decoding: Array(ref.utf8.prefix(end)), as: UTF8.self)
+    }
+
+    /// Which trips run each pattern, so a board can walk the dozen trips of the
+    /// patterns that call there rather than the two million in the file.
+    ///
+    /// The trip table is sorted by start minute across the whole year, which is
+    /// exactly the order a map wants and the wrong one for a stop: asking for
+    /// the next day at one place touches most of the file. Grouped by pattern
+    /// it is 2,071,007 rows over 179,287 patterns — eleven trips a pattern — and
+    /// a board reads only the groups its own station names. Measured on the
+    /// packed feed, that took the first board for a station from 149 ms to
+    /// 33 ms and every later one to under a millisecond.
+    ///
+    /// It costs nine megabytes of `Int32` for the session and is built on the
+    /// first board rather than at load, so a map that is only being looked at
+    /// never pays for it.
+    private var patternTripsAt: [Int32] = []
+    private var patternTrips: [Int32] = []
+
+    private func prepareTripsByPattern() {
+        guard patternTrips.count != tripCount else { return }
+        var offsets = [Int32](repeating: 0, count: patternCount + 1)
+        for i in 0..<tripCount {
+            let pattern = tripPattern(i)
+            guard pattern < patternCount else { continue }
+            offsets[pattern + 1] += 1
+        }
+        for i in 1...patternCount { offsets[i] += offsets[i - 1] }
+        var fill = offsets
+        var rows = [Int32](repeating: 0, count: tripCount)
+        for i in 0..<tripCount {
+            let pattern = tripPattern(i)
+            guard pattern < patternCount else { continue }
+            rows[Int(fill[pattern])] = Int32(i)
+            fill[pattern] += 1
+        }
+        patternTripsAt = offsets
+        patternTrips = rows
+    }
+
+    /// The patterns that call at any slot this board accepts.
+    ///
+    /// Remembered under `key`, because the question is asked again on every tap
+    /// of the same place and the answer is a property of the timetable rather
+    /// than of the hour.
+    ///
+    /// `accepting` is what makes a *platform* board a platform board. Asked for
+    /// the station instead, the patterns are every pattern calling anywhere at
+    /// Bern, Bahnhof — hundreds of them — and the schedule then fills the
+    /// board's whole budget with trips leaving from kerbs A to Z, of which
+    /// almost none call at stop M. That is exactly what the screenshot showed:
+    /// three departures on a kerb with a Moonliner booked through it at 01:45.
+    /// The station test is an array read; the caller's test is only ever run on
+    /// the slots that belong to the station, a few dozen out of 68,445.
+    private func patterns(
+        callingAt stations: Set<String>, key: String, accepting: ((String) -> Bool)? = nil
+    ) -> [Int32] {
+        prepareStations()
+        if let known = patternsByKey[key] { return known }
+
+        var ids = Set<Int32>()
+        for station in stations {
+            if let id = stationSlots[station] { ids.insert(id) }
+        }
+        var slots = [Bool](repeating: false, count: stopCount)
+        var any = false
+        if !ids.isEmpty {
+            for slot in 0..<stopCount {
+                let station = stationOfSlot[slot]
+                guard station >= 0, ids.contains(station) else { continue }
+                if let accepting, !accepting(stopRef(slot)) { continue }
+                slots[slot] = true
+                any = true
+            }
+        }
+        // Asked and answered: a place the timetable has no slot for has no
+        // patterns, and remembering that is what stops every later board
+        // scanning the file to find out again.
+        guard any else {
+            patternsByKey[key] = []
+            return []
+        }
+
+        var found: [Int32] = []
+        for index in 0..<patternCount {
+            let at = patternIndexAt + index * 8
+            let offset = Int(bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
+            let count = Int(bytes.loadUnaligned(fromByteOffset: at + 4, as: UInt32.self))
+            for c in 0..<count {
+                let slot = Int(bytes.loadUnaligned(
+                    fromByteOffset: patternCallsAt + offset + c * Self.callStride, as: UInt32.self
+                ))
+                guard slot < slots.count, slots[slot] else { continue }
+                found.append(Int32(index))
+                break
+            }
+        }
+        patternsByKey[key] = found
+        return found
+    }
+
+    /// The pattern a trip row runs, read on its own.
+    ///
+    /// Four bytes rather than the twenty-two `trip` reads, because for a board
+    /// this is the rejection that throws away 99% of the day: at Bern, 2,300 of
+    /// a weekday's 215,943 trips call there.
+    private func tripPattern(_ i: Int) -> Int {
+        Int(bytes.loadUnaligned(fromByteOffset: tripsAt + i * Self.tripStride, as: UInt32.self))
+    }
+
+    /// What the printed timetable has calling at these stations, over a span
+    /// the drawn window has no reason to cover.
+    ///
+    /// This is what a departure board is actually asking. The map's expansion is
+    /// an hour wide and is about what can be *drawn*; a board is about what
+    /// leaves, and at a lakeside landing with four boats a day, or a city stop
+    /// at one in the morning waiting on a night bus, the next departure is
+    /// hours outside that hour. Asked over the same file with the same builder,
+    /// so a row from here is the same journey the map would have drawn had the
+    /// clock been moved to it.
+    ///
+    /// `limit` is a ceiling on journeys *built*, and the scan is in start-minute
+    /// order, so a busy station stops early and a quiet one walks a cheap
+    /// integer rejection over the day.
+    public func journeys(
+        callingAt stations: Set<String>,
+        key: String? = nil,
+        accepting: ((String) -> Bool)? = nil,
+        from: Timestamp,
+        to: Timestamp,
+        zone: TimeZone = TimeZone(identifier: "Europe/Zurich") ?? .current,
+        limit: Int = 120,
+        place: (String) -> Place?,
+        operatorName: (String) -> String? = { _ in nil }
+    ) -> [Journey] {
+        guard isReady, to >= from, !stations.isEmpty else { return [] }
+        let wanted = patterns(
+            callingAt: stations,
+            key: key ?? stations.sorted().joined(separator: "|"),
+            accepting: accepting
+        )
+        guard !wanted.isEmpty else { return [] }
+        prepareTripsByPattern()
+
+        // The service days in reach. Yesterday too, for the same reason the
+        // window query considers it: a night service filed under yesterday
+        // leaves at 25:40.
+        var days: [(index: Int, zero: Timestamp, opened: Int, closes: Int)] = []
+        var cursor = Date(timeIntervalSince1970: TimeInterval(from) - 86400)
+        let lastDay = Date(timeIntervalSince1970: TimeInterval(to))
+        while cursor <= lastDay {
+            defer { cursor = cursor.addingTimeInterval(86400) }
+            guard let zero = Self.dayStart(cursor, zone: zone) else { continue }
+            let index = Self.daysSince1970(cursor, zone: zone) - feedStart
+            guard index >= 0, index < dayCount else { continue }
+            let closes = Int((to - zero) / 60)
+            guard closes >= 0 else { continue }
+            days.append((index, zero, Int((from - zero) / 60), closes))
+        }
+        guard !days.isEmpty else { return [] }
+
+        // Every trip of every pattern that calls here, against every day it
+        // could be running on. Ordered by when it leaves its own origin, which
+        // is the order it is built in — a board sorts by the call at *this*
+        // stop afterwards, and cannot sort what was never built.
+        var candidates: [(at: Timestamp, row: Int, day: Int, zero: Timestamp)] = []
+        for pattern in wanted {
+            let index = Int(pattern)
+            guard index < patternCount else { continue }
+            let duration = Int(patternDuration[index])
+            for slot in Int(patternTripsAt[index])..<Int(patternTripsAt[index + 1]) {
+                let row = Int(patternTrips[slot])
+                let start = Int(tripStart[row])
+                var service = -1
+                for day in days {
+                    if start > day.closes || start + duration < day.opened { continue }
+                    if service < 0 { service = trip(row).service }
+                    guard runs(service: service, onDay: day.index) else { continue }
+                    candidates.append((day.zero + Timestamp(start) * 60, row, day.index, day.zero))
+                }
+            }
+        }
+        candidates.sort { $0.at < $1.at }
+
+        var out: [Journey] = []
+        out.reserveCapacity(min(limit, candidates.count))
+        for candidate in candidates {
+            if out.count >= limit { break }
+            if let journey = build(
+                trip(candidate.row), row: candidate.row, dayZero: candidate.zero,
+                place: place, operatorName: operatorName
+            ) {
+                out.append(journey)
+            }
+        }
+        return out
+    }
+
     private struct Class {
         var line: String?
         var headsign: String?

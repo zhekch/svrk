@@ -15,6 +15,12 @@ public struct VehicleSnapshot: Sendable, Identifiable, Equatable {
     public var journeyRef: String?
     public var mode: Mode
     public var category: String?
+    /// Which of the four things `.cable` means, resolved rather than stated.
+    ///
+    /// Nil for everything that is not a cable service. See
+    /// `Fleet.cableKind(of:)`, which works it out, and
+    /// `LayoutLibrary.CableKind`, which says why the question exists.
+    public var cable: LayoutLibrary.CableKind?
     public var line: String
     public var operatorName: String?
     public var operatorFull: String?
@@ -67,7 +73,8 @@ public struct VehicleSnapshot: Sendable, Identifiable, Equatable {
     /// A complete snapshot for clients that render a vehicle without querying
     /// the fleet actor, including SwiftUI previews.
     public init(
-        id: String, mode: Mode, category: String? = nil, line: String,
+        id: String, mode: Mode, category: String? = nil,
+        cable: LayoutLibrary.CableKind? = nil, line: String,
         operatorName: String? = nil, operatorFull: String? = nil,
         to: String? = nil, from: String, delay: Int? = nil,
         lon: Double, lat: Double, bearing: Double = 0, moving: Bool = false,
@@ -81,6 +88,7 @@ public struct VehicleSnapshot: Sendable, Identifiable, Equatable {
         self.journeyRef = journeyRef
         self.mode = mode
         self.category = category
+        self.cable = cable
         self.line = line
         self.operatorName = operatorName
         self.operatorFull = operatorFull
@@ -155,11 +163,12 @@ public struct StationBoard: Sendable, Equatable {
     public var lat: Double
     public var now: Timestamp
     public var departures: [BoardEntry]
-    /// Lines the mapped routes say call here, running or not.
+    /// Lines the mapped routes say call here that have nothing on the board.
     ///
     /// Carried on the board rather than fetched by the panel so the two halves
-    /// of the answer — what is running, and what serves this place at all —
-    /// arrive together and cannot disagree about which stop they describe.
+    /// of the answer — what is running, and what else serves this place —
+    /// arrive together and cannot disagree about which stop they describe, or
+    /// list the same line twice between them.
     public var serving: [ServingLine] = []
 }
 
@@ -176,7 +185,7 @@ public struct PlatformBoard: Sendable, Equatable {
     /// these are the station's departures. Said plainly rather than passed off
     /// as a platform board.
     public var stationOnly: Bool
-    /// Lines the mapped routes say call here, running or not.
+    /// Lines the mapped routes say call here that have nothing on the board.
     public var serving: [ServingLine] = []
     /// The OpenStreetMap element this board was opened from, where it was
     /// opened by tapping a drawn platform rather than a plate.
@@ -1313,6 +1322,147 @@ public actor Fleet {
     /// file of this module.
     func fleetVehicles() -> [Journey] { Array(fleetByID().values) }
 
+    // MARK: - Which of the four things a cable service is
+
+    /// Answered once per line and then remembered. There are 78 cable lines in
+    /// the country and a busy gondola puts forty cabins on one of them.
+    private var cableKinds: [String: LayoutLibrary.CableKind] = [:]
+
+    /// Shortest an aerial ropeway gets, in metres.
+    ///
+    /// Below this it is not a ropeway, it is a lift. The Matte–Münsterplattform
+    /// in Bern is a hundred metres of inclined elevator up the side of the
+    /// Aare terrace, filed under the same mode as the Schilthornbahn, and it
+    /// runs in a concrete shaft rather than on a rope. Nothing in the data says
+    /// so; its length does.
+    static let shortestRopeway = 250.0
+
+    /// Which of the four vehicles this cable service runs.
+    ///
+    /// **The feed states this and the packed archive does not.** SIRI carries a
+    /// product category — `GB`, `LB`, `FUN` — and where there is one it is
+    /// taken and nothing here is guessed at. But the timetable pack collapses
+    /// GTFS's route types to one `Mode` per route before the app ever sees
+    /// them, so every cable run read out of the archive arrives with
+    /// `category == nil`; and since the archive is where nearly all of them
+    /// come from, "unstated" is the normal case rather than the corner. Left at
+    /// the old default, every ropeway in the Alps was drawn as a funicular car
+    /// standing on the mountainside.
+    ///
+    /// **So it is inferred, and the inference is a fact about the ground rather
+    /// than a guess about the name.** A funicular runs on rails. Those rails
+    /// are in OpenStreetMap as `railway=funicular`, they are in the packed
+    /// graph under the `funicular` class, and `RailNet` will route a leg over
+    /// them. An aerial ropeway runs on a rope, which is in no graph at all —
+    /// so a cable leg the graph cannot route is a cable leg with nothing under
+    /// it, and a vehicle with nothing under it hangs.
+    ///
+    /// Measured over the whole national timetable: of 78 cable lines, 26 route
+    /// over funicular track and **every one of them is a funicular** — the
+    /// Polybahn, the Dolderbahn, the Harderbahn, Territet–Glion, the four
+    /// Neuchâtel FUNIs, Ligerz–Prêles. The other 52 route over nothing and all
+    /// but one are ropeways — the Riederalpbahn, the Schilthornbahn, Weggis–
+    /// Rigi Kaltbad, and the whole shelf of Valais village Luftseilbahnen at
+    /// Unterbäch, Eischoll, Jeizinen, Gspon and Isérables. The exception is the
+    /// Emosson Minifunic, a funicular too small for anyone to have mapped, and
+    /// it says `FUN` in its own line code.
+    ///
+    /// The name rules are only there for that last case and for the lifts. They
+    /// are read before the graph, because a service that says what it is should
+    /// be believed ahead of an inference about it.
+    func cableKind(of journey: Journey) -> LayoutLibrary.CableKind? {
+        if let stated = LayoutLibrary.cableKind(of: journey.category) { return stated }
+        guard journey.mode == .cable else { return nil }
+
+        let key = "\(journey.operatorName ?? "")|\(journey.line)"
+        if let known = cableKinds[key] { return known }
+        let resolved = resolveCable(journey)
+        // Remembered only once there is a graph to have asked. Half of this
+        // answer is "the search found no track", and a search that could not
+        // run finds no track either — so an answer reached before `railnet.bin`
+        // was mapped would put every funicular in the country on a rope, and
+        // being memoised it would stay there for the life of the process.
+        if railnet.isReady { cableKinds[key] = resolved }
+        return resolved
+    }
+
+    /// Words a service uses about itself, in the four languages it might.
+    ///
+    /// **Matched as whole words, and that is not fussiness.** The first version
+    /// of this looked for the substring `funi`, which is how the app decided
+    /// that the San Carlo–Robiei *funivia* was a funicular. It is not: `funivia`
+    /// is Italian for an aerial cableway, and it is one of the longest ropeways
+    /// in the country. Half of Europe's words for both machines start with the
+    /// same four letters, so the text is cut into words and the words are
+    /// compared — `funi` on its own, as the timetable abbreviates it in
+    /// `Cossonay-Penthalaz (funi)`, is a funicular; `funivia` is not.
+    ///
+    /// `Standseilbahn` and `Drahtseilbahn` are the same trap in German. All
+    /// three compounds end in `seilbahn`, and two of them are funiculars while
+    /// `Luftseilbahn` — air-rope-railway — is the one that flies, so searching
+    /// for the ending would get every one of them wrong.
+    private static let saysFunicular: Set<String> = [
+        "funi", "funicular", "funiculaire", "funicolare", "funicolar",
+        "standseilbahn", "standseilb", "drahtseilbahn", "minifunic",
+    ]
+    private static let saysGondola: Set<String> = [
+        "gondelbahn", "gondola", "gondelb", "telecabine", "cabinovia",
+    ]
+
+    private func resolveCable(_ journey: Journey) -> LayoutLibrary.CableKind {
+        // Everything the service says about itself, cut into words. Accents
+        // folded away because the same name is written `téléphérique` and
+        // `telepherique` in one timetable.
+        let said = Set(
+            ([journey.line, journey.to] + journey.stops.map(\.name))
+                .compactMap { $0?.lowercased() }
+                .joined(separator: " ")
+                .folding(options: .diacriticInsensitive, locale: Locale(identifier: "de_CH"))
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+        )
+        if !said.isDisjoint(with: Self.saysFunicular) { return .funicular }
+
+        guard journey.stops.count >= 2 else { return .funicular }
+
+        // Rails under it, on the class of graph a funicular is mapped in. Asked
+        // leg by leg because a line with a mid-station may have one leg the
+        // graph is missing, and one routed leg is enough: an aerial ropeway
+        // does not route anywhere.
+        for i in 1..<journey.stops.count {
+            let from = journey.stops[i - 1].coord
+            let to = journey.stops[i].coord
+            guard Geo.metres(from, to) > 1 else { continue }
+            // Prefixed, so this can never read or write the entry
+            // `GeometryBuilder` keeps for the same pair of stops. The two ask
+            // the same question of the graph but they are not the same
+            // question of the cache: one is "draw this leg" and is allowed to
+            // be answered by whatever a previous mode's mask found, and this
+            // one is a classification that must only ever see funicular track.
+            let cacheKey = String(
+                format: "cable|%.5f,%.5f|%.5f,%.5f", from.lat, from.lon, to.lat, to.lon
+            )
+            if let path = railnet.routeLeg(
+                key: cacheKey, from: from, to: to, mode: .cable
+            ), path.count > 1 {
+                return .funicular
+            }
+        }
+
+        // Nothing under it, so it hangs — but only if it is long enough to be a
+        // ropeway at all. See `shortestRopeway`.
+        let span = Geo.length(of: journey.stops.map(\.coord))
+        guard span >= Self.shortestRopeway else { return .funicular }
+        // A gondola where the name says so, and an aerial tramway car
+        // otherwise. That default is the right way round for this country's
+        // *timetabled* ropeways, which is what this is choosing for: the public
+        // network is mostly village Luftseilbahnen — Unterbäch, Eischoll,
+        // Jeizinen, Gspon, Isérables — carrying one big car apiece, and the
+        // continuous gondolas on it are the minority and usually say
+        // `Gondelbahn` on the station.
+        return said.isDisjoint(with: Self.saysGondola) ? .tramway : .gondola
+    }
+
     // MARK: - Which journeys call where
 
     /// The indexed fleet, and the index: stop identity to the journeys calling
@@ -1492,6 +1642,7 @@ public actor Fleet {
             let shift = drift[i]
             out.append(VehicleSnapshot(
                 id: journey.id, mode: journey.mode, category: journey.category,
+                cable: cableKind(of: journey),
                 line: journey.line, operatorName: journey.operatorName,
                 operatorFull: journey.operatorFull, to: journey.to, from: journey.from,
                 delay: journey.delay,
@@ -2407,6 +2558,7 @@ public actor Fleet {
             builder.attach(to: journey)
             return VehicleSnapshot(
                 id: journey.id, mode: journey.mode, category: journey.category,
+                cable: cableKind(of: journey),
                 line: journey.line, operatorName: journey.operatorName,
                 operatorFull: journey.operatorFull, to: journey.to, from: journey.from,
                 delay: journey.delay, lon: journey.stops[0].lon, lat: journey.stops[0].lat,
@@ -2464,6 +2616,7 @@ public actor Fleet {
 
         return VehicleSnapshot(
             id: journey.id, mode: journey.mode, category: journey.category,
+            cable: cableKind(of: journey),
             line: journey.line, operatorName: journey.operatorName,
             operatorFull: journey.operatorFull, to: journey.to, from: journey.from,
             delay: journey.delay,
@@ -2691,24 +2844,30 @@ public actor Fleet {
         }
 
         var found: [BoardEntry] = []
-        // The national feed first, and the mirror's own sightings only if it
-        // had nothing — so a service can never be listed twice.
-        //
-        // Narrowed by identity before anything is measured; see `callers`.
-        // `herePlatforms` needs no key of its own, because every register row
-        // that goes into it puts its own station into `hereStations` beside it.
-        // The mirror is a handful of sightings around one stop and is walked as
-        // it always was.
-        var source = callers(matchingAnyOf: hereStations.union([name]))
-        if !mirrored.isEmpty, !source.contains(where: { $0.stops.contains(where: callsHere) }) {
-            source.append(contentsOf: mirrored.values)
-        }
-        for journey in source {
-            guard let index = journey.stops.firstIndex(where: callsHere) else { continue }
+        var listed = Set<String>()
+        /// One row for one run, wherever the run was read from.
+        func list(_ journey: Journey) {
+            guard let index = journey.stops.firstIndex(where: callsHere) else { return }
             let stop = journey.stops[index]
             // A departure board is about what is leaving, not what left. A
             // minute of grace covers a vehicle still standing there.
-            if stop.dep < now - 60 { continue }
+            if stop.dep < now - 60 { return }
+
+            // Keyed twice, because the same run has two names here. A chained
+            // journey carries its *first* leg's id — an S1 renumbered at
+            // Gümligen is one row on the map and two trips in the file — so the
+            // timetable's own row for the later leg is a different id for a
+            // departure already on the board. The legs are claimed below; the
+            // second key catches whatever chaining did not join.
+            //
+            // That key has to name the whole departure and not just its line
+            // and minute: two directions of a city bus leave the same station
+            // in the same minute all day, and they are two departures.
+            guard listed.insert(journey.id).inserted else { return }
+            guard listed.insert(
+                "\(journey.mode.rawValue)|\(journey.line)|\(stop.dep)|\(stop.ref ?? stop.name)|\(journey.to ?? "")"
+            ).inserted else { return }
+            for part in journey.parts ?? [] { listed.insert(part.id) }
 
             found.append(BoardEntry(
                 id: journey.id, mode: journey.mode, line: journey.line, to: journey.to,
@@ -2721,15 +2880,118 @@ public actor Fleet {
                 running: Positioning.position(of: journey, at: now) != nil
             ))
         }
+
+        // The national feed first, and the mirror's own sightings only if it
+        // had nothing — so a service can never be listed twice.
+        //
+        // Narrowed by identity before anything is measured; see `callers`.
+        // `herePlatforms` needs no key of its own, because every register row
+        // that goes into it puts its own station into `hereStations` beside it.
+        // The mirror is a handful of sightings around one stop and is walked as
+        // it always was.
+        var source = callers(matchingAnyOf: hereStations.union([name]))
+        if !mirrored.isEmpty, !source.contains(where: { $0.stops.contains(where: callsHere) }) {
+            source.append(contentsOf: mirrored.values)
+        }
+        for journey in source { list(journey) }
+        for journey in scheduled(at: hereStations, from: now, filling: found.count, of: limit) {
+            list(journey)
+        }
         found.sort { $0.departure < $1.departure }
 
         return StationBoard(
             id: id, name: name, lon: lon, lat: lat, now: now,
-            departures: Array(found.prefix(limit)),
-            // Only worth computing when there is nothing live to show. With a
-            // board full of departures the feed is the answer, and a second
-            // list beside it derived a different way is noise at best.
-            serving: found.isEmpty ? servingLines(at: kerbs) : []
+            departures: Self.trim(found, to: limit),
+            serving: servingLines(at: kerbs, besides: found)
+        )
+    }
+
+    /// How far ahead a board reads when the drawn fleet runs out.
+    ///
+    /// A day, and the horizon is the point of it. The map holds an hour either
+    /// side of now — see `timetableAhead`, which is about what can be *drawn* —
+    /// and a board asked inside that hour and no further is wrong in exactly
+    /// the places a board matters most: the Verkehrshaus lake landing whose
+    /// next boat is at 21:35, Bern at one in the morning waiting on a Moonliner
+    /// that leaves at 01:26, a village with four buses a day. Every one of
+    /// those said "no data available", which reads as "nothing runs here" and
+    /// was only ever "nothing runs here in the next hour".
+    ///
+    /// A day rather than a few hours because the failure it fixes is a stop
+    /// with *one* departure left, and there is no cheaper horizon that catches
+    /// the last boat of the evening from an afternoon. It costs an integer
+    /// rejection per trip of the day and stops as soon as the board is full.
+    public static let boardHorizon: TimeInterval = 24 * 3600
+
+    /// How deep into the schedule a board reads before it is trimmed.
+    ///
+    /// Larger than the board, on purpose. The trim below keeps the next
+    /// departure of every line, and a line running once a night is only found
+    /// by reading past the line running every seven minutes — at Bern's stop M
+    /// at 23:15, the 17 and the 19 fill forty rows before the Moonliner's 01:45
+    /// is reached.
+    static let boardDepth = 240
+
+    /// The board, trimmed so a frequent line cannot crowd out a rare one.
+    ///
+    /// A count alone is the wrong cap for this panel, because the panel groups:
+    /// forty rows of a bus every seven minutes draw as two rows with a
+    /// disclosure on them, and the Moonliner that leaves stop M at 01:45 —
+    /// which is the whole reason to look at that kerb at midnight — falls off
+    /// the end of a list it was never really competing for. So the count is
+    /// kept, and after it every service still unrepresented gets its next
+    /// departure, up to a ceiling on how many a board is.
+    ///
+    /// Keyed as the panel groups — see `DepartureGroup.group`, which draws one
+    /// row per line, destination and kerb.
+    static func trim(_ entries: [BoardEntry], to limit: Int, services: Int = 24) -> [BoardEntry] {
+        guard entries.count > limit else { return entries }
+        var seen = Set<String>()
+        var out: [BoardEntry] = []
+        out.reserveCapacity(limit)
+        for entry in entries {
+            let key = "\(entry.mode.rawValue)|\(entry.line)|\(entry.to ?? "")|\(entry.stop ?? "")"
+            let known = !seen.insert(key).inserted
+            // Inside the count, everything; past it, only a service the board
+            // has not named yet, and only while it is still a board rather than
+            // a timetable.
+            if out.count >= limit, known || seen.count > services { continue }
+            out.append(entry)
+        }
+        return out
+    }
+
+    /// What the printed timetable says calls at these stations, for a board the
+    /// live fleet could not fill.
+    ///
+    /// Deliberately not folded into `journeys`: these are rows for a panel, not
+    /// vehicles for the map. Adding them to the store would draw tomorrow's
+    /// first bus on today's map and would have to be undrawn again on the next
+    /// tick, so they are built, read, and dropped.
+    ///
+    /// Asked only when the board has room. A station whose live board is
+    /// already full has nothing to gain from the schedule, and skipping it
+    /// there is what keeps a tap on Bern as cheap as it was.
+    ///
+    /// `accepting` narrows the query from the station to the stops a *platform*
+    /// board is about. Without it the schedule spends the board's whole budget
+    /// on the station's other kerbs — see `TimetableStore.patterns`.
+    private func scheduled(
+        at stations: Set<String>, key: String? = nil, accepting: ((String) -> Bool)? = nil,
+        from now: Timestamp, filling count: Int, of limit: Int
+    ) -> [Journey] {
+        guard count < limit, !stations.isEmpty, register.isReady,
+              let timetable, timetable.isReady
+        else { return [] }
+        return timetable.journeys(
+            callingAt: stations,
+            key: key,
+            accepting: accepting,
+            from: now,
+            to: now + Timestamp(Self.boardHorizon),
+            limit: max(limit, Self.boardDepth) - count,
+            place: { [register] ref in register.lookup(ref) },
+            operatorName: { [operators] agency in operators.name(for: agency) }
         )
     }
 
@@ -2768,6 +3030,27 @@ public actor Fleet {
             if (a == nil) != (b == nil) { return a != nil }
             return $0.ref < $1.ref
         }
+    }
+
+    /// The same list, without the lines the board already answers for.
+    ///
+    /// Both halves are shown together now, so the two must not say the same
+    /// thing twice: with tram 8 leaving in four minutes, a row underneath
+    /// saying tram 8 calls here is a worse copy of the row above it. What is
+    /// left is the half the feed cannot answer — the night bus, the line whose
+    /// hourly service has finished for the day — which is the whole reason the
+    /// relations are asked at all.
+    ///
+    /// Matched on `normaliseRef`, because the two sources agree on a line's
+    /// digits and not on its decoration: the feed's `S 1` and the relation's
+    /// `S1` are one line. Where the mode disagrees the row survives, which errs
+    /// towards showing a line twice rather than hiding one that runs.
+    func servingLines(at points: [Coord], besides departures: [BoardEntry]) -> [ServingLine] {
+        func key(_ mode: Mode, _ ref: String) -> String {
+            "\(mode.rawValue)|\(RelationStore.normaliseRef(ref))"
+        }
+        let live = Set(departures.map { key($0.mode, $0.line) })
+        return servingLines(at: points).filter { !live.contains(key($0.mode, $0.ref)) }
     }
 
     /// The individual platforms and kerbs inside a viewport, laid out so no two
@@ -2829,10 +3112,9 @@ public actor Fleet {
         let station = StopRegister.stationOf(ref)
 
         var departures: [BoardEntry] = []
-        // Both ways a call can belong to this platform put it at this station,
-        // so the station's own callers are the whole candidate set. See
-        // `callers`: without it this walks every call in the country.
-        for journey in callers(matchingAnyOf: [station]) {
+        var listed = Set<String>()
+        /// One row for one run — see the station board's `list`, which this is.
+        func list(_ journey: Journey) {
             for (i, stop) in journey.stops.enumerated() {
                 let here = stop.ref == ref || (
                     stop.ref != nil && place.platform != nil
@@ -2841,6 +3123,11 @@ public actor Fleet {
                 )
                 guard here else { continue }
                 if stop.dep < now - 300 { continue } // already gone
+                guard listed.insert(journey.id).inserted else { return }
+                guard listed.insert(
+                    "\(journey.mode.rawValue)|\(journey.line)|\(stop.dep)|\(journey.to ?? "")"
+                ).inserted else { return }
+                for part in journey.parts ?? [] { listed.insert(part.id) }
 
                 departures.append(BoardEntry(
                     id: journey.id, mode: journey.mode, line: journey.line, to: journey.to,
@@ -2850,17 +3137,42 @@ public actor Fleet {
                     terminates: i == journey.stops.count - 1, originates: i == 0,
                     running: Positioning.position(of: journey, at: now) != nil
                 ))
-                break
+                return
             }
+        }
+
+        // Both ways a call can belong to this platform put it at this station,
+        // so the station's own callers are the whole candidate set. See
+        // `callers`: without it this walks every call in the country.
+        for journey in callers(matchingAnyOf: [station]) { list(journey) }
+        // And the printed timetable for the rest of the day, for the same
+        // reason the station board asks: a platform is quieter than the station
+        // it is in, so it runs out of live departures sooner. Bern's stop M is
+        // a Moonliner kerb, and before this it had a board only in the hour
+        // before a Moonliner left.
+        for journey in scheduled(
+            at: [station], key: ref,
+            // The same test `here` makes, asked of a stop rather than of a
+            // call: this kerb, or one of the kerbs sharing its track.
+            accepting: { [register] candidate in
+                candidate == ref || (
+                    place.platform != nil
+                        && StopRegister.sameTrack(register.lookup(candidate)?.platform, place.platform)
+                )
+            },
+            from: now, filling: departures.count, of: limit
+        ) {
+            list(journey)
         }
         departures.sort { $0.departure < $1.departure }
 
         return PlatformBoard(
             id: ref, name: place.name, code: place.platform, assigned: place.assigned,
             lon: place.lon, lat: place.lat, now: now,
-            departures: Array(departures.prefix(limit)), stationOnly: false,
-            serving: departures.isEmpty
-                ? servingLines(at: [Coord(lon: place.lon, lat: place.lat)]) : []
+            departures: Self.trim(departures, to: limit), stationOnly: false,
+            serving: servingLines(
+                at: [Coord(lon: place.lon, lat: place.lat)], besides: departures
+            )
         )
     }
 
@@ -2903,9 +3215,13 @@ public actor Fleet {
             id: shape.sloids[0], name: shape.name,
             code: shape.codes.filter { !$0.isEmpty }.joined(separator: " · "),
             assigned: nil, lon: first.lon, lat: first.lat, now: now,
-            departures: Array(departures.prefix(40)), stationOnly: shape.stationOnly,
-            serving: departures.isEmpty
-                ? servingLines(at: [Coord(lon: first.lon, lat: first.lat)]) : [],
+            departures: Self.trim(departures, to: 40), stationOnly: shape.stationOnly,
+            // Asked again for the whole shape rather than unioning the tracks'
+            // lists: a line live at one track and idle at the other is running
+            // here, and each track's own list only knows about its own board.
+            serving: servingLines(
+                at: [Coord(lon: first.lon, lat: first.lat)], besides: departures
+            ),
             shape: osmId
         )
     }

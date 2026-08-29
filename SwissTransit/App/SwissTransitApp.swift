@@ -24,8 +24,13 @@ struct SwissTransitApp: App {
         // only moment the app reliably gets before it is killed. Losing them
         // costs nothing but correctness — they are recomputed — but recomputing
         // them is the pause this exists to remove.
+        //
+        // And the loops go down with them. iOS freezes a backgrounded process
+        // in its own time, and everything drawn between leaving the screen and
+        // being frozen is drawn for nobody. See `AppModel.suspend`.
         .onChange(of: scenePhase) { _, phase in
-            guard phase != .active else { return }
+            guard phase != .active else { model.resume(); return }
+            model.suspend()
             Task { await model.persist() }
         }
     }

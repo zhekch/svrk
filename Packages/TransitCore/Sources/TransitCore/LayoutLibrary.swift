@@ -389,6 +389,56 @@ public enum LayoutLibrary {
     // MARK: - The stock
 
     /// The classes this table can name, built from their real dimensions.
+    /// Which of the four vehicles `.cable` means.
+    ///
+    /// **A table with two readers, and that is the reason it exists at all.**
+    /// `.cable` folds together a cog railway, a funicular, a gondola and an
+    /// aerial tramway because none of them moves by its own wheels on a level
+    /// track, and beyond that they have nothing in common: one is a train, one
+    /// is a car on a slope, and two of them hang from a rope. The silhouette has
+    /// been asking this question since the four were told apart. What is new is
+    /// that something else needs the same answer — `Cableway.plan`, which builds
+    /// a station, a rope and a set of towers for the two that hang and must
+    /// build none of it for the two that do not, or there is a cableway strung
+    /// over the Polybahn.
+    ///
+    /// Answered here rather than in both places, because a copy of this switch
+    /// somewhere else is a copy that will one day disagree — and the way it
+    /// would disagree is a gondola hanging in the air beside its own rope, or a
+    /// funicular climbing a hillside under one.
+    public enum CableKind: Sendable {
+        /// A gondola or a chair on a lift: small, and it hangs.
+        case gondola
+        /// A Luftseilbahn or Pendelbahn car: the size of a small bus, and it
+        /// hangs from the same kind of rope.
+        case tramway
+        /// A cog railway, which is a train.
+        case cogRailway
+        /// A funicular, and the lifts filed with it: the one thing in this mode
+        /// that really does stand on the ground.
+        case funicular
+
+        /// Whether this one hangs from a rope rather than standing on anything.
+        public var hangs: Bool { self == .gondola || self == .tramway }
+    }
+
+    /// What the feed's product category says this cable run is.
+    ///
+    /// `nil` where there is no category to read, which is not a rare case and is
+    /// worth being plain about: the packed timetable collapses GTFS's route
+    /// types to one mode per route before the app ever sees them, so a run that
+    /// came from the archive rather than from the live feed has nothing here to
+    /// go on. Those keep the funicular they have always been drawn as.
+    public static func cableKind(of category: String?) -> CableKind? {
+        switch normalise(category) {
+        case "GB", "SL": return .gondola
+        case "LB", "PB", "AS": return .tramway
+        case "CC": return .cogRailway
+        case "FUN", "ASC": return .funicular
+        default: return nil
+        }
+    }
+
     public enum Stock {
 
         /// A locomotive-hauled push-pull train: a driving trailer at the front,
@@ -1130,7 +1180,7 @@ public enum LayoutLibrary {
     /// of the four cities that run articulated fleets on most of their routes.
     static func road(
         mode: Mode, operatorName: String?, line: String? = nil, category: String? = nil,
-        variant: Int = 0
+        cable: CableKind? = nil, variant: Int = 0
     ) -> ([VehicleUnit], String) {
         let code = operatorName?.uppercased() ?? ""
         switch mode {
@@ -1207,22 +1257,29 @@ public enum LayoutLibrary {
             // parser. It costs one string comparison on a path that runs when
             // a layout is first built, and it is the difference between four
             // recognisable vehicles and one that is wrong about all of them.
-            switch normalise(category) {
-            case "CC":
+            // What the feed said, or failing that what the app worked out. See
+            // `Fleet.cableKind(of:)`: the packed archive states nothing, so on
+            // nearly every cable service in the country the second of these is
+            // the only answer there is.
+            switch cableKind(of: category) ?? cable {
+            case .cogRailway:
                 return cogRailway(code, line: line)
-            case "GB", "SL":
+            case .gondola:
                 // A gondola cabin seats six or eight and is a shade over two
                 // metres long; a chair on a lift is smaller still. Both hang.
                 return (Stock.aerialCabin(length: 2.4, width: 2.1), "Gondola")
-            case "LB", "PB", "AS":
+            case .tramway:
                 // An aerial tramway car — a Pendelbahn or a Luftseilbahn —
                 // carries eighty people and is the size of a small bus, and it
                 // hangs from the same kind of rope.
                 return (Stock.aerialCabin(length: 6.4, width: 3.4), "Cable car")
-            default:
+            case .funicular, nil:
                 // A funicular, and the lifts filed as `ASC` with it: a car on
                 // rails on a hillside, which is the one thing in this mode
-                // that really does stand on the ground.
+                // that really does stand on the ground. And whatever came with
+                // no category at all, which is every run read out of the packed
+                // archive: a funicular is much the commonest of the four and is
+                // the least wrong thing to draw when nothing is known.
                 return (Stock.cabin(length: 12.0, width: 3.0), "Funicular")
             }
         default:
@@ -1333,7 +1390,7 @@ public enum LayoutLibrary {
     /// always answers, so there is no vehicle the map cannot draw.
     public static func layout(
         mode: Mode, category: String?, line: String?, operatorName: String?,
-        modeColour: String, variant: Int = 0
+        modeColour: String, cable: CableKind? = nil, variant: Int = 0
     ) -> VehicleLayout {
         let paint = stockLivery(
             mode: mode, line: line, operatorName: operatorName, category: category,
@@ -1346,7 +1403,7 @@ public enum LayoutLibrary {
         guard mode == .train else {
             let (units, name) = road(
                 mode: mode, operatorName: operatorName, line: line, category: category,
-                variant: variant
+                cable: cable, variant: variant
             )
             return VehicleLayout(units: units, livery: paint, name: name).resolvingStripes()
         }

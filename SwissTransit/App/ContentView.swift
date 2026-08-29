@@ -175,6 +175,7 @@ struct ContentView: View {
         // moves: if a panel is already up, the offer waits for it to close.
         .onChange(of: model.rides.offeringID) { _, _ in offerRide() }
         .onChange(of: otherSheetUp) { _, _ in offerRide() }
+        .onChange(of: mapCovered) { _, covered in model.mapObscured = covered }
         // The fit can be withdrawn from under a standing bar — a tunnel long
         // enough, a train that turns out to be the one on the next track. The
         // sheet is showing the bar and the bar has lost its subject, so it goes
@@ -279,6 +280,14 @@ struct ContentView: View {
     /// time. An offer that arrived under an open Settings used to be swallowed
     /// — the flag was set, nothing appeared, and it never asked again.
     private var otherSheetUp: Bool { showSettings || showMapSettings || showOffline }
+
+    /// The sheets that take the whole screen, as opposed to the one that does
+    /// not. The map settings sheet is 470 points precisely so the map stays
+    /// visible while a slider is changing it — slowing *that* map down would be
+    /// slowing down the one thing the sheet exists to let you watch. The other
+    /// two cover it, and a covered map does not need thirty frames a second.
+    /// See `AppModel.mapObscured`.
+    private var mapCovered: Bool { showSettings || showOffline }
 
     /// Put the offer up, if there is one and there is room for it.
     private func offerRide() {

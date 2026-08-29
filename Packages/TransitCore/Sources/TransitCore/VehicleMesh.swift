@@ -438,6 +438,44 @@ extension VehicleShape {
             ], beltTop: upperCant, roofTop: roof)
         }
 
+        /// A gondola cabin, which is a moulded shell rather than a body with
+        /// bands painted round it.
+        ///
+        /// `banded` was drawing it and drawing it as a small coach, which is
+        /// four separate wrongnesses on one very small object. A coach has an
+        /// underframe: a flat plinth the body sits on, and on a cabin two
+        /// metres long that plinth was a black bar under a pod that is supposed
+        /// to be hanging in the air. A coach has a cant rail, so the shoulder
+        /// took the belt colour and the gondola came out with a stripe round
+        /// the top of it that no cabin in the country wears. And a coach has a
+        /// flat roof, where a gondola's is a dome — which matters here more than
+        /// it does anywhere else on the map, because the cabin is the one
+        /// vehicle whose *roof* is what the reader is looking at: it is above
+        /// eye level in the scene, and it is the surface the arm rises out of.
+        ///
+        /// So: a tucked-in tub, one hand of sill, glass from the seat pan to the
+        /// shoulder, and two roof slabs stepping in to a cap.
+        func pod(_ bands: BodyBands) -> Stack {
+            // How much of the roof is the cap. Small: it is the last centimetres
+            // of a curve, and a deep one turns the dome into a hat.
+            let cap = min(0.18, (bands.roof - bands.shoulder) * 0.55)
+            return Stack(levels: [
+                // The darkest thing on the cabin and the smallest. What is under
+                // a gondola floor is a shallow glass-fibre pan, so it is raked
+                // hard — from any angle but straight down it should be seen to
+                // tuck under rather than to stand out.
+                level(.chassis, 0, bands.floor, width: underWidth, rake: 0.55, fill: .running),
+                level(.body, bands.floor, bands.waist, width: 1.0, rake: 0.16, fill: .livery),
+                level(.glazing, bands.waist, bands.cant, width: 0.99, rake: 0.34, fill: .glass),
+                // Body colour, not belt. There is no cant rail to paint.
+                level(.shoulder, bands.cant, bands.shoulder, width: 0.94, rake: 0.72, fill: .livery),
+                level(.roof, bands.shoulder, bands.roof - cap, width: roofWidth,
+                      rake: 0.92, fill: .roof),
+                level(.roof, bands.roof - cap, bands.roof, width: roofWidth * 0.70,
+                      rake: 1.0, fill: .roof),
+            ], beltTop: bands.cant, roofTop: bands.roof)
+        }
+
         // The class's own bands win over everything the kind implies.
         //
         // Placed before the switch rather than inside it because the switch
@@ -448,6 +486,7 @@ extension VehicleShape {
         // Falling through is what `.generic` does, and `.generic` is every
         // wagon whose class was never written down.
         if let bands {
+            if shape == .aerialCabin { return pod(bands) }
             if let upperWaist = bands.upperWaist, let upperCant = bands.upperCant {
                 return doubleDecked(
                     floor: bands.floor, lowerWaist: bands.waist, lowerCant: bands.cant,
@@ -803,25 +842,88 @@ extension VehicleShape {
         // cabin could. A rounded pod on its own at eight metres is an object
         // that happens to be in the air; the same pod with a stalk over it
         // reading up to a grip is a thing *hanging*, which is the single fact
-        // about an aerial cableway that the map has to get across. The rope
-        // itself is not drawn — it belongs to the line, not to the vehicle, and
-        // a wire one pixel wide is nothing a renderer at this scale can hold.
+        // about an aerial cableway that the map has to get across.
+        //
+        // **The two blocks are the wrong shape and the right shape, and it is
+        // the same distinction all over again.** The arm used to be a square
+        // post two-thirds of a metre across with a fatter box on top of it,
+        // which from any angle is a chimney: it says nothing about which way the
+        // rope runs, and a gondola's whole attitude is *along* the rope. A real
+        // hanger is a flat blade — narrow across the line, deep along it — and
+        // the thing on the end of it is not a knob but a **carriage**: a bar
+        // longer than the arm is wide, lying fore and aft, riding the rope. Told
+        // apart in those two dimensions the assembly reads as running gear even
+        // at four pixels, because the silhouette is now asymmetric in the one
+        // axis that carries the meaning.
+        //
+        // **The height is not a constant any more, and that is the change this
+        // was really for.** The top of the carriage is at `Cableway.ropeHeight`
+        // exactly — `Silhouette.hover` is derived by subtracting this arm, this
+        // grip and the body below them — so the rope the line draws passes
+        // through the grip rather than near it. Neither end of that arrangement
+        // can be adjusted without the other following.
         if unit.silhouette == .aerialCabin {
-            let mast = min(0.34, half * 0.30)
-            let along = min(0.5, unit.length * 0.10)
             let mid = unit.length / 2
-            out.append(LocalSlab(
-                role: .pantograph,
-                rings: [box(x0: mid - mast, x1: mid + mast, y0: -mast, y1: mast)],
-                base: stack.roofTop * heightScale,
-                top: (stack.roofTop + 1.45) * heightScale,
-                fill: equipmentColour
-            ))
+            // Across the line: a blade, floored so it survives the rasteriser
+            // on a cabin two metres long and capped so it stays a blade on one
+            // six metres long.
+            let blade = max(0.16, min(0.34, half * 0.21))
+            // Along it: deep enough to be plainly a plate seen edge-on.
+            let arm = max(0.30, min(1.05, unit.length * 0.19))
+            // And the carriage, which is longer again — this is the proportion
+            // that says "this hangs from a moving rope" rather than "this has a
+            // post on it".
+            let carriage = max(0.55, min(2.70, unit.length * 0.42))
+            let grip = max(0.24, min(0.46, half * 0.30))
+            let shoulder = stack.roofTop + Cableway.armHeight
+
+            // **How far the arm leans back along the body as it rises.**
+            //
+            // Scaled off the cabin's own length rather than switched on its
+            // class, and the scaling is the whole of the difference between the
+            // two things this silhouette draws. A six-seat gondola hangs off a
+            // short upright stalk a hand's breadth behind its own centre. A
+            // Luftseilbahn car does not: it carries eighty people on a fixed
+            // track rope, so the arm is a great curved blade taller than a
+            // person, springing off the back of the roof and sweeping forward
+            // over the middle to the carriage. That sweep is the first thing
+            // anybody recognises in a photograph of one, and drawn as a post
+            // both vehicles were the same object at two sizes.
+            let sweep = min(1.75, unit.length * 0.27)
+            // Four steps up the curve. Enough that the lean reads as a bend
+            // rather than as a lean, and few enough to stay in the low-poly
+            // idiom the rest of the vehicle is drawn in.
+            let steps = 4
+            for i in 0..<steps {
+                let bottom = Double(i) / Double(steps)
+                let top = Double(i + 1) / Double(steps)
+                /// Where the arm's centre is at a given height, 0 at the roof
+                /// and 1 at the carriage. Most of the lean is spent low down,
+                /// which is what makes it a curve springing off the roof rather
+                /// than a straight strut leaning against it.
+                func lean(_ t: Double) -> Double { -sweep * pow(1 - t, 1.7) }
+                let at = mid + (lean(bottom) + lean(top)) / 2
+                out.append(LocalSlab(
+                    role: .pantograph,
+                    rings: [box(
+                        x0: at - arm / 2, x1: at + arm / 2, y0: -blade, y1: blade
+                    )],
+                    base: (stack.roofTop + (shoulder - stack.roofTop) * bottom) * heightScale,
+                    top: (stack.roofTop + (shoulder - stack.roofTop) * top) * heightScale,
+                    fill: equipmentColour
+                ))
+            }
+            // The carriage, over the cabin's middle whatever the arm did to get
+            // there: what rides the rope is above the load it is carrying, or
+            // the cabin would hang at an angle.
             out.append(LocalSlab(
                 role: .dome,
-                rings: [box(x0: mid - along, x1: mid + along, y0: -mast * 0.8, y1: mast * 0.8)],
-                base: (stack.roofTop + 1.45) * heightScale,
-                top: (stack.roofTop + 1.85) * heightScale,
+                rings: [box(
+                    x0: mid - carriage / 2, x1: mid + carriage / 2,
+                    y0: -grip, y1: grip
+                )],
+                base: shoulder * heightScale,
+                top: (shoulder + Cableway.gripDepth) * heightScale,
                 fill: runningGearColour
             ))
         }

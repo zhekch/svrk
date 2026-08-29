@@ -117,8 +117,12 @@ struct TransitMap: UIViewRepresentable {
         // The puck *itself* is installed with the layers rather than here — see
         // `Coordinator.installPuck`, which is the only place that can know what
         // it has to sit on top of.
+        //
+        // Which bearing source the puck turns to, if it turns at all. *Whether*
+        // it turns — and whether the magnetometer is running to tell it — is
+        // decided per moment rather than once, because a compass spinning a
+        // wedge nobody can see is pure loss. See `Coordinator.applyLocationPolicy`.
         mapView.location.options.puckBearing = .heading
-        mapView.location.options.puckBearingEnabled = true
         context.coordinator.attach(to: mapView)
         return mapView
     }
@@ -189,9 +193,191 @@ final class MapCoordinator: NSObject {
         self.model = model
     }
 
+    // MARK: - How fast the renderer is allowed to run
+
+    /// The interval the model last said it was feeding the map at.
+    private var pacedInterval: Duration?
+
+    /// Whether the camera is mid-movement — a finger, or an ease the app
+    /// started — and so owns the frame rate until the map settles again.
+    private var cameraSettled = true
+
+    /// What the map and the follow link are currently being held to.
+    private var renderRange = CAFrameRateRange.default
+
+    /// Hold the renderer's display link to the rate the model is actually
+    /// feeding it.
+    ///
+    /// **A display link is a request as well as a callback.** Left at its
+    /// default the SDK's link asks for the panel's maximum — 120 Hz on a
+    /// ProMotion phone — and iOS grants it by holding the *display itself* at
+    /// that rate for as long as the link is alive. So the default costs twice
+    /// over: `MapView.updateFromDisplayLink` runs a hundred and twenty times a
+    /// second to discover, four times out of five, that nothing is dirty; and
+    /// the screen never drops to the low refresh rate it would otherwise idle
+    /// at. Those are the GPU and Display bars on an energy trace, and neither
+    /// of them buys a frame — the data underneath changes fifteen to thirty
+    /// times a second and no faster, because `AppModel.frameInterval` went to
+    /// some trouble to work out that it need not.
+    ///
+    /// **Except while somebody is moving the map.** A pan, a pinch and every
+    /// camera ease are drawn from data already uploaded, at whatever rate the
+    /// display can manage — that is why a finger can drag the map smoothly
+    /// while the vehicles on it are being recomputed seventeen times a second.
+    /// Capping the link through a gesture would make the gesture stutter, which
+    /// is the one thing here actually worth the energy. So the cap comes off
+    /// while the camera is busy and goes back on when the map settles.
+    private func setRenderRate(_ interval: Duration? = nil) {
+        if let interval { pacedInterval = interval }
+        guard let mapView, let paced = pacedInterval else { return }
+
+        let wanted: CAFrameRateRange
+        if !cameraSettled {
+            wanted = .default
+        } else if model.isFollowingVehicle {
+            // The camera is being written by the follow link rather than by the
+            // model, so the map has to keep up with that lane and not this one.
+            wanted = Self.followRange
+        } else {
+            let hz = Float(min(120, max(1, (1 / paced.seconds).rounded())))
+            // A range rather than a single number. Naming one rate as minimum,
+            // maximum and preferred says the link cannot be served at anything
+            // else, and on a panel with no exact divisor for it that is a
+            // request iOS has to round *up*. A floor of half the rate leaves it
+            // a divisor it actually has.
+            wanted = CAFrameRateRange(minimum: max(1, hz / 2), maximum: hz, preferred: hz)
+        }
+
+        guard wanted != renderRange else { return }
+        renderRange = wanted
+        mapView.preferredFrameRateRange = wanted
+        followLink?.preferredFrameRateRange = wanted
+    }
+
+    /// What the follow lane is held to, which is *not* the model's rate.
+    ///
+    /// The follow link deliberately runs faster than the model: it carries the
+    /// followed vehicle on past the last tick's position — see `followShift` —
+    /// so that a camera locked to a train moves every display refresh rather
+    /// than in thirty steps a second. Capping it to the model's thirty would
+    /// throw that interpolation away and make following *worse*, which is the
+    /// one place in this map worth spending frames on.
+    ///
+    /// Sixty rather than the panel's maximum, because the prediction it is
+    /// computing is a straight line: the second sixty frames on a 120 Hz phone
+    /// are drawn from the same velocity as the first sixty and land half a
+    /// millimetre from them. On a 60 Hz phone this changes nothing at all.
+    private static let followRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+
+    /// The camera moved. What that means depends entirely on who moved it.
+    ///
+    /// A finger or an ease owns the frame rate until the map settles. The
+    /// *follower* does not: it sets the camera every display refresh, so its
+    /// own writes must never be read back as somebody moving the map, or the
+    /// cap would come off for as long as following lasted and never go back on
+    /// — a followed map never goes idle.
+    private func cameraMoved() {
+        reportViewport()
+        cameraSettled = model.isFollowingVehicle
+        setRenderRate()
+    }
+
+    // MARK: - What the phone is asked to work out about itself
+
+    /// The location source, owned here rather than left to the SDK's default.
+    ///
+    /// **The default is the most expensive setting CoreLocation has.** Mapbox
+    /// builds its provider with `kCLLocationAccuracyBest` and no distance
+    /// filter — a GNSS receiver at full duty cycle and a continuous Wi-Fi scan,
+    /// from launch, for the whole session — and this app never asked for that.
+    /// Ten metres is more than enough for both things it does with a fix: draw
+    /// a dot on a map of a country, and match a trail against the fleet, which
+    /// discards anything worse than seventy metres before it looks at it. See
+    /// `RideWatch.accurateEnough`.
+    private let locationProvider = AppleLocationProvider()
+
+    /// Whether the data model currently in place carries a heading publisher,
+    /// or nil before one has ever been installed.
+    private var appliedHeading: Bool?
+
+    /// Ask the phone for exactly as much as is about to be used, and no more.
+    ///
+    /// Re-evaluated when the map settles, when a fix arrives and when the
+    /// locate button changes state — which between them cover every way either
+    /// answer below can change, at about a second's granularity.
+    ///
+    /// The distance filter stays off wherever rides are being matched, and that
+    /// is not an oversight. `RideWatch` reads a *stationary* phone as evidence
+    /// — a train standing at a terminus is still your train, and four minutes
+    /// of not moving is how the claim is finally given up — and a distance
+    /// filter makes a stationary phone produce no fixes at all, which is a
+    /// different state entirely and the one the tunnel hold is for.
+    private func applyLocationPolicy() {
+        guard let mapView else { return }
+        // Precise where a fix is being read for its own sake: a trail being
+        // fitted to a journey, or a camera locked to the puck. Otherwise the
+        // fix is only ever a dot on a national map, and a hundred metres with a
+        // filter over it puts that dot in the same place for a fraction of the
+        // power.
+        let precise = model.rides.enabled || model.locateMode != .unfocused
+        let options = AppleLocationProvider.Options(
+            distanceFilter: precise ? kCLDistanceFilterNone : 25,
+            desiredAccuracy: precise
+                ? kCLLocationAccuracyNearestTenMeters
+                : kCLLocationAccuracyHundredMeters
+        )
+        if locationProvider.options != options { locationProvider.options = options }
+
+        let heading = headingIsVisible
+        guard heading != appliedHeading else { return }
+        appliedHeading = heading
+        mapView.location.options.puckBearingEnabled = heading
+        // **`puckBearingEnabled` alone does not stop the compass.** That flag
+        // reaches the puck's *renderer* and nothing else; the SDK subscribes to
+        // whatever heading publisher the data model carries either way, and the
+        // subscription is what calls `startUpdatingHeading`. So the only way to
+        // put the magnetometer down is to hand over a data model that has no
+        // heading in it. See `LocationManager.updateDataModel`.
+        mapView.location.dataModel = LocationDataModel(
+            location: locationProvider.onLocationUpdate.eraseToAnyPublisher(),
+            heading: heading ? locationProvider.onHeadingUpdate.eraseToAnyPublisher() : nil
+        )
+    }
+
+    /// Whether the cone is somewhere it could be seen.
+    ///
+    /// The cone is the only thing in this app that uses a heading. Two ways it
+    /// is on screen: the map is following the puck, so it is there by
+    /// construction; or the last known fix falls inside the viewport, so it is
+    /// there by arithmetic. Anywhere else the puck is off the edge of the map
+    /// and the compass would be turning a wedge in an empty room.
+    private var headingIsVisible: Bool {
+        guard let mapView else { return false }
+        if model.locateMode != .unfocused { return true }
+        guard let fix = mapView.location.latestLocation else { return false }
+        // A tenth of the box in every direction. Swapping the data model stops
+        // and restarts the location manager, so a puck sitting exactly on the
+        // edge of the screen should not be able to do it twice a pan — and a
+        // margin is cheaper than the flapping it prevents.
+        let box = model.viewport
+        let margin = 0.1
+        let lonRoom = (box.east - box.west) * margin
+        let latRoom = (box.north - box.south) * margin
+        let point = fix.coordinate
+        return point.longitude >= box.west - lonRoom && point.longitude <= box.east + lonRoom
+            && point.latitude >= box.south - latRoom && point.latitude <= box.north + latRoom
+    }
+
     func attach(to mapView: MapView) {
         self.mapView = mapView
+        // Before anything subscribes to a location, so the provider that starts
+        // is ours rather than the SDK's default one at full accuracy.
+        applyLocationPolicy()
         model.onFrame = { [weak self] in self?.draw() }
+        model.onPace = { [weak self] interval in self?.setRenderRate(interval) }
+        // The loop only announces a change, and it may already be running at
+        // the rate it wants — so the first one is taken by hand.
+        setRenderRate(model.frameInterval)
         model.onFocus = { [weak self] coord, zoom in
             self?.focus(
                 on: CLLocationCoordinate2D(latitude: coord.lat, longitude: coord.lon),
@@ -251,6 +437,10 @@ final class MapCoordinator: NSObject {
                 course: last.bearing.flatMap { $0 >= 0 ? $0 : nil },
                 accuracy: last.horizontalAccuracy ?? -1
             ))
+
+            // Cheap and guarded: the options are only written when they differ
+            // and the data model only swapped when the compass changes hands.
+            self?.applyLocationPolicy()
         }.store(in: &cancellables)
 
         mapView.mapboxMap.onStyleLoaded.observe { [weak self] _ in
@@ -258,7 +448,7 @@ final class MapCoordinator: NSObject {
         }.store(in: &cancellables)
 
         mapView.mapboxMap.onCameraChanged.observe { [weak self] _ in
-            self?.reportViewport()
+            self?.cameraMoved()
         }.store(in: &cancellables)
 
         // Where the map was left, for the next launch to open on.
@@ -318,8 +508,16 @@ final class MapCoordinator: NSObject {
         // viewport would then keep whatever it was last given, which on a map
         // nobody has panned is the initial guess rather than what is on screen.
         mapView.mapboxMap.onMapIdle.observe { [weak self] _ in
-            self?.reportViewport()
-            Task { @MainActor in await self?.mergeStationBlobs() }
+            guard let self else { return }
+            reportViewport()
+            if !cameraSettled {
+                cameraSettled = true
+                setRenderRate()
+            }
+            // The viewport is what decides whether the puck is on screen, so
+            // the moment it stops moving is the moment to ask again.
+            applyLocationPolicy()
+            Task { @MainActor in await self.mergeStationBlobs() }
         }.store(in: &cancellables)
 
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
@@ -490,6 +688,9 @@ final class MapCoordinator: NSObject {
             target: DisplayLinkProxy { [weak self] in self?.followFrame() },
             selector: #selector(DisplayLinkProxy.fire)
         )
+        // At the rate the map itself is being held to, rather than at the
+        // panel's maximum. See `setRenderRate`.
+        link.preferredFrameRateRange = renderRange
         link.add(to: .main, forMode: .common)
         followLink = link
     }
@@ -1754,6 +1955,9 @@ final class MapCoordinator: NSObject {
             )
         )
         model.locateMode = mode
+        // Following the puck is a fix read for its own sake rather than for a
+        // dot, and it puts the puck on screen by construction.
+        applyLocationPolicy()
         // No completion handler putting the button back on failure: the status
         // observer already hears the idle that a failed transition ends in, and
         // it hears it in order. A completion would not — press the button twice
@@ -2135,6 +2339,17 @@ final class MapCoordinator: NSObject {
             halo.circleStrokeOpacity = .expression(Exp(.get) { "fade" })
             try addLayer(halo, to: style)
 
+            // What the gondolas hang from, under the vehicles that hang from
+            // it. A cableway is scenery rather than a marker: the cabin flies
+            // through the station and over the towers, so both have to be in
+            // the style before it. Caught on its own — a map with gondolas and
+            // no ropes is the map this app had until now.
+            do {
+                try Cableways.install(style)
+            } catch {
+                Diagnostics.note("cableways unavailable: \(error)")
+            }
+
             // The vehicles themselves, over the dots they replace and under the
             // line numbers, which stay legible whatever is drawn beneath them.
             do {
@@ -2330,6 +2545,7 @@ final class MapCoordinator: NSObject {
         drawnPlateRevision = -1
         drawnShapesVisible = nil
         drewVehicleShapes = false
+        drawnCableways = nil
         drawnFrameVersion = -1
         drawnStopsVersion = -1
         drawnHitboxes = nil
@@ -2699,9 +2915,47 @@ final class MapCoordinator: NSObject {
             withId: ID.vehicles, geoJSON: .featureCollection(FeatureCollection(features: vehicleFeatures))
         )
         drawVehicleShapes(style)
+        drawCableways(style)
         #if DEBUG
         Diagnostics.pushed(vehicles: vehicleFeatures.count, tracks: model.tracks.count, styleReady: styleReady)
         #endif
+    }
+
+    /// The cableway plan currently in the source, so a frame that would draw
+    /// the same ropes again writes nothing.
+    ///
+    /// Compared by value rather than versioned, and it is the cheaper of the
+    /// two here: a plan is a handful of stations and spans, and what it is being
+    /// compared against is a rebuild of a source that runs to a few thousand
+    /// vertices. What changes it is panning onto a new line or off one, which is
+    /// a gesture rather than a tick — every other frame in between finds the
+    /// same answer and stops.
+    private var drawnCableways: Cableway.Plan?
+
+    /// The stations, ropes and towers under whatever is flying on them.
+    ///
+    /// Built from the *fleet* rather than from the drawn shapes, and the
+    /// difference matters at the zoom this switches on at: a vehicle only
+    /// becomes a drawing once it is long enough on screen to be worth one, and a
+    /// gondola cabin is two metres long, so the cabins are still dots for a
+    /// couple of zoom levels after their line is plainly visible. The rope is
+    /// the line, not the cabin, and it should be there before them.
+    private func drawCableways(_ style: MapboxMap) {
+        // Only where the cabins themselves could be drawn. Further out a span
+        // is a line beside the route overlay's own line and a station is a
+        // tenth of a pixel, and every one of them is still a polygon being
+        // parsed. See `Cableways.minZoom`.
+        let wanted = model.zoom >= Cableways.minZoom
+            ? Cableway.plan(for: model.vehicles)
+            : Cableway.Plan()
+        guard wanted != drawnCableways else { return }
+        drawnCableways = wanted
+        style.updateGeoJSONSource(
+            withId: Cableways.source,
+            geoJSON: .featureCollection(FeatureCollection(
+                features: Cableways.features(wanted, dark: isDarkTheme)
+            ))
+        )
     }
 
     /// The stop dots, rebuilt only when the set of them has changed.
@@ -3125,6 +3379,24 @@ final class MapCoordinator: NSObject {
                 // No relief: the ground is flat everywhere, every wagon lies
                 // level on it, and no lookup is needed to find that out.
                 out[print.id] = VehicleModels.Rest(grades: [], lifts: [])
+                continue
+            }
+            // What hangs takes no angle from the ground it is over.
+            //
+            // A wagon lies at the gradient of the hillside because it is
+            // standing on it. A gondola is not: it hangs from a rope on a
+            // pivot, and a cabin swinging into the slope of the mountain
+            // underneath it is the one attitude a cabin never takes. Measured
+            // like everything else it was reading a DEM twelve metres below its
+            // own floor and tipping into it — worst exactly where a cableway
+            // is, which is on the steepest ground the map ever draws.
+            //
+            // Asked of the mesh rather than of a flag on the footprint, so the
+            // rule is the same one `VehicleMesh` already lifts the body by and
+            // there is nothing to keep in step. See `Silhouette.hover`.
+            if print.placements.allSatisfy({ $0.model.unit.silhouette.hover > 0 }) {
+                let level = [Double](repeating: 0, count: print.placements.count)
+                out[print.id] = VehicleModels.Rest(grades: level, lifts: level)
                 continue
             }
             let held = seats[print.id]
@@ -3624,7 +3896,11 @@ extension MapCoordinator: ViewportStatusObserver {
     ) {
         guard toStatus == .idle else { return }
         Task { @MainActor [weak self] in
-            if self?.model.locateMode != .unfocused { self?.model.locateMode = .unfocused }
+            guard let self, model.locateMode != .unfocused else { return }
+            model.locateMode = .unfocused
+            // And the phone can stop working so hard: nothing is locked to the
+            // puck any more.
+            applyLocationPolicy()
         }
     }
 }

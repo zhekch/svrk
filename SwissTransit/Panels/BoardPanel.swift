@@ -72,8 +72,8 @@ struct BoardPanel: View {
     let subtitle: String?
     let now: Timestamp
     let entries: [BoardEntry]
-    /// Lines that serve this stop even when nothing is running, so an empty
-    /// board still answers the question the map was asked.
+    /// Lines that serve this stop with nothing on the board of their own, so
+    /// the panel answers what runs through here and not only what is running.
     var serving: [ServingLine] = []
 
     /// Which groups are open.
@@ -126,6 +126,17 @@ struct BoardPanel: View {
         return entries.filter { shown.contains($0.mode) }
     }
 
+    /// The serving lines the chips leave standing.
+    ///
+    /// A mode with nothing live on the board has no chip to switch it back on,
+    /// so filtering it away here would hide it with no way to ask for it — the
+    /// night bus at a station whose board is all trains. Those stay; the ones
+    /// the bar can speak for follow the bar.
+    private var servingShown: [ServingLine] {
+        guard present.count > 1, let shown else { return serving }
+        return serving.filter { shown.contains($0.mode) || !present.contains($0.mode) }
+    }
+
     private var departures: [DepartureGroup] {
         DepartureGroup.group(visible.filter { !$0.terminates })
     }
@@ -155,24 +166,6 @@ struct BoardPanel: View {
                 }
             }
 
-            // What serves this stop, when nothing is on it.
-            //
-            // The relations know which lines call at a stop regardless of the
-            // hour, which is why tapping the track beside a stop at three in the
-            // morning answers and tapping the stop itself did not. Nothing about
-            // that difference was real — the track asked the relations and the
-            // board asked the fleet — and this closes it. It appears only where
-            // the feed has nothing to say: with departures on screen the live
-            // answer is the answer, and a second list derived another way beside
-            // it is noise.
-            if !serving.isEmpty {
-                Section("Lines running through here") {
-                    ForEach(serving) { line in
-                        ServingRow(model: model, line: line)
-                    }
-                }
-            }
-
             if departures.isEmpty && arrivals.isEmpty && !entries.isEmpty {
                 // Every row filtered away. Said plainly, because a board that
                 // has just gone blank at a tap reads as broken rather than as
@@ -192,6 +185,24 @@ struct BoardPanel: View {
             if !arrivals.isEmpty {
                 Section("Arrivals") {
                     rows(arrivals, showing: .arrival)
+                }
+            }
+
+            // What else serves this stop.
+            //
+            // The relations know which lines call at a stop regardless of the
+            // hour, which is why tapping the track beside a stop at three in the
+            // morning answers and tapping the stop itself did not. Nothing about
+            // that difference was real — the track asked the relations and the
+            // board asked the fleet — and this closes it. Kept under the board
+            // rather than over it, and holding only the lines with nothing on
+            // that board, so it reads as what it is: the rest of the answer,
+            // after the live one.
+            if !servingShown.isEmpty {
+                Section("Lines through here") {
+                    ForEach(servingShown) { line in
+                        ServingRow(model: model, line: line)
+                    }
                 }
             }
 

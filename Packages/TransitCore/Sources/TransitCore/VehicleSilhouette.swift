@@ -234,7 +234,19 @@ extension Silhouette {
     /// twelve on screen — which is about where a gondola actually is over a
     /// mid-span meadow, and low enough that one at a station is not floating
     /// over the roof.
-    public var hover: Double { self == .aerialCabin ? 8.0 : 0 }
+    ///
+    /// **Derived rather than written down, now that there is a rope to hang
+    /// from.** The height that matters is the rope's, and it is stated once, in
+    /// `Cableway.ropeHeight`; what a cabin does is hang the depth of its own
+    /// grip, its own arm and its own body below it. Written as a constant of
+    /// its own the two were a pair of numbers that had to be kept in step by
+    /// hand, and the first time either moved every gondola in the country would
+    /// have been threaded on a rope through its roof or dangling under one.
+    public var hover: Double {
+        guard self == .aerialCabin else { return 0 }
+        let body = bands?.roof ?? 0
+        return max(0, Cableway.ropeHeight - body - Cableway.armHeight - Cableway.gripDepth)
+    }
 
     /// Whether anything holds this body up from below.
     ///
@@ -436,11 +448,20 @@ extension Silhouette {
                 roofWidth: 0.80, underWidth: 0.78
             )
         case .aerialCabin:
-            // A gondola is a pod: nearly all glass, very narrow, and with a
-            // roof drawn in hard because the hanger sits on it.
+            // A gondola is a pod, and a pod is not a small coach.
+            //
+            // Three numbers do the work, and all three were wrong before. The
+            // **sill** is at 0.72 rather than 0.92: a CWA Omega is glazed from
+            // just above the seat pan to the roof, which is most of the side —
+            // drawn with a coach's proportions the cabin came out as a painted
+            // box with a letterbox in it. The **shoulder** is a hand's breadth
+            // rather than a band, because there is no cant rail on a moulded
+            // shell to paint anything along. And the **under-pan** is 0.32 deep
+            // and drawn in tight: what is under a gondola's floor is a shallow
+            // rounded tub, not a solebar with bogies below it.
             return BodyBands(
-                floor: 0.28, waist: 0.92, cant: 2.28, shoulder: 2.58, roof: 2.86,
-                roofWidth: 0.55, underWidth: 0.60
+                floor: 0.32, waist: 0.72, cant: 2.18, shoulder: 2.46, roof: 2.68,
+                roofWidth: 0.62, underWidth: 0.62
             )
 
         case .tramCar:

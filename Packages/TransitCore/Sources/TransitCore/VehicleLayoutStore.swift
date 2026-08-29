@@ -340,7 +340,8 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         // `like:` parameter on `WagonCatalogue.units`.
         let guess = LayoutLibrary.layout(
             mode: vehicle.mode, category: vehicle.category, line: vehicle.line,
-            operatorName: vehicle.operatorName, modeColour: modeColour, variant: variant
+            operatorName: vehicle.operatorName, modeColour: modeColour,
+            cable: vehicle.cable, variant: variant
         )
         let learned = exact ?? remembered.flatMap {
             WagonCatalogue.layout(

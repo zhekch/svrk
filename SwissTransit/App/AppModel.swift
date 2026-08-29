@@ -1117,6 +1117,17 @@ final class AppModel {
     /// and drew none of them.
     var onFrame: (() -> Void)?
 
+    /// Tell the map how fast the model intends to feed it, whenever that
+    /// changes. Set by the coordinator, which owns the renderer.
+    ///
+    /// The SDK keeps its own display link and knows none of this. Left alone it
+    /// asks for the panel's maximum — 120 Hz on a ProMotion phone — which is
+    /// four to eight times the rate anything on the map is being recomputed at,
+    /// and a display link is a *request* for a refresh rate as well as a source
+    /// of callbacks: the screen is held there for as long as the link is alive.
+    /// See `MapCoordinator.setRenderRate`.
+    var onPace: ((Duration) -> Void)?
+
     /// Ask the map to move. Set by the coordinator.
     var onFocus: ((Coord, Double?) -> Void)?
 
@@ -1800,11 +1811,20 @@ final class AppModel {
         }
 
         watchNetwork()
+        watchPower()
         startTicking()
         startLearning()
         restartRefreshLoop()
         restartSituationLoop()
+        started = true
     }
+
+    /// Whether `start` has finished. Read by `resume`, which must not bring the
+    /// loops up in front of the data they are loops over: the scene can go
+    /// inactive and back before the packed timetable has finished being read,
+    /// and a refresh loop started there would fetch against an empty fleet with
+    /// a cadence nobody had configured yet.
+    private var started = false
 
     private func watchNetwork() {
         let monitor = NWPathMonitor()
@@ -1938,6 +1958,44 @@ final class AppModel {
         layouts.save()
     }
 
+    /// Stop everything that costs anything, because the app is no longer on
+    /// screen.
+    ///
+    /// iOS suspends a backgrounded process soon enough, and that alone stops
+    /// the loops — but "soon enough" is not "now", and the seconds in between
+    /// are spent recomputing a national fleet and re-uploading it to a renderer
+    /// nobody can see.
+    ///
+    /// The larger cost is on the way back. Every loop here is paced off a
+    /// deadline rather than a sleep, which is right while it is running and
+    /// wrong across a suspension: a process frozen mid-sleep and thawed twenty
+    /// minutes later wakes to a deadline twenty minutes past, and the first
+    /// thing it does is the one frame it was careful never to do — catch up.
+    /// Cancelled and restarted, the deadline is simply taken again from now.
+    func suspend() {
+        tickTask?.cancel(); tickTask = nil
+        refreshTask?.cancel(); refreshTask = nil
+        situationTask?.cancel(); situationTask = nil
+        progressTask?.cancel(); progressTask = nil
+        // So the map is told the rate again on the way back, whatever it was
+        // holding its display link at when the app went away.
+        announcedInterval = nil
+        pacedInterval = nil
+    }
+
+    /// Back on screen. The loops pick up from now rather than from whenever
+    /// they were interrupted.
+    func resume() {
+        guard started, tickTask == nil else { return }
+        // What the phone thinks of us may well have changed while we were away
+        // — a background app does not get the notification it was not running
+        // to hear.
+        readPower()
+        startTicking()
+        restartRefreshLoop()
+        restartSituationLoop()
+    }
+
     /// What the app can draw, which with a timetable in the bundle is the whole
     /// packed year and does not move as the clock is scrubbed.
     ///
@@ -1973,6 +2031,7 @@ final class AppModel {
                 await self.tick()
                 let interval = self.frameInterval
                 self.pacedInterval = interval
+                self.announce(interval)
                 next += interval
                 // A frame that overran does not get made up for by running the
                 // next several back to back; that spirals under exactly the
@@ -1986,6 +2045,17 @@ final class AppModel {
 
     /// The interval the sleeping loop is currently counting down.
     private var pacedInterval: Duration?
+
+    /// The interval the map has already been told about, so it is told on a
+    /// change rather than on every frame. Setting a display link's frame rate
+    /// range is cheap but not free, and this runs thirty times a second.
+    @ObservationIgnored private var announcedInterval: Duration?
+
+    private func announce(_ interval: Duration) {
+        guard announcedInterval != interval else { return }
+        announcedInterval = interval
+        onPace?(interval)
+    }
 
     /// Start again from now, if the rate the loop is keeping is no longer the
     /// rate that is wanted.
@@ -2017,7 +2087,37 @@ final class AppModel {
         Task { @MainActor [weak self] in self?.startTicking() }
     }
 
-    /// How long to wait before drawing again.
+    /// How long to wait before drawing again, after the phone has had its say.
+    ///
+    /// `wantedInterval` below is the rate the *picture* wants, and it is a
+    /// statement about motion: how far the fastest thing on screen travels
+    /// between two frames. This is the rate the picture actually gets, and the
+    /// difference between the two is everything the map cannot see — a sheet
+    /// standing over it, a battery the reader has asked to be careful with, a
+    /// chassis that has begun throttling itself.
+    ///
+    /// Kept separate rather than folded into the bands below, because the two
+    /// answer different questions and a single expression mixing them would be
+    /// readable as neither.
+    var frameInterval: Duration {
+        // A sheet over the map is a map nobody is looking at. It is still
+        // there — SwiftUI keeps the view alive underneath — so without this the
+        // loop goes on querying the viewport and re-uploading every vehicle
+        // thirty times a second behind an opaque panel. The still-map rate is
+        // the right one rather than stopping altogether: whatever is behind the
+        // sheet has to be correct the instant it comes down, and a second is
+        // well inside the dismissal.
+        if mapObscured { return .seconds(1) }
+        let wanted = wantedInterval
+        guard powerFactor > 1 else { return wanted }
+        // Never past the rate the map already keeps when it is a picture of the
+        // country. Below that it stops feeling live, and a map that has stopped
+        // feeling live is one the reader keeps prodding to check it is still
+        // working — which costs more than the frames just saved.
+        return min(Self.throttleFloor, wanted * powerFactor)
+    }
+
+    /// The rate the picture wants, before the phone gets a say.
     ///
     /// Fifteen a second is right for a map of dots and stays the default. It is
     /// not right for a map of vehicles: at zoom 17 a train covers seventy points
@@ -2043,7 +2143,7 @@ final class AppModel {
     /// nothing on it moves a pixel in a second, and the tick that would have
     /// advanced it is the most expensive one there is, because the viewport
     /// holds most of the running fleet. See `stillZoom`.
-    private var frameInterval: Duration {
+    private var wantedInterval: Duration {
         // Following comes first and ignores the rest, including the zoom floor
         // below. The camera is locked to a vehicle, so the rate the model
         // produces positions at is the rate the *whole map* moves at, and a map
@@ -2067,6 +2167,88 @@ final class AppModel {
             noFasterThan: zoom >= 14 ? .milliseconds(33) : .milliseconds(50),
             movingAt: fastestDrawn, metresPerPoint: metresPerPoint
         )
+    }
+
+    // MARK: - Backing off
+
+    /// Whether something opaque is standing over the map.
+    ///
+    /// Written by `ContentView` for the sheets that take the whole screen, and
+    /// deliberately not for the map settings sheet — that one is short on
+    /// purpose, so the map stays visible while a slider is changing it, and a
+    /// map you are watching change is the last thing to slow down.
+    ///
+    /// Out of observation: nothing draws from it, and a write that invalidated
+    /// the view hierarchy every time a sheet opened would be paying for the
+    /// saving twice.
+    @ObservationIgnored var mapObscured = false {
+        didSet {
+            guard mapObscured != oldValue else { return }
+            repaceIfNeeded()
+        }
+    }
+
+    /// The multiplier the phone's own state puts on every frame interval.
+    ///
+    /// One is "no opinion". **Two** is Low Power Mode or a chassis reporting
+    /// `.serious`: in the first the reader has asked for the battery to last,
+    /// in the second the phone has already begun throttling itself, and the
+    /// honest answer from something drawing a map thirty times a second is to
+    /// draw it fifteen. **Four** is `.critical`, where iOS is dimming the
+    /// screen and slowing the cores on its own and the only useful thing left
+    /// is to stop asking.
+    ///
+    /// `.fair` is deliberately not in here. It is where a phone sits through
+    /// ordinary use on a warm day, and halving the frame rate of the common
+    /// case would be paying the cost of a thermal defence without there being
+    /// a thermal problem.
+    @ObservationIgnored private var powerFactor = 1.0
+
+    /// The slowest the throttle may make the map, whatever the multipliers say.
+    /// The same rate `stillZoom` already runs the country at, so the floor is
+    /// one the map is known to be readable at rather than a new guess.
+    private static let throttleFloor = Duration.seconds(1)
+
+    /// Held only so the registrations outlive the call that made them.
+    @ObservationIgnored private var powerObservers: [NSObjectProtocol] = []
+
+    /// Watch what the phone says about its own state, and repace on a change.
+    ///
+    /// Both notifications, because the two are independent: Low Power Mode is
+    /// the reader's decision and the thermal state is the hardware's, and
+    /// either alone is reason enough to back off. Read once here as well as
+    /// subscribed — a notification only reports a *change*, so an app launched
+    /// with Low Power Mode already on would otherwise never hear about it.
+    ///
+    /// Both values were already being sampled for the diagnostics readout, and
+    /// were used for nothing else: the app knew it was cooking the phone and
+    /// went on asking for thirty frames a second anyway. See `DeviceLoad`.
+    private func watchPower() {
+        readPower()
+        for name in [
+            ProcessInfo.thermalStateDidChangeNotification,
+            Notification.Name.NSProcessInfoPowerStateDidChange,
+        ] {
+            powerObservers.append(NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: nil
+            ) { [weak self] _ in
+                Task { @MainActor in self?.readPower() }
+            })
+        }
+    }
+
+    private func readPower() {
+        let info = ProcessInfo.processInfo
+        let thermal: Double
+        switch info.thermalState {
+        case .critical: thermal = 4
+        case .serious: thermal = 2
+        default: thermal = 1
+        }
+        let factor = max(thermal, info.isLowPowerModeEnabled ? 2 : 1)
+        guard factor != powerFactor else { return }
+        powerFactor = factor
+        repaceIfNeeded()
     }
 
     /// How often the map has to be redrawn for the fastest thing on it to move
