@@ -338,9 +338,22 @@ enum Cableways {
             // is still plainly being held up.
             for at in Cableway.towerPoints(of: rope) {
                 guard let point = Cableway.position(rope, at: at) else { continue }
+                // How tall the mast has to be to reach the rope, measured
+                // against the ground **under the tower's own footprint** rather
+                // than against the profile's idea of it.
+                //
+                // A tower is an extrusion, and an extrusion on `flat`
+                // alignment stands on the one elevation the renderer finds
+                // under it; its height is added to that. The profile's ground
+                // is interpolated between samples twenty-five metres apart, so
+                // on a mountainside the two disagree by metres — and the
+                // disagreement is the tower's top missing the rope, which is
+                // the one place on this drawing where a couple of metres is
+                // plainly visible.
+                let floor = ground(point.coord) ?? point.ground
                 out.append(contentsOf: mast(
                     at: point.coord, bearing: point.bearing, paint: paint,
-                    base: 0, top: Cableway.height(of: rope, at: at) - point.ground
+                    base: 0, top: Cableway.height(of: rope, at: at) - floor
                 ))
             }
         }

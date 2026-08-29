@@ -148,22 +148,52 @@ public enum Cableway {
 
         public var total: Double { along.last ?? 0 }
 
-        /// The rope's height above sea level at a point near it, and the ground
-        /// under that point, or nil if the point is not on this span.
+        /// The rope's height above sea level over a point near it, and the
+        /// ground under that point, or nil if the point is not on this span.
         ///
-        /// Nearest vertex rather than a true perpendicular projection: the
-        /// points are twenty-five metres apart and a cabin is never more than a
-        /// few metres off the line it is running on, so the two answers differ
-        /// by less than the thickness of the rope.
-        public func at(_ coord: Coord, within metres: Double) -> (rope: Double, ground: Double)? {
+        /// **Interpolated along the span, and it has to be.** This began as
+        /// "the nearest vertex", on the reasoning that the vertices are
+        /// twenty-five metres apart and a cabin is never far off its own line,
+        /// so the two answers differ by less than the thickness of the rope.
+        /// That is true of the *distance* and false of everything that matters.
+        /// The height is what is being asked for, and on a cableway the height
+        /// changes by ten or fifteen metres between one vertex and the next —
+        /// so a cabin flying along the span held the height of one vertex,
+        /// then abruptly the height of the next. That is the cabin rising above
+        /// the rope, sinking below it, and snapping back: not a rendering
+        /// artefact but this function, answering in steps a staircase wide.
+        ///
+        /// Projected onto the segment rather than snapped to an end of it, so
+        /// the answer is continuous everywhere along the line and the cabin
+        /// slides rather than jumps.
+        public func at(
+            _ coord: Coord, within metres: Double
+        ) -> (rope: Double, ground: Double, away: Double)? {
+            guard points.count >= 2 else { return nil }
             var best = metres
-            var found: Int?
-            for (i, point) in points.enumerated() {
-                let d = Geo.metres(point, coord)
-                if d < best { best = d; found = i }
+            var answer: (rope: Double, ground: Double, away: Double)?
+            for i in 1..<points.count {
+                let a = points[i - 1], b = points[i]
+                guard along[i] - along[i - 1] > 0 else { continue }
+                // How far along this segment the point falls, as a fraction,
+                // clamped to the segment so a cabin past the end of one is
+                // measured against its end rather than off into space.
+                let ab = Geo.eastNorth(from: a, to: b)
+                let ap = Geo.eastNorth(from: a, to: coord)
+                let square = ab.east * ab.east + ab.north * ab.north
+                let share = square > 0
+                    ? min(1, max(0, (ap.east * ab.east + ap.north * ab.north) / square))
+                    : 0
+                let away = Geo.metres(Geo.interpolate(a, b, share), coord)
+                guard away < best else { continue }
+                best = away
+                answer = (
+                    rope: altitude[i - 1] + (altitude[i] - altitude[i - 1]) * share,
+                    ground: ground[i - 1] + (ground[i] - ground[i - 1]) * share,
+                    away: away
+                )
             }
-            guard let found else { return nil }
-            return (altitude[found], ground[found])
+            return answer
         }
     }
 

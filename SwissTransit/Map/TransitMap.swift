@@ -2548,6 +2548,7 @@ final class MapCoordinator: NSObject {
         drawnCableways = nil
         ropes = []
         cablewaysPending = false
+        cablewayGround = []
         drawnFrameVersion = -1
         drawnStopsVersion = -1
         drawnHitboxes = nil
@@ -2945,6 +2946,27 @@ final class MapCoordinator: NSObject {
     /// under it turns up.
     private var cablewaysPending = false
 
+    /// The ground under a handful of points of the drawn cableways, as it was
+    /// when they were last built.
+    ///
+    /// **The rope is the one thing this app draws at an absolute height**, and
+    /// that is what makes it the one thing that can go stale. Everything else
+    /// —  a station, a tower, a wagon — is placed *on* the terrain by the
+    /// renderer, so when a better elevation tile arrives it moves with it. The
+    /// rope is at a height above sea level worked out by the app from the
+    /// terrain it could see at the moment it was built, and if that was a
+    /// coarse tile, or no tile, the rope stays where that put it while the
+    /// towers and stations under it rise into place without it.
+    ///
+    /// That is exactly the bug this exists for: a line drawn on arrival had a
+    /// straight rope that ran nowhere near its towers and cabins that hung
+    /// clear of it, and switching the basemap fixed it — because a style reload
+    /// throws the whole overlay away and rebuilds it, by which time the tiles
+    /// had landed. Watching the ground is what makes the rebuild happen on its
+    /// own. A dozen lookups a frame, against the several hundred `rest` already
+    /// makes for the vehicles.
+    private var cablewayGround: [Double] = []
+
     /// The stations, ropes and towers under whatever is flying on them.
     ///
     /// Built from the *fleet* rather than from the drawn shapes, and the
@@ -2961,13 +2983,7 @@ final class MapCoordinator: NSObject {
         let wanted = model.zoom >= Cableways.minZoom
             ? Cableway.plan(for: model.vehicles)
             : Cableway.Plan()
-        // Rebuilt when the set of lines changes, and also while any of them is
-        // still waiting on the ground under it — a rope cannot be pulled tight
-        // against terrain that has not loaded, so it is drawn draped and asked
-        // again. See `Cableways.features`.
-        guard wanted != drawnCableways || cablewaysPending else { return }
-        drawnCableways = wanted
-        let built = Cableways.features(wanted, dark: isDarkTheme) { at in
+        func ground(_ at: Coord) -> Double? {
             guard model.terrain3D else { return 0 }
             let height = style.elevation(at: CLLocationCoordinate2D(
                 latitude: at.lat, longitude: at.lon
@@ -2975,12 +2991,44 @@ final class MapCoordinator: NSObject {
             guard let height, height.isFinite else { return nil }
             return height
         }
+
+        // Rebuilt when the set of lines changes; while any of them is still
+        // waiting on the ground under it — a rope cannot be pulled tight
+        // against terrain that has not loaded, so it is drawn draped and asked
+        // again; and whenever the ground it *was* built against has since moved
+        // under it. See `cablewayGround`.
+        let measured = Self.probes(of: wanted).map { ground($0) ?? .nan }
+        let moved = measured.count != cablewayGround.count
+            || zip(measured, cablewayGround).contains { now, then in
+                now.isNaN != then.isNaN || (!now.isNaN && abs(now - then) > 0.5)
+            }
+        guard wanted != drawnCableways || cablewaysPending || moved else { return }
+        drawnCableways = wanted
+        cablewayGround = measured
+        let built = Cableways.features(wanted, dark: isDarkTheme, ground: ground)
         ropes = built.ropes
         cablewaysPending = built.pending
         style.updateGeoJSONSource(
             withId: Cableways.source,
             geoJSON: .featureCollection(FeatureCollection(features: built.features))
         )
+    }
+
+    /// The few points whose ground is watched for a cableway to be rebuilt.
+    ///
+    /// Both ends and the middle of every span, and every station. Not every
+    /// vertex: the question is only whether the terrain under this line has
+    /// changed at all, and a tile arriving changes all of it at once.
+    private static func probes(of plan: Cableway.Plan) -> [Coord] {
+        var out: [Coord] = []
+        out.reserveCapacity(plan.spans.count * 3 + plan.stations.count)
+        for span in plan.spans where !span.points.isEmpty {
+            out.append(span.points[0])
+            out.append(span.points[span.points.count / 2])
+            out.append(span.points[span.points.count - 1])
+        }
+        out.append(contentsOf: plan.stations.map(\.at))
+        return out
     }
 
     /// The stop dots, rebuilt only when the set of them has changed.
@@ -3435,10 +3483,23 @@ final class MapCoordinator: NSObject {
                 // supposed to be clamped to whatever the ground below does.
                 var lifts = level
                 for (index, placement) in print.placements.enumerated() {
-                    guard let seat = ropes.lazy.compactMap({
+                    // The nearest rope, not merely the first that answers: at a
+                    // mid station two spans meet and both of them are within
+                    // reach of a cabin standing in it.
+                    guard let seat = ropes.compactMap({
                         $0.at(placement.at, within: Cableways.snap)
-                    }).first else { continue }
-                    lifts[index] = seat.rope - seat.ground - Cableway.drawnRopeHeight
+                    }).min(by: { $0.away < $1.away }) else { continue }
+                    // **Measured against the ground the *renderer* will use,
+                    // not against the profile's own sample of it.** The lift is
+                    // added to whatever height the renderer stands the model
+                    // on, so the two have to be the same number or the
+                    // difference is error — and the profile's ground is
+                    // interpolated between samples twenty-five metres apart,
+                    // which on a mountainside is metres out and differently out
+                    // at every point along the span. That was the other half of
+                    // the cabin bobbing over and under its own rope.
+                    let floor = height(placement.at) ?? seat.ground
+                    lifts[index] = seat.rope - floor - Cableway.drawnRopeHeight
                 }
                 out[print.id] = VehicleModels.Rest(grades: level, lifts: lifts)
                 continue
