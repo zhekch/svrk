@@ -542,6 +542,9 @@ final class MapCoordinator: NSObject {
     /// translated rather than rebuilt — see `followFrame`.
     private var followShape: VehicleFootprint?
     private var followId: String?
+    /// Whether the follow lane currently has a footprint in its source, so it
+    /// is emptied exactly once when there stops being one. See `followFrame`.
+    private var drewFollowShape = false
     /// The bearing the camera has been eased to, while it is turning with a
     /// vehicle. Nil whenever it is not.
     private var followBearing: CLLocationDirection?
@@ -703,15 +706,34 @@ final class MapCoordinator: NSObject {
         followVelocity = (0, 0)
         followWatched = nil
         clearCatchup()
-        guard let mapView, styleReady, followId != nil else { followId = nil; return }
+        // Whether *this* call is the one that ended a follow, as against one of
+        // the several that tidy up after it. It decides the camera reset below
+        // and nothing else.
+        let wasFollowing = followId != nil
         followId = nil
         followShape = nil
         followBearing = nil
         followBearingRate = 0
-        mapView.mapboxMap.updateGeoJSONSource(
-            withId: VehicleShapes.followSource,
-            geoJSON: .featureCollection(FeatureCollection(features: []))
-        )
+        guard let mapView, styleReady else { drewFollowShape = false; return }
+
+        // **The footprint goes because there is one, not because this call
+        // happens to be the one that ended the follow.** That distinction is
+        // the whole of a bug: `followId` is reassigned on the model's tick and
+        // cleared the moment the follow stops, so by the time the display link
+        // next runs and calls this, `followId` is already nil — and the guard
+        // that used to stand here read that as "nothing to clean up" and
+        // returned before emptying the source. What was left was the last frame
+        // of the drawn train, painted on the map at the position and the zoom
+        // it had when the follow ended, while the vehicle's own dot carried on
+        // up the valley without it.
+        if drewFollowShape {
+            drewFollowShape = false
+            mapView.mapboxMap.updateGeoJSONSource(
+                withId: VehicleShapes.followSource,
+                geoJSON: .featureCollection(FeatureCollection(features: []))
+            )
+        }
+        guard wasFollowing else { return }
         // Put the camera's own centre back where the view's centre is. The
         // offset belongs to following — see `followInset` — and Mapbox keeps
         // the last padding it was given, so leaving it set would hold the whole
@@ -868,6 +890,7 @@ final class MapCoordinator: NSObject {
             // From one translated footprint, in one write. This lane runs at
             // the display's rate rather than the model's, so it is the one
             // place where three separate writes would have been most visible.
+            drewFollowShape = true
             let moved = shape.shifted(byLon: shift.lon, lat: shift.lat)
             style.updateGeoJSONSource(
                 withId: VehicleShapes.followSource,
@@ -876,6 +899,28 @@ final class MapCoordinator: NSObject {
                         [moved], excluding: nil, flatness: 1, follow: true
                     )
                 ))
+            )
+        } else if drewFollowShape {
+            // **The vehicle has stopped being drawn as a vehicle, and what was
+            // left behind was the last frame of it.**
+            //
+            // A footprint is only built while the vehicle is long enough on
+            // screen to be worth one — see `AppModel.rebuildShapes` — so zooming
+            // out far enough takes `followShape` away while the follow is still
+            // running. This branch did not exist: the write above was simply
+            // skipped, and a source nobody writes keeps what it has. So the
+            // train stayed painted on the map at the position and the zoom it
+            // had when it was last built, while its own dot went on up the
+            // valley without it. At zoom 12 that is a train sitting in a field
+            // half a kilometre behind the marker naming it.
+            //
+            // Cleared once rather than every frame: this lane runs at the
+            // display's rate and re-emptying an empty source sixty times a
+            // second is sixty parses of nothing.
+            drewFollowShape = false
+            style.updateGeoJSONSource(
+                withId: VehicleShapes.followSource,
+                geoJSON: .featureCollection(FeatureCollection(features: []))
             )
         }
         // The dot and its line label hang off the point source, and they have to
@@ -893,7 +938,20 @@ final class MapCoordinator: NSObject {
                     tunnel: tunnelIndex.fade(
                         at: Coord(lon: vehicle.lon + shift.lon, lat: vehicle.lat + shift.lat),
                         heading: vehicle.bearing
-                    )
+                    ),
+                    // **Open, because this is the vehicle being followed**, and
+                    // leaving it to default was the whole of why the line
+                    // number would not go away.
+                    //
+                    // This lane rewrites the followed vehicle's own feature at
+                    // the display's rate — sixty times a second against the
+                    // model's thirty — so whatever it puts here is what the
+                    // label layers actually see. Built without this the feature
+                    // came back every frame saying it was not the open vehicle,
+                    // which put its number straight back into the layer that
+                    // never fades. The main lane was setting the flag correctly
+                    // and being overwritten before it could be drawn.
+                    open: true
                 )
             ])
         }
@@ -1079,7 +1137,7 @@ final class MapCoordinator: NSObject {
     /// feature back, fifteen times a second.
     private static func vehicleFeature(
         _ vehicle: VehicleSnapshot, at position: Coord, selected: Bool, emerged: Double,
-        tunnel: Double = 0, followed: Double = 0
+        tunnel: Double = 0, open: Bool = false
     ) -> Feature {
         var feature = Feature(geometry: .point(Point(
             CLLocationCoordinate2D(latitude: position.lat, longitude: position.lon)
@@ -1099,10 +1157,11 @@ final class MapCoordinator: NSObject {
             // fade happen in a disc too small to see it happen in.
             "shrink": .number(1 - 0.7 * emerged),
             "tunnel": .boolean(tunnel > 0.15),
-            // How far this vehicle is into being the one the camera is holding
-            // — 0 for everything else. The label layer spends it against the
-            // zoom. See `VehicleDot.labelFadeZoom`.
-            "followed": .number(followed),
+            // Whether this is the vehicle whose panel is open. It decides
+            // which of the two label layers draws this vehicle's number, and
+            // nothing else — the fade itself belongs to the layer. See
+            // `VehicleDot.labelHideZoom`.
+            "open": .boolean(open),
         ]
         return feature
     }
@@ -2372,7 +2431,32 @@ final class MapCoordinator: NSObject {
                 Diagnostics.note("vehicle shapes unavailable: \(error)")
             }
 
+            // Two layers over one source, split on whether this is the vehicle
+            // whose panel is open.
+            //
+            // **A filter and a plain number, rather than one layer with a
+            // data-driven opacity.** The obvious way to write this is a single
+            // layer whose `text-opacity` reads a value off each feature, and it
+            // does not work — twice now the number stayed at full strength on
+            // screen with no error anywhere, because a paint property the
+            // renderer will not accept is not an error, it is a property that
+            // silently keeps its default. There is nothing to debug and nothing
+            // to see.
+            //
+            // Split in two there is no expression to refuse. Which layer draws
+            // a vehicle is a filter, which is the most ordinary thing in the
+            // style; what the open one's opacity is, is a single number on the
+            // layer; and the fade between two numbers is
+            // `text-opacity-transition`, which is what transitions are for and
+            // which the renderer runs at its own frame rate rather than at the
+            // model's tick. That last point is worth the extra layer on its
+            // own: the hand-rolled ease this replaces stepped at fifteen a
+            // second.
             var labels = SymbolLayer(id: "\(ID.vehicles)-label", source: ID.vehicles)
+            // Asserted, like every other `get` in this file. A filter the
+            // renderer will not read is a layer that draws nothing, and this
+            // one carries every line number on the map.
+            labels.filter = Exp(.not) { Exp(.toBoolean) { Exp(.get) { "open" } } }
             labels.textField = .expression(Exp(.get) { "line" })
             labels.textSize = .expression(
                 Exp(.interpolate) {
@@ -2433,8 +2517,19 @@ final class MapCoordinator: NSObject {
             labels.minZoom = VehicleDot.labelMinZoom
             try addLayer(labels, to: style)
 
+            // And the same layer again for the one vehicle that is open, whose
+            // only difference is an opacity the app turns off close in.
+            var openLabel = labels
+            openLabel.id = Self.openLabelLayer
+            openLabel.filter = Exp(.toBoolean) { Exp(.get) { "open" } }
+            openLabel.textOpacity = .constant(1)
+            openLabel.textOpacityTransition = StyleTransition(
+                duration: VehicleDot.labelFadeSeconds, delay: 0
+            )
+            try addLayer(openLabel, to: style)
+
             // Last, and above everything: where *you* are.
-            installPuck(topmost: "\(ID.vehicles)-label")
+            installPuck(topmost: Self.openLabelLayer)
 
             // And now that every layer of ours exists, put the whole overlay
             // where it belongs in somebody else's style: the ground markings
@@ -2587,6 +2682,7 @@ final class MapCoordinator: NSObject {
         drawnFrameVersion = -1
         drawnStopsVersion = -1
         drawnHitboxes = nil
+        hidOpenLabel = nil
         drawnTunnelFades = nil
         // A new style has the layers' own filters back, so nothing is hidden.
         mergedAway = []
@@ -2880,6 +2976,7 @@ final class MapCoordinator: NSObject {
         drawTracks(style)
         drawRoute(style)
         drawRailwayShapes(style)
+        applyOpenLabel(style)
         apply3D(style)
         applyLightPreset(style)
         // Solidity is normally driven off camera movement, which is where it
@@ -2906,12 +3003,9 @@ final class MapCoordinator: NSObject {
     /// matters: `AppModel` keeps them out of observation, so asking "is this
     /// new?" from inside `updateUIView` does not register a dependency on the
     /// answer and cannot schedule the next update.
-    /// How far the open vehicle's line number has faded out, 0 to 1, and the
-    /// clock it is stepped on. See `VehicleDot.labelFadeSeconds`.
-    private var followLabelFade = 0.0
-    private var followLabelAt: CFTimeInterval = 0
-    /// Which vehicle that fade belongs to.
-    private var fadedFollowId: String?
+    /// What the open vehicle's label layer was last told to be, so the fade is
+    /// started once rather than restated thirty times a second.
+    private var hidOpenLabel: Bool?
 
     private var drawnFrameVersion = -1
     private var drawnStopsVersion = -1
@@ -2944,30 +3038,6 @@ final class MapCoordinator: NSObject {
         // The followed vehicle is written where the follow lane has it, not
         // where the last tick left it. See `followShift`.
         let shift = followId != nil ? followShift() : (lon: 0.0, lat: 0.0)
-        // How far the open vehicle's number has faded, stepped on this tick's
-        // own clock. Reset when the reader picks a different vehicle, so the
-        // one let go of gets its number back at once and the new one loses it
-        // from full strength rather than inheriting the last one's fade.
-        let clock = CACurrentMediaTime()
-        let dt = min(0.25, max(0, clock - followLabelAt))
-        followLabelAt = clock
-        // Reset only when moving from one vehicle to *another*: that one's
-        // number has to come back at once, and the new one's has to go from
-        // full strength rather than inherit a fade it did not earn. Letting go
-        // of a vehicle altogether is not a reset — it eases back the way it
-        // went, so closing the panel brings the number back rather than
-        // snapping it on.
-        if let selectedId, selectedId != fadedFollowId { followLabelFade = 0 }
-        fadedFollowId = selectedId
-        // The zoom decides; the clock draws. See `VehicleDot.labelFadeSeconds`.
-        let wantedFade: Double = selectedId != nil && model.zoom > VehicleDot.labelHideZoom
-            ? 1 : 0
-        let step = VehicleDot.labelFadeSeconds > 0
-            ? dt / VehicleDot.labelFadeSeconds : 1
-        let gap = wantedFade - followLabelFade
-        followLabelFade = abs(gap) <= step
-            ? wantedFade : followLabelFade + (gap < 0 ? -step : step)
-
         let vehicleFeatures = model.vehicles.map { vehicle -> Feature in
             let moved = vehicle.id == followId
             let at = Coord(
@@ -2978,7 +3048,7 @@ final class MapCoordinator: NSObject {
                 vehicle, at: at,
                 selected: vehicle.id == selectedId, emerged: emergence[vehicle.id] ?? 0,
                 tunnel: tunnelIndex.fade(at: at, heading: vehicle.bearing),
-                followed: vehicle.id == selectedId ? followLabelFade : 0
+                open: vehicle.id == selectedId
             )
         }
         style.updateGeoJSONSource(
@@ -3096,6 +3166,34 @@ final class MapCoordinator: NSObject {
         }
         out.append(contentsOf: plan.stations.map(\.at))
         return out
+    }
+
+    /// The label layer for the vehicle whose panel is open.
+    static let openLabelLayer = "transit-vehicles-label-open"
+
+    /// Take the line number off the open vehicle once the map is close enough
+    /// that the vehicle is the picture, and put it back when it is not.
+    ///
+    /// One property write, and only when the answer has changed: the fade
+    /// itself is the layer's transition, so this starts it rather than draws
+    /// it. Called from `draw`, which runs on the model's tick — the tick that
+    /// carries a pinch is the one that crosses the zoom, so there is nothing
+    /// finer to be gained by watching the camera directly.
+    private func applyOpenLabel(_ style: MapboxMap) {
+        guard style.layerExists(withId: Self.openLabelLayer) else { return }
+        let hide = model.zoom > VehicleDot.labelHideZoom
+        guard hide != hidOpenLabel else { return }
+        hidOpenLabel = hide
+        do {
+            try style.setLayerProperty(
+                for: Self.openLabelLayer, property: "text-opacity", value: hide ? 0.0 : 1.0
+            )
+        } catch {
+            // Said rather than swallowed. A refused paint property is the one
+            // failure mode this feature has, it is silent, and it has already
+            // cost two attempts that looked correct and changed nothing.
+            Diagnostics.note("open label kept its opacity: \(error)")
+        }
     }
 
     /// The stop dots, rebuilt only when the set of them has changed.
