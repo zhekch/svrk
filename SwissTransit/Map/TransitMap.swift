@@ -2390,32 +2390,26 @@ final class MapCoordinator: NSObject {
             // take the number out between one frame and the next. Spread over a
             // zoom level, the number thins out as the vehicle grows into the
             // screen, which is the handover actually happening.
-            // **The zoom interpolation is the outermost expression, and it has
-            // to be.** A data-driven paint property may combine zoom and
-            // feature expressions only with the zoom one at the top level; nest
-            // it inside an arithmetic expression — which is the natural way to
-            // write `1 - followed × ramp` — and the renderer refuses the
-            // property. What that costs is not this feature but every line
-            // number on the map, which is the failure this layer has had once
-            // already; see `text-allow-overlap` below.
+            // Gone over the vehicle the panel is open on, once the map is close
+            // enough that the vehicle is the picture. Every other vehicle
+            // carries 0 here and so is left at full strength at every zoom.
             //
-            // Written the legal way it is the same function: below the first
-            // zoom every vehicle's number is at full strength, above the second
-            // it is `1 - followed`, and the band between interpolates the two.
-            // A vehicle that is not being followed carries 0 and so is at 1 at
-            // both ends, which is to say untouched.
+            // **No zoom in the expression, and that is deliberate twice over.**
+            // The fade is a function of time rather than of scale — see
+            // `VehicleDot.labelFadeSeconds` — so the zoom is a decision the app
+            // takes once and hands over as a number. It also keeps this legal
+            // without having to think about it: a data-driven paint property
+            // may only combine zoom and feature expressions with the zoom one
+            // outermost, and nesting it inside the arithmetic gets the whole
+            // property refused. What that costs is not this feature but every
+            // line number on the map, which is a failure this layer has had
+            // once already; see `text-allow-overlap` below.
+            //
+            // Asserted as a number, like every other `get` in this file: the
+            // expression language is typed, and a property fetched without an
+            // assertion has unknown type where arithmetic wants a number.
             labels.textOpacity = .expression(
-                Exp(.interpolate) {
-                    Exp(.linear); Exp(.zoom)
-                    VehicleDot.labelFadeZoom
-                    1.0
-                    VehicleDot.labelGoneZoom
-                    // Asserted as a number, like every other `get` in this
-                    // file: the expression language is typed, and a property
-                    // fetched without an assertion has unknown type where
-                    // arithmetic wants a number.
-                    Exp(.subtract) { 1.0; Exp(.toNumber) { Exp(.get) { "followed" } } }
-                }
+                Exp(.subtract) { 1.0; Exp(.toNumber) { Exp(.get) { "followed" } } }
             )
             labels.textOffset = .constant([0, -1.2])
             labels.textAnchor = .constant(.bottom)
@@ -2912,8 +2906,8 @@ final class MapCoordinator: NSObject {
     /// matters: `AppModel` keeps them out of observation, so asking "is this
     /// new?" from inside `updateUIView` does not register a dependency on the
     /// answer and cannot schedule the next update.
-    /// How far the followed vehicle's line number has faded out, 0 to 1, and
-    /// the clock it is stepped on. See `VehicleDot.labelFadeSeconds`.
+    /// How far the open vehicle's line number has faded out, 0 to 1, and the
+    /// clock it is stepped on. See `VehicleDot.labelFadeSeconds`.
     private var followLabelFade = 0.0
     private var followLabelAt: CFTimeInterval = 0
     /// Which vehicle that fade belongs to.
@@ -2950,15 +2944,24 @@ final class MapCoordinator: NSObject {
         // The followed vehicle is written where the follow lane has it, not
         // where the last tick left it. See `followShift`.
         let shift = followId != nil ? followShift() : (lon: 0.0, lat: 0.0)
-        // How far the followed vehicle's number has faded, stepped on this
-        // tick's own clock. Reset when the camera takes hold of a different
-        // vehicle, so the one let go of gets its number back and the new one
-        // loses it from full strength rather than inheriting the last one's.
+        // How far the open vehicle's number has faded, stepped on this tick's
+        // own clock. Reset when the reader picks a different vehicle, so the
+        // one let go of gets its number back at once and the new one loses it
+        // from full strength rather than inheriting the last one's fade.
         let clock = CACurrentMediaTime()
         let dt = min(0.25, max(0, clock - followLabelAt))
         followLabelAt = clock
-        if followId != fadedFollowId { fadedFollowId = followId; followLabelFade = 0 }
-        let wantedFade: Double = followId == nil ? 0 : 1
+        // Reset only when moving from one vehicle to *another*: that one's
+        // number has to come back at once, and the new one's has to go from
+        // full strength rather than inherit a fade it did not earn. Letting go
+        // of a vehicle altogether is not a reset — it eases back the way it
+        // went, so closing the panel brings the number back rather than
+        // snapping it on.
+        if let selectedId, selectedId != fadedFollowId { followLabelFade = 0 }
+        fadedFollowId = selectedId
+        // The zoom decides; the clock draws. See `VehicleDot.labelFadeSeconds`.
+        let wantedFade: Double = selectedId != nil && model.zoom > VehicleDot.labelHideZoom
+            ? 1 : 0
         let step = VehicleDot.labelFadeSeconds > 0
             ? dt / VehicleDot.labelFadeSeconds : 1
         let gap = wantedFade - followLabelFade
@@ -2975,7 +2978,7 @@ final class MapCoordinator: NSObject {
                 vehicle, at: at,
                 selected: vehicle.id == selectedId, emerged: emergence[vehicle.id] ?? 0,
                 tunnel: tunnelIndex.fade(at: at, heading: vehicle.bearing),
-                followed: moved ? followLabelFade : 0
+                followed: vehicle.id == selectedId ? followLabelFade : 0
             )
         }
         style.updateGeoJSONSource(

@@ -25,30 +25,37 @@ enum VehicleDot {
     /// missing from the map.
     static let labelMinZoom = 11.0
 
-    /// Where the *followed* vehicle's line number starts to go, and where it
-    /// has gone.
+    /// Past this zoom, the line number comes off the vehicle that is open on
+    /// the panel.
     ///
-    /// Only the followed one, and only close in. A line number is what you
-    /// follow a vehicle by when it is a dot among fifty; it is the one thing on
-    /// the map that says which of them is the 8. Locked onto one and zoomed to
-    /// the length of the train, that question is already answered — the vehicle
-    /// in the middle of the screen, the one everything else is sliding past, is
-    /// plainly the one — and the label is left sitting over the roof of the
-    /// thing it is naming, in the way of the only view that shows it.
+    /// **The one the reader has picked, not only the one the camera is locked
+    /// to.** This began as "the followed vehicle", meaning the follow-lock the
+    /// camera enters on a second tap — and that is not what it feels like to be
+    /// following a train. Tapping one opens its panel and brings the camera to
+    /// it, and from then on the reader is watching that vehicle whether or not
+    /// the lock was ever engaged. Keyed on the lock, the label stayed put
+    /// through the whole of the case it was written for.
     ///
-    /// Every other vehicle keeps its number at every zoom. They are the ones
-    /// still worth telling apart.
-    static let labelFadeZoom = 16.0
-    static let labelGoneZoom = 17.0
+    /// A line number is what you follow a vehicle by when it is a dot among
+    /// fifty: it is the only thing on the map that says which of them is the 8.
+    /// Open on the panel and zoomed to the length of the train, that question
+    /// has been answered — the vehicle in the middle of the screen, named at
+    /// the top of the sheet, is plainly the one — and the label is left sitting
+    /// on the roof of the thing it names, in the way of the only view that
+    /// shows it. Every other vehicle keeps its number at every zoom; those are
+    /// the ones still worth telling apart.
+    static let labelHideZoom = 16.0
 
-    /// How long the number takes to go when following starts or stops.
+    /// How long the number takes to go, in seconds.
     ///
-    /// The zoom half of this fades on its own — it is a ramp over a zoom range,
-    /// so a pinch draws every frame of it. This is for the other half: tapping
-    /// follow while already zoomed in crosses the whole ramp in one frame, and
-    /// a label that is there and then is not reads as a glitch rather than as
-    /// something getting out of the way.
-    static let labelFadeSeconds = 0.35
+    /// A threshold crossed on a clock rather than a ramp spread over a zoom
+    /// band. The band was the first answer and it is the worse one: it ties how
+    /// fast the label goes to how fast the reader happens to be pinching, so a
+    /// slow zoom leaves a half-strength number hanging over the train for as
+    /// long as the gesture lasts. Crossing the zoom starts a fade of its own
+    /// length, and the label is gone half a second later however the crossing
+    /// was made.
+    static let labelFadeSeconds = 0.5
 
     /// The layer's own `circle-radius`, with the handover to the drawn vehicle
     /// folded in.
