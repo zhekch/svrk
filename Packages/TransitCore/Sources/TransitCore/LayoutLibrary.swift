@@ -447,34 +447,45 @@ public enum LayoutLibrary {
         /// identical boxes. Thurbo runs most of the eastern regional network
         /// with these, so it is a shape a great many dots on this map ought to
         /// have.
-        /// A GTW, which for now is three equal low-floor bodies.
+        /// A GTW: two long low-floor cars with the machinery standing between
+        /// them.
         ///
-        /// It should be two long cars with a four-metre blank tower between
-        /// them — that traction container is the whole of why a GTW is
-        /// recognisable — and it cannot be, for a reason worth writing down
-        /// because it will come up again.
+        /// The module is the whole point. A GTW is the one design in the
+        /// country whose *middle* identifies it — four metres of blank,
+        /// full-height traction container between two low cars, so the roofline
+        /// goes low, tall, low — and drawn as three equal cars it is a short
+        /// train and nothing else.
         ///
-        /// A library layout has to be *reproducible from what the database
-        /// stores*, and what it stores is a list of class names plus, per
-        /// class, one learned length (`ClassFacts`). Every car of a GTW is a
-        /// `RABe 526`, so a rebuilt observation gives all three bodies the same
-        /// length by construction; a guess with a short middle can therefore
-        /// never be confirmed by an observation of the very train it describes,
-        /// and `VehicleLayoutStore` would file every Thurbo working in the
-        /// country as a correction to a guess that was right. Unequal bodies
-        /// need a per-position fact the file does not carry.
-        ///
-        /// So the shape claimed here stays inside what can be checked: short,
-        /// low-floor, moulded front. Which is still most of a GTW, and is a
-        /// great deal more than the 26.4 m intercity box it used to be.
+        /// The catch, and it is worth knowing about because it will come up
+        /// again: a library layout has to be reproducible from what the
+        /// database stores, which is class names plus one measured length per
+        /// class. Every car of a GTW is a `RABe 526`, so a formation rebuilt
+        /// from file would give all three bodies the same length, disagree with
+        /// this, and be filed as a correction to a guess that was right. The
+        /// fix is not to weaken the guess but to teach the *reading* the same
+        /// rule — see `WagonCatalogue.tractionModule`, which puts the short
+        /// middle body back on the observation side so the two paths reach the
+        /// same drawing from the same evidence.
         public static func gtw(
-            cars: Int = 3, carLength: Double = 18.0,
-            width: Double = VehicleUnit.standardGaugeWidth
+            carLength: Double = 17.4, width: Double = VehicleUnit.standardGaugeWidth
         ) -> [VehicleUnit] {
-            multipleUnit(
-                cars: cars, carLength: carLength, width: width, doors: 2,
-                silhouette: .lowFloorUnit
-            )
+            [
+                VehicleUnit(
+                    kind: .drivingCar, length: carLength, width: width,
+                    cabFront: true, band: .first, doors: 2, joint: .none,
+                    silhouette: .lowFloorUnit
+                ),
+                VehicleUnit(
+                    kind: .coach, length: WagonCatalogue.gtwModuleLength, width: width,
+                    pantographs: 1, band: .second, doors: 0,
+                    silhouette: .gtwPower
+                ),
+                VehicleUnit(
+                    kind: .drivingCar, length: carLength, width: width,
+                    cabBack: true, band: .second, doors: 2,
+                    silhouette: .lowFloorUnit
+                ),
+            ]
         }
 
         /// A metre-gauge locomotive and the coaches behind it.

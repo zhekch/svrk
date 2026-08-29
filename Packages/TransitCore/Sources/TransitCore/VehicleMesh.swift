@@ -976,11 +976,31 @@ extension VehicleShape {
         var out: [LocalSlab] = []
         for glyph in glyphs {
             for bar in digit(glyph) {
-                let x0 = x + bar.x0 * wide
-                let x1 = x + bar.x1 * wide
+                let a0 = x + bar.x0 * wide
+                let a1 = x + bar.x1 * wide
                 let z0 = base + bar.y0 * tall
                 let z1 = base + bar.y1 * tall
                 let rings = [-1.0, 1.0].map { side -> [MeshPoint] in
+                    // Mirrored on the left-hand side of the vehicle, because
+                    // otherwise it is written backwards there.
+                    //
+                    // Both sides used to be drawn from the same `x`, which
+                    // looks right until you work out where the reader is
+                    // standing. `x` runs forward along the body, and a person
+                    // looking at the *left* flank of a vehicle has its nose on
+                    // their left — so increasing `x` runs right to left across
+                    // their view, and a `2` painted along it comes out as its
+                    // own mirror image. From the right flank the nose is on
+                    // their right and the same glyph reads correctly. One side
+                    // of every train in the country was written backwards.
+                    //
+                    // Reflected about `origin` — the middle of the whole legend
+                    // — rather than about each glyph's own cell, which matters
+                    // for the mixed first-and-second coaches: mirroring `1` and
+                    // `2` in place would leave them in the order they were laid
+                    // out and read "21".
+                    let x0 = side < 0 ? 2 * origin - a1 : a0
+                    let x1 = side < 0 ? 2 * origin - a0 : a1
                     let y0 = side * half - (side > 0 ? 0 : thick)
                     let y1 = side * half + (side > 0 ? thick : 0)
                     return [

@@ -761,6 +761,26 @@ private struct FrameReadout: View {
                 "\(stats.learnedTrains) trains · \(stats.learnedLines) lines"
                     + " · \(stats.asked) asked · \(stats.askRate)/min"
             )
+            // Everything the app asks the network for, not one caller of one
+            // interface. The `learned` row above counts background formation
+            // lookups, which is a behaviour worth watching on its own and was
+            // for a long time the only network figure here — so a refresh
+            // pulling thirty megabytes of fleet feed showed up as nothing at
+            // all. See `NetworkMeter`.
+            row(
+                "net",
+                "\(stats.net.callsPerMinute)/min · \(rate(stats.net.wirePerMinute))"
+                    + " · \(FeedActivity.bytes(stats.net.wire)) in \(stats.net.calls)",
+                warn: stats.net.callsPerMinute > 40
+            )
+            // Which interfaces those calls went to. The platform counts its
+            // rate limits per subscription, so a total that is comfortable can
+            // still be one interface being hammered — and that is the shape of
+            // every 429 this app has ever seen.
+            if !stats.net.byInterface.isEmpty {
+                row("apis", stats.net.byInterface.map { "\($0.name) \($0.calls)" }
+                    .joined(separator: " · "))
+            }
             row(
                 "cpu",
                 String(format: "%.0f%% · %.0f MB", stats.load.cpuPercent, stats.load.memoryMB),
@@ -782,13 +802,25 @@ private struct FrameReadout: View {
     /// iOS publishes no instantaneous power draw, so this is the evidence it
     /// does give: whether the phone has begun throttling itself, whether low
     /// power mode is on, and where the battery stands.
+    ///
+    /// The three are unrelated measurements and the row used to read like one.
+    /// `serious · 41%` looks as though 41% is a quantity of seriousness; it is
+    /// the battery, and the word beside it is `ProcessInfo.thermalState` —
+    /// nominal, fair, serious or critical — which is how hot the phone is and
+    /// therefore how hard iOS is throttling the processors under this app. The
+    /// battery is labelled now so the two cannot be read as one figure.
     private var power: String {
         var parts = [stats.load.thermal.label]
         if stats.load.lowPower { parts.append("low-power") }
         if let battery = stats.load.batteryPercent {
-            parts.append(String(format: "%.0f%%", battery))
+            parts.append(String(format: "batt %.0f%%", battery))
         }
         return parts.joined(separator: " · ")
+    }
+
+    /// Bytes a minute, written as a rate somebody can compare to a data plan.
+    private func rate(_ perMinute: Int) -> String {
+        perMinute == 0 ? "idle" : "\(FeedActivity.bytes(perMinute))/min"
     }
 
     private func row(_ name: String, _ value: String, warn: Bool = false) -> some View {

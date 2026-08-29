@@ -241,6 +241,13 @@ public actor OTDClient {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             note(response)
+            // What came back. `URLSession.data(for:)` will not say how many
+            // bytes crossed the wire — only the streaming path can — so the
+            // decoded length stands for both. On these interfaces the two are
+            // close: the answers are kilobytes of XML, not megabytes of it.
+            NetworkMeter.shared.received(
+                Self.label(api), wire: data.count, payload: data.count
+            )
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard (200..<300).contains(code) else {
                 errors += 1
@@ -283,6 +290,13 @@ public actor OTDClient {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             note(response)
+            // What came back. `URLSession.data(for:)` will not say how many
+            // bytes crossed the wire — only the streaming path can — so the
+            // decoded length stands for both. On these interfaces the two are
+            // close: the answers are kilobytes of XML, not megabytes of it.
+            NetworkMeter.shared.received(
+                Self.label(api), wire: data.count, payload: data.count
+            )
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard (200..<300).contains(code) else {
                 errors += 1
@@ -327,6 +341,22 @@ public actor OTDClient {
         rememberWindow()
         today += 1
         calls += 1
+        // Counted here rather than at each of the three ways out, because this
+        // is the one place every one of them passes through — and counted on
+        // the way *out* rather than on the way back, so a call that is refused,
+        // fails or is still in flight is in the rate. Those are the ones
+        // somebody watching the readout is looking for.
+        NetworkMeter.shared.began(Self.label(api))
+    }
+
+    /// The interface's short name, for a readout with a line to spare.
+    ///
+    /// The path without its leading slash: `gtfs-rt`, `siri-sx`, `ojp20`. Short
+    /// enough to print several of, and the platform's own word for the thing,
+    /// so a figure here can be taken to its documentation.
+    static func label(_ api: API) -> String {
+        let path = api.path.split(separator: "/").last.map(String.init) ?? api.path
+        return path
     }
 
     /// Stream one of the interfaces, handing back chunks as they arrive.
@@ -352,6 +382,12 @@ public actor OTDClient {
                 request: request, monitor: monitor, onChunk: onChunk
             )
             note(answer.response)
+            // The one path that knows both numbers, and the one where they
+            // differ by an order of magnitude: about 1.3 MB of gzip on the wire
+            // becoming 4 MB of protobuf, or 8 MB becoming 65 MB of XML.
+            NetworkMeter.shared.received(
+                Self.label(api), wire: answer.wire, payload: answer.payload
+            )
             let received = answer.status
             guard (200..<300).contains(received) else {
                 errors += 1
@@ -436,11 +472,20 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
     struct Answer: @unchecked Sendable {
         var status: Int
         var response: HTTPURLResponse?
+        /// Bytes over the wire — the compressed body, and what a data allowance
+        /// is charged for this transfer.
+        var wire: Int = 0
+        /// What those inflated to once URLSession undid the gzip, which is what
+        /// the parser was handed.
+        var payload: Int = 0
     }
 
     private var continuation: CheckedContinuation<Answer, Error>?
     private var status = 0
     private var response: HTTPURLResponse?
+    /// The wire count as the task last reported it. Kept rather than read at
+    /// the end because the task is gone by the time the continuation resumes.
+    private var wireBytes = 0
     /// Decompressed bytes handed on, kept only as a fallback for a transport
     /// that will not say how many went over the wire.
     private var parsedBytes = 0
@@ -509,6 +554,7 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
         // workload and nobody's bill.
         parsedBytes += data.count
         let wire = Int(dataTask.countOfBytesReceived)
+        wireBytes = wire
         let expected = Int(dataTask.countOfBytesExpectedToReceive)
         monitor?.received(
             wire > 0 ? wire : parsedBytes, expected: expected > 0 ? expected : nil
@@ -536,7 +582,13 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
         if let error {
             pending?.resume(throwing: error)
         } else {
-            pending?.resume(returning: Answer(status: status, response: budget ?? response))
+            pending?.resume(returning: Answer(
+                status: status, response: budget ?? response,
+                // A transport that would not say how many bytes it moved is
+                // reported at the decoded size, which is the same fallback the
+                // progress readout already makes.
+                wire: wireBytes > 0 ? wireBytes : parsedBytes, payload: parsedBytes
+            ))
         }
     }
 

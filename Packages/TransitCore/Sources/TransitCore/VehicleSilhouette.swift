@@ -80,6 +80,10 @@ public enum Silhouette: String, Sendable, Codable, Hashable, CaseIterable {
     /// The passenger module of a GTW or a Traverso — floor at platform height,
     /// glass from the knee up.
     case lowFloorUnit
+    /// The traction container in the middle of a GTW, which is the whole reason
+    /// a GTW is recognisable: four metres of blank, full-height machinery
+    /// between two long low cars.
+    case gtwPower
     /// An Allegra, a Capricorn, a zb Fink: metre-gauge, and shorter and lower
     /// in every dimension than the standard-gauge stock beside it.
     case narrowGaugeUnit
@@ -136,7 +140,7 @@ extension Silhouette {
         case .rackTrainCar, .rackTrailer, .funicularCar: return .slab
         case .tramCar, .metroCar, .aerialCabin: return .blunt
         case .generic, .intercityCoach, .doubleDeckCoach, .panoramaCoach,
-             .sleeperCoach, .luggageVan, .electricLoco, .shunter,
+             .sleeperCoach, .luggageVan, .electricLoco, .shunter, .gtwPower,
              .cityBus, .trolleybus, .coachBus, .boatHull:
             return nil
         }
@@ -155,7 +159,7 @@ extension Silhouette {
     /// Whether the sides carry windows worth drawing as glass.
     public var isGlazed: Bool {
         switch self {
-        case .luggageVan, .electricLoco, .shunter, .highSpeedPower:
+        case .luggageVan, .electricLoco, .shunter, .highSpeedPower, .gtwPower:
             return false
         default:
             return true
@@ -338,6 +342,16 @@ extension Silhouette {
             return BodyBands(
                 floor: 0.44, waist: 1.62, cant: 2.86, shoulder: 3.42, roof: 3.88,
                 underWidth: 0.64
+            )
+        case .gtwPower:
+            // No glass anywhere and full height throughout. The module is all
+            // machinery, and drawn with a window band it stops being the thing
+            // that makes a GTW a GTW — it becomes a very short coach. Taller
+            // than the cars either side of it, which is the other half of the
+            // silhouette: the roofline steps up in the middle and back down.
+            return BodyBands(
+                floor: 0.55, waist: 3.16, cant: 3.22, shoulder: 3.84, roof: 4.32,
+                roofWidth: 0.70, underWidth: 0.74
             )
         case .narrowGaugeUnit:
             return BodyBands(

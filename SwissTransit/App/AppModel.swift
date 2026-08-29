@@ -751,7 +751,14 @@ final class AppModel {
         var learnedLines = 0
         var asked = 0
         /// Background formation requests in the last minute.
+        ///
+        /// One caller of one interface, and it stays because it answers a
+        /// different question from `net` below: this is the app deciding to go
+        /// and look something up, which is a behaviour worth watching on its
+        /// own. `net` is everything the app asks for, formations included.
         var askRate = 0
+        /// Every request the app makes, and what it costs — see `NetworkMeter`.
+        var net = NetworkMeter.Reading()
         /// What the open vehicle is being drawn from, in words. The one line
         /// that makes a wrong drawing reportable: without it "that train looks
         /// wrong" cannot be told from "that train is wrong", because the drawing
@@ -2595,6 +2602,7 @@ final class AppModel {
             learnedLines: layouts.patternCount,
             asked: askedFormations.count,
             askRate: recentAsks.count,
+            net: NetworkMeter.shared.reading(),
             selected: selectedSummary(),
             ride: rides.summary,
             // Sampled on its own clock — see `DeviceLoad`, which will not do

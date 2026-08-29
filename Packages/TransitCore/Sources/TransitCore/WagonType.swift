@@ -645,6 +645,121 @@ public enum WagonCatalogue {
         return type.raw.hasPrefix("D") ? .van : .coach
     }
 
+    // MARK: - The one body that is not a vehicle
+
+    /// How long a GTW's traction container is, over its couplings.
+    static let gtwModuleLength = 4.2
+
+    /// Which body of a formation is a traction container rather than something
+    /// a passenger rides in, or nil where none is.
+    ///
+    /// One class, and it earns the special case because it is the only stock in
+    /// the country whose *middle* is the recognisable part. A Stadler GTW —
+    /// what Thurbo runs on most of the eastern regional network, and AB and MBC
+    /// on theirs — is two long low-floor cars with the entire traction package
+    /// standing between them in a four-metre, full-height, windowless box. Low,
+    /// low, tall-and-blank, low, low. Drawn as three equal cars it is a short
+    /// train and nothing more.
+    ///
+    /// **Why it cannot be read off a length.** The database stores class names
+    /// and, per class, one measured length; every car of a GTW is a `RABe 526`,
+    /// so a formation rebuilt from what is on file gives all three bodies the
+    /// same length by construction. The register does not distinguish them and
+    /// the formation service does not either — the module has no seats, no
+    /// class and no door, so there is nothing for either of them to report.
+    ///
+    /// **Why it has to be here and not in the library.** `LayoutLibrary`
+    /// guesses what a line runs and `VehicleLayoutStore` checks that guess
+    /// against real formations with `VehicleLayout.drawsAlike`. If the library
+    /// drew a short middle body and this did not, then every Thurbo working
+    /// ever looked at would disagree with a guess that was in fact correct, and
+    /// be filed as a correction to it. The two paths have to reach the same
+    /// drawing from the same evidence, and this is the evidence: the class
+    /// name, read in the one place class names are read.
+    ///
+    /// Narrow on purpose. Three bodies, all named as the same GTW class, none
+    /// of which the service called a locomotive — anything else is left alone.
+    static func tractionModule(in wagons: [StoredWagon]) -> Int? {
+        guard wagons.count == 3 else { return nil }
+        let families = wagons.map { $0.type?.family }
+        guard let family = families[0], families.allSatisfy({ $0 == family }) else { return nil }
+        guard gtwFamilies.contains(family) else { return nil }
+        // A set filed with an explicit locomotive in it is not a GTW being
+        // described; it is something else wearing the same name, and guessing
+        // at its middle would be worse than leaving it as three cars.
+        guard !wagons.contains(where: { $0.kind == .locomotive }) else { return nil }
+        return 1
+    }
+
+    /// Where one multiple unit ends and the next one begins.
+    ///
+    /// Two four-car FLIRTs coupled to make an eight-car train are not an
+    /// eight-car train. They are two trains touching, and in the middle of them
+    /// are two cab ends nose to nose — four windscreens, two sets of lamps and
+    /// a real gap, which is the most visible thing about the whole formation
+    /// and the one thing the drawing said nothing about. Every coupled unit in
+    /// the country came out as one continuous rake with a gangway where the
+    /// couplers are, and at that point an eight-car set and two four-car sets
+    /// are the same picture.
+    ///
+    /// **Read off the position suffix, which is already on disk.** The register
+    /// numbers the cars of a set — `RABe511_6_1` is car one of a six-car 511 —
+    /// and `WagonType` keeps those underscores deliberately, so the evidence
+    /// has been in every record ever written. Where the trailing number stops
+    /// climbing and starts again, a new unit has begun. Nothing needs
+    /// migrating and no new field is stored, which is the whole bargain this
+    /// file makes: the names stay, and the reading of them improves.
+    ///
+    /// Returns the indices that *begin* a unit, always including 0. A single
+    /// unit gives `[0]`, and a train with no suffixes at all gives `[0]` too —
+    /// which is exactly what was drawn before, and the right answer when there
+    /// is no evidence either way.
+    static func setStarts(in wagons: [StoredWagon]) -> [Int] {
+        var starts = [0]
+        var previous: Int?
+        for (index, wagon) in wagons.enumerated() {
+            // A locomotive is not part of a numbered set and must not break
+            // one: a rake with an engine in the middle is a different fact and
+            // the suffixes either side of it go on running.
+            guard let position = wagon.type.flatMap(setPosition) else {
+                previous = nil
+                continue
+            }
+            // Down, or level, means a new set. Level because a two-car unit
+            // coupled to another two-car unit runs 1,2,1,2 — and because a
+            // repeat is as much a restart as a decrease is.
+            if let previous, position <= previous, index > 0 {
+                starts.append(index)
+            }
+            previous = position
+        }
+        return starts
+    }
+
+    /// The car's own position within its set, where the name carries one.
+    ///
+    /// `RABE511_6_3` is car three of a six-car set, so the answer is the number
+    /// after the *last* underscore. Nil for a name with no suffix at all, which
+    /// is most hauled stock and every migrated record.
+    static func setPosition(_ type: WagonType) -> Int? {
+        guard let mark = type.raw.lastIndex(of: "_") else { return nil }
+        let tail = type.raw[type.raw.index(after: mark)...]
+        // The suffix has to be a bare number. `Bt4(GBT/Velo)` has no
+        // underscore; anything that does and is not a plain figure is not a
+        // position and is better read as "no evidence" than as a guess.
+        guard !tail.isEmpty, tail.allSatisfy(\.isNumber) else { return nil }
+        return Int(tail)
+    }
+
+    /// The classes built as a GTW.
+    ///
+    /// `RABe 526` is the Swiss GTW and covers Thurbo, SOB's older sets, and the
+    /// regional companies that bought them; `RABe 520` is the Seetal version,
+    /// built to the same pattern. The Traverso is also filed under 526 and is
+    /// *not* a GTW — but it is a four- or eight-car set, and the three-body
+    /// test above is what keeps them apart without needing to know that.
+    private static let gtwFamilies: Set<String> = ["RABE526", "RABE520", "RABDE526"]
+
     // MARK: - The drawing, from the names alone
 
     /// A train's wagons, as bodies to be drawn.
@@ -680,6 +795,17 @@ public enum WagonCatalogue {
         guard !wagons.isEmpty else { return [] }
         let kinds = wagons.map { kind(of: $0) }
         let hasLocomotive = kinds.contains(.locomotive)
+        // Which body, if any, is a traction container rather than a vehicle
+        // anybody rides in. See `tractionModule`.
+        let module = tractionModule(in: wagons)
+        // Where each coupled unit begins. `[0]` for an ordinary train; two
+        // entries for two units coupled nose to tail. See `setStarts`.
+        let starts = Set(setStarts(in: wagons))
+        /// Whether this body is the *last* of its unit — the one whose back end
+        /// faces the nose of the next unit along.
+        func endsAUnit(_ index: Int) -> Bool {
+            index == wagons.count - 1 || starts.contains(index + 1)
+        }
 
         /// Whether this end of the train is one somebody drives from.
         ///
@@ -698,8 +824,11 @@ public enum WagonCatalogue {
 
         return wagons.enumerated().map { index, wagon in
             let kind = kinds[index]
+            // Only the front of the *train* has nothing coupled to it. The
+            // back no longer has a use of its own: what used to be asked of it
+            // — where the cabs and the pantographs go — is now asked of the
+            // ends of each coupled unit instead. See `setStarts`.
             let leading = index == 0
-            let trailing = index == wagons.count - 1
             // The name where there is one; the line's usual stock where there
             // is not; a plain standard-gauge coach where there is neither.
             let traits = wagon.type.map { self.traits(of: $0) }
@@ -720,13 +849,27 @@ public enum WagonCatalogue {
                 ?? .unknown
 
             // A locomotive has a cab at both ends wherever it is standing.
-            let cabFront = kind == .locomotive ? true : (leading && cabAtFront)
-            let cabBack = kind == .locomotive ? true : (trailing && cabAtBack)
+            //
+            // Otherwise, a cab is on the end of a *unit* rather than on the end
+            // of the train — which for a single unit is the same thing, and for
+            // two coupled ones is the whole difference. Two four-car FLIRTs
+            // working as one eight-car train have four cabs, not two, and the
+            // middle pair face each other. See `setStarts`.
+            let startsUnit = starts.contains(index)
+            let endsUnit = endsAUnit(index)
+            let cabFront = kind == .locomotive ? true : (startsUnit && cabAtFront)
+            let cabBack = kind == .locomotive ? true : (endsUnit && cabAtBack)
 
             // Measured first, implied second. A class the app has watched is
             // drawn at the length it was seen to be; one it has not is drawn at
             // whatever its name suggests.
-            let observed = wagon.type.flatMap { measured[$0.family]?.length }
+            // A traction container is four metres whatever the class has been
+            // measured at, because what has been measured is the class and
+            // every car of a GTW carries the same class name. See
+            // `tractionModule`, and `LayoutLibrary.Stock.gtw`.
+            let observed = index == module
+                ? gtwModuleLength
+                : wagon.type.flatMap { measured[$0.family]?.length }
 
             return VehicleUnit(
                 kind: kind,
@@ -737,14 +880,28 @@ public enum WagonCatalogue {
                 // no pantograph — it is the unpowered end of the train — so
                 // putting one on every end car drew a Bt as though it were a
                 // railcar.
-                pantographs: kind == .locomotive
-                    ? 2 : (!hasLocomotive && (leading || trailing) ? 1 : 0),
+                // Per unit, for the same reason the cabs are: each of two
+                // coupled sets raises its own.
+                //
+                // Except on a GTW, where it is on the traction container in the
+                // middle — which is where the traction is, and where anybody
+                // looking at one sees it. The library's own GTW says the same;
+                // the two have to agree or the same train is drawn two ways
+                // depending on whether anybody has tapped it.
+                pantographs: kind == .locomotive ? 2
+                    : (module != nil
+                        ? (index == module ? 1 : 0)
+                        : (!hasLocomotive && (startsUnit || endsUnit) ? 1 : 0)),
                 doubleDeck: traits.doubleDeck,
                 // What the service said this vehicle is; failing that, what
                 // its name implies; failing both, nothing.
                 band: wagon.kind.map { band(of: $0) }
                     ?? wagon.type.map { band(of: $0.raw) } ?? .none,
-                doors: kind == .locomotive ? 0 : 2,
+                // No doors on a machine. A locomotive has none, and neither
+                // does a traction container — drawn with the two ticks every
+                // coach gets, the one body on a GTW that nobody can board
+                // reads as the shortest coach on the network.
+                doors: kind == .locomotive || index == module ? 0 : 2,
                 joint: leading ? .none : .coupler,
                 nose: (cabFront || cabBack) ? traits.nose : nil,
                 type: wagon.type,
@@ -761,9 +918,11 @@ public enum WagonCatalogue {
                 // the register calls the coaches around it, and a rake filed
                 // with every vehicle under one name would otherwise put a
                 // window band down the side of the engine.
-                silhouette: kind == .locomotive && !traits.powered
-                    ? (traits.silhouette == .highSpeedCar ? .highSpeedPower : .electricLoco)
-                    : traits.silhouette
+                silhouette: index == module
+                    ? .gtwPower
+                    : (kind == .locomotive && !traits.powered
+                        ? (traits.silhouette == .highSpeedCar ? .highSpeedPower : .electricLoco)
+                        : traits.silhouette)
             )
         }
     }
