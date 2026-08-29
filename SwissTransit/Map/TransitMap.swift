@@ -939,9 +939,8 @@ final class MapCoordinator: NSObject {
                         at: Coord(lon: vehicle.lon + shift.lon, lat: vehicle.lat + shift.lat),
                         heading: vehicle.bearing
                     ),
-                    // **Open, because this is the vehicle being followed**, and
-                    // leaving it to default was the whole of why the line
-                    // number would not go away.
+                    // **The open flag, and leaving it to default was the whole
+                    // of why the line number would not go away.**
                     //
                     // This lane rewrites the followed vehicle's own feature at
                     // the display's rate — sixty times a second against the
@@ -951,7 +950,13 @@ final class MapCoordinator: NSObject {
                     // which put its number straight back into the layer that
                     // never fades. The main lane was setting the flag correctly
                     // and being overwritten before it could be drawn.
-                    open: true
+                    // Read off `labelOpenId` rather than asserted: this lane
+                    // rewrites the feature sixty times a second, so it decides
+                    // what the label layers see, and it must say the same thing
+                    // the other lane is saying or the two fight. During the tick
+                    // a selection is handed over they differ, which is exactly
+                    // when getting it wrong would fade the wrong vehicle.
+                    open: vehicle.id == labelOpenId
                 )
             ])
         }
@@ -2682,7 +2687,9 @@ final class MapCoordinator: NSObject {
         drawnFrameVersion = -1
         drawnStopsVersion = -1
         drawnHitboxes = nil
-        hidOpenLabel = nil
+        labelOpenId = nil
+        openLabelOpacity = 1
+        openLabelSettleAt = 0
         drawnTunnelFades = nil
         // A new style has the layers' own filters back, so nothing is hidden.
         mergedAway = []
@@ -3003,9 +3010,17 @@ final class MapCoordinator: NSObject {
     /// matters: `AppModel` keeps them out of observation, so asking "is this
     /// new?" from inside `updateUIView` does not register a dependency on the
     /// answer and cannot schedule the next update.
-    /// What the open vehicle's label layer was last told to be, so the fade is
+    /// Which vehicle the *features* currently say is the open one.
+    ///
+    /// Deliberately not the selection: it lags it, because moving a feature
+    /// between the two label layers is instantaneous and the fade is not. See
+    /// `applyOpenLabel`.
+    private var labelOpenId: String?
+    /// What the open label layer was last told its opacity is, so the fade is
     /// started once rather than restated thirty times a second.
-    private var hidOpenLabel: Bool?
+    private var openLabelOpacity = 1.0
+    /// When the fade that was last started will have finished.
+    private var openLabelSettleAt: CFTimeInterval = 0
 
     private var drawnFrameVersion = -1
     private var drawnStopsVersion = -1
@@ -3048,7 +3063,7 @@ final class MapCoordinator: NSObject {
                 vehicle, at: at,
                 selected: vehicle.id == selectedId, emerged: emergence[vehicle.id] ?? 0,
                 tunnel: tunnelIndex.fade(at: at, heading: vehicle.bearing),
-                open: vehicle.id == selectedId
+                open: vehicle.id == labelOpenId
             )
         }
         style.updateGeoJSONSource(
@@ -3171,22 +3186,76 @@ final class MapCoordinator: NSObject {
     /// The label layer for the vehicle whose panel is open.
     static let openLabelLayer = "transit-vehicles-label-open"
 
+    /// How long to let a change of which vehicle is the open one reach the
+    /// map before acting on it, in seconds.
+    ///
+    /// A GeoJSON write is queued rather than applied, so "the features now say
+    /// X" is true a frame or two after saying it. Two frames at the model's
+    /// slowest rate, which is short enough to be invisible and long enough to
+    /// be sure.
+    private static let labelSwapSettle = 0.12
+
     /// Take the line number off the open vehicle once the map is close enough
     /// that the vehicle is the picture, and put it back when it is not.
     ///
-    /// One property write, and only when the answer has changed: the fade
-    /// itself is the layer's transition, so this starts it rather than draws
-    /// it. Called from `draw`, which runs on the model's tick — the tick that
-    /// carries a pinch is the one that crosses the zoom, so there is nothing
-    /// finer to be gained by watching the camera directly.
+    /// **Two things can change and only one of them can be animated.** The
+    /// layer's opacity fades, because that is what a paint transition does. Its
+    /// *membership* cannot: a feature is in one label layer or the other, and
+    /// the frame it changes over is the frame it changes over. So zooming faded
+    /// and tapping did not — tapping a train moved its number into a layer
+    /// already at nothing, and closing the panel moved it back into one already
+    /// at full strength, both of them in one frame.
+    ///
+    /// The answer is to only ever change membership at the moment it cannot be
+    /// seen, which is while both layers are at full strength. So a vehicle
+    /// being let go of is faded back in *before* it is released, and one being
+    /// taken up joins at full strength and is faded out afterwards. The
+    /// sequencing costs a tick — the features are rewritten by `drawVehicles`
+    /// on the model's clock, so this hands over and waits for the next one
+    /// rather than setting an opacity the features have not caught up with.
     private func applyOpenLabel(_ style: MapboxMap) {
         guard style.layerExists(withId: Self.openLabelLayer) else { return }
-        let hide = model.zoom > VehicleDot.labelHideZoom
-        guard hide != hidOpenLabel else { return }
-        hidOpenLabel = hide
+        let selected: String? = {
+            if case let .vehicle(id) = model.selection { return id }
+            return nil
+        }()
+
+        if selected != labelOpenId {
+            // Whoever is in the open layer has to be at full strength before
+            // anyone can leave or join it.
+            if openLabelOpacity != 1 {
+                setOpenLabel(style, opacity: 1)
+                return
+            }
+            // And the fade that brought them there has to have finished, or
+            // they would be released halfway and snap the rest of the way.
+            guard CACurrentMediaTime() >= openLabelSettleAt else { return }
+            labelOpenId = selected
+            // The features still say what they said, and a source update is
+            // handed to the SDK's own parsing queue rather than applied where
+            // it is written — so the swap lands a frame or two from now. Wait
+            // for it before touching the opacity: faded in between, the number
+            // would still be in the layer it is leaving and would jump to
+            // wherever the fade had got to when it finally moved.
+            openLabelSettleAt = CACurrentMediaTime() + Self.labelSwapSettle
+            return
+        }
+
+        // Nothing is started while something is still running: a fade
+        // interrupted halfway is a jump, and a swap released halfway is worse.
+        guard CACurrentMediaTime() >= openLabelSettleAt else { return }
+        let target = labelOpenId != nil && model.zoom > VehicleDot.labelHideZoom
+            ? 0.0 : 1.0
+        guard target != openLabelOpacity else { return }
+        setOpenLabel(style, opacity: target)
+    }
+
+    private func setOpenLabel(_ style: MapboxMap, opacity: Double) {
+        openLabelOpacity = opacity
+        openLabelSettleAt = CACurrentMediaTime() + VehicleDot.labelFadeSeconds
         do {
             try style.setLayerProperty(
-                for: Self.openLabelLayer, property: "text-opacity", value: hide ? 0.0 : 1.0
+                for: Self.openLabelLayer, property: "text-opacity", value: opacity
             )
         } catch {
             // Said rather than swallowed. A refused paint property is the one
