@@ -99,6 +99,246 @@ public enum Cableway {
         Silhouette.aerialCabin.hover * VehicleShape.modelExaggeration
     }
 
+    /// How much daylight a taut rope keeps over the ground it passes, in drawn
+    /// metres.
+    ///
+    /// This is what the towers are for and it is the whole shape of the answer
+    /// below: a rope is straight until the mountain gets in its way, and where
+    /// the mountain gets in its way somebody has built a tower. Eight metres is
+    /// enough that the rope reads as clearing the ridge rather than grazing it,
+    /// and low enough that a tower on a shoulder is a tower rather than a mast.
+    public static let clearance = 8.0
+
+    /// How far inside that clearance a rope is allowed to cut a corner, in
+    /// drawn metres.
+    ///
+    /// This is the number that decides how many towers a line gets, and it is
+    /// the one thing here that is a drawing decision rather than a fact. At
+    /// nothing, every sample of a smooth hillside is a tower; at ten metres, a
+    /// line over a ridge is a straight rope through the top of it. Two is a
+    /// hand's breadth against the eight above, so a rope still visibly clears
+    /// what it passes, and a mountainside comes out with three or four towers
+    /// on it rather than fifty.
+    public static let slack = 2.0
+
+    /// Longest a rope may run without a tower under it, in metres.
+    ///
+    /// The taut profile puts a tower wherever the rope actually bends, which is
+    /// the honest place for one, and on an even hillside that is nowhere at
+    /// all. A two-kilometre span with nothing under it reads as a line drawn on
+    /// the sky, so the straight stretches are filled in.
+    public static let towerFill = 340.0
+
+    /// One rope, as the heights it actually hangs at.
+    ///
+    /// Held by the coordinator after it is built, because two things need it
+    /// and they must agree exactly: the line that draws the rope, and the lift
+    /// that hangs the cabins on it. See `MapCoordinator.rest`.
+    public struct Rope {
+        /// The plan, resampled.
+        public var points: [Coord]
+        /// How far along the span each of those is, in metres.
+        public var along: [Double]
+        /// The ground under each, in the metres the map draws in.
+        public var ground: [Double]
+        /// And where the rope is, above sea level, at each.
+        public var altitude: [Double]
+        /// The distances at which the rope changes angle — the towers.
+        public var bends: [Double]
+
+        public var total: Double { along.last ?? 0 }
+
+        /// The rope's height above sea level at a point near it, and the ground
+        /// under that point, or nil if the point is not on this span.
+        ///
+        /// Nearest vertex rather than a true perpendicular projection: the
+        /// points are twenty-five metres apart and a cabin is never more than a
+        /// few metres off the line it is running on, so the two answers differ
+        /// by less than the thickness of the rope.
+        public func at(_ coord: Coord, within metres: Double) -> (rope: Double, ground: Double)? {
+            var best = metres
+            var found: Int?
+            for (i, point) in points.enumerated() {
+                let d = Geo.metres(point, coord)
+                if d < best { best = d; found = i }
+            }
+            guard let found else { return nil }
+            return (altitude[found], ground[found])
+        }
+    }
+
+    // MARK: - Pulling the rope tight
+
+    /// The rope a taut cable would take over this ground.
+    ///
+    /// **It is the upper convex hull of the clearance profile, and that is not
+    /// an approximation of a rope — it is what a rope is.** Pull a string tight
+    /// between two points over a lumpy surface and it touches the surface at
+    /// exactly the points of the upper hull and runs dead straight between
+    /// them. Every one of those touch points is where a real cableway has a
+    /// tower, which is why the towers below are placed at them rather than at
+    /// an interval somebody chose.
+    ///
+    /// The two ends are pinned at rope height over their own stations, because
+    /// that is where the rope leaves the building; everything between is pinned
+    /// no lower than `clearance` over the ground. So a span across a valley
+    /// comes out as one straight line with a hundred metres of air under it,
+    /// and a span up an even hillside comes out parallel to the hill, which is
+    /// what each of them looks like.
+    ///
+    /// Nil if the terrain has not been measured at every point — a span half
+    /// measured would be pulled tight against ground that is not there yet.
+    public static func taut(along points: [Coord], ground: (Coord) -> Double?) -> Rope? {
+        var along: [Double] = [0]
+        var floor: [Double] = []
+        var heights: [Double] = []
+        for (i, point) in points.enumerated() {
+            guard let g = ground(point), g.isFinite else { return nil }
+            heights.append(g)
+            if i > 0 { along.append(along[i - 1] + Geo.metres(points[i - 1], point)) }
+        }
+        guard along.count == points.count, let last = along.last, last > 0 else { return nil }
+
+        // What the rope may not go below: its own station height at the two
+        // ends, and a clearance over the ground everywhere between.
+        for (i, g) in heights.enumerated() {
+            let isEnd = i == 0 || i == heights.count - 1
+            floor.append(g + (isEnd ? Cableway.drawnRopeHeight : clearance))
+        }
+
+        // The upper hull, by monotone chain. A point is kept while the turn it
+        // makes with the two before it is a right one; a left turn means the
+        // middle point is under the line joining its neighbours, which is a
+        // point the rope flies over.
+        var hull: [Int] = []
+        for i in 0..<floor.count {
+            while hull.count >= 2 {
+                let a = hull[hull.count - 2], b = hull[hull.count - 1]
+                let cross = (along[b] - along[a]) * (floor[i] - floor[a])
+                    - (floor[b] - floor[a]) * (along[i] - along[a])
+                if cross >= 0 { hull.removeLast() } else { break }
+            }
+            hull.append(i)
+        }
+        guard hull.count >= 2 else { return nil }
+
+        // **And then most of the hull is thrown away, which is the difference
+        // between a rope and a contour line.**
+        //
+        // The hull is exactly right and it is too detailed to be a cableway. A
+        // taut string over a *smooth* dome touches the dome all the way across
+        // it — that is a true fact about strings, and it came out as fifty-seven
+        // towers up one hillside. What a real rope does is bear on a handful of
+        // towers and cut the corner between them, hanging a metre or two closer
+        // to the ground in the middle of each stretch than a string pulled
+        // infinitely tight would.
+        //
+        // So the vertices are walked greedily and skipped for as long as the
+        // straight chord over them stays within `slack` of the ground it is
+        // supposed to clear. Where the hillside is smooth, consecutive hull
+        // points are nearly in line and the chord skips the lot; where there is
+        // an actual ridge, the chord would cut into it and the vertex is kept.
+        // What is left is the set of points the rope genuinely needs bearing
+        // on, which is the set of points somebody built a tower on.
+        var supports: [Int] = [hull[0]]
+        var k = 0
+        while k < hull.count - 1 {
+            var reach = k + 1
+            var next = k + 1
+            while next < hull.count {
+                let a = supports[supports.count - 1], b = hull[next]
+                let run = along[b] - along[a]
+                var clears = true
+                if run > 0 {
+                    for j in (k + 1)..<next {
+                        let i = hull[j]
+                        let share = (along[i] - along[a]) / run
+                        let chord = floor[a] + (floor[b] - floor[a]) * share
+                        if chord < floor[i] - slack { clears = false; break }
+                    }
+                }
+                if !clears { break }
+                reach = next
+                next += 1
+            }
+            supports.append(hull[reach])
+            k = reach
+        }
+
+        // And the height at every point of the span, read off what is left.
+        var altitude = [Double](repeating: 0, count: floor.count)
+        for k in 1..<supports.count {
+            let a = supports[k - 1], b = supports[k]
+            let run = along[b] - along[a]
+            for i in a...b {
+                let share = run > 0 ? (along[i] - along[a]) / run : 0
+                altitude[i] = floor[a] + (floor[b] - floor[a]) * share
+            }
+        }
+        return Rope(
+            points: points, along: along, ground: heights, altitude: altitude,
+            bends: supports.dropFirst().dropLast().map { along[$0] }
+        )
+    }
+
+    /// The rope's height above sea level at a distance along it.
+    public static func height(of rope: Rope, at distance: Double) -> Double {
+        position(rope, at: distance)?.height ?? (rope.altitude.first ?? 0)
+    }
+
+    /// Where a distance along the rope falls: the point, the ground under it,
+    /// the rope over it, and which way the line is running there.
+    public static func position(
+        _ rope: Rope, at distance: Double
+    ) -> (coord: Coord, ground: Double, height: Double, bearing: Double)? {
+        guard rope.points.count >= 2 else { return nil }
+        let want = min(max(0, distance), rope.total)
+        var i = 1
+        while i < rope.along.count - 1 && rope.along[i] < want { i += 1 }
+        let a = i - 1, b = i
+        let run = rope.along[b] - rope.along[a]
+        let share = run > 0 ? (want - rope.along[a]) / run : 0
+        return (
+            coord: Geo.interpolate(rope.points[a], rope.points[b], share),
+            ground: rope.ground[a] + (rope.ground[b] - rope.ground[a]) * share,
+            height: rope.altitude[a] + (rope.altitude[b] - rope.altitude[a]) * share,
+            bearing: Geo.bearing(rope.points[a], rope.points[b])
+        )
+    }
+
+    /// The stretch of the plan between two distances along it.
+    public static func slice(_ rope: Rope, from: Double, to: Double) -> [Coord] {
+        var out: [Coord] = []
+        if let head = position(rope, at: from) { out.append(head.coord) }
+        for (i, point) in rope.points.enumerated()
+        where rope.along[i] > from + 0.5 && rope.along[i] < to - 0.5 {
+            out.append(point)
+        }
+        if let tail = position(rope, at: to) { out.append(tail.coord) }
+        return out
+    }
+
+    /// Where the towers stand: at every bend, and down the straight stretches
+    /// between them so a long clear span is still held up by something.
+    public static func towerPoints(of rope: Rope) -> [Double] {
+        var stops = [0.0] + rope.bends + [rope.total]
+        stops.sort()
+        var out: [Double] = rope.bends
+        for i in 1..<max(2, stops.count) where i < stops.count {
+            let run = stops[i] - stops[i - 1]
+            guard run > towerFill * 1.5 else { continue }
+            let count = Int((run / towerFill).rounded())
+            guard count > 1 else { continue }
+            for k in 1..<count {
+                out.append(stops[i - 1] + run * Double(k) / Double(count))
+            }
+        }
+        // Never inside a station.
+        return out.filter {
+            $0 > Cableway.towerClearance && $0 < rope.total - Cableway.towerClearance
+        }
+    }
+
     // MARK: - The towers
 
     /// How far apart the towers stand, in metres.
@@ -111,7 +351,7 @@ public enum Cableway {
     /// How close to a station a tower may stand. Inside this the station
     /// building is the structure holding the rope, and a tower there is a mast
     /// through the roof.
-    static let towerClearance = 90.0
+    public static let towerClearance = 90.0
     public static let towerWidth = 2.0
     /// The crosshead the sheaves hang from, across the line.
     public static let towerHead = 5.2

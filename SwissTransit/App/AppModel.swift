@@ -288,6 +288,18 @@ final class AppModel {
     private(set) var selectedGeometryRevision = 0
     private(set) var selectedVehicle: VehicleSnapshot?
 
+    /// Set when a vehicle was asked for by id and the fleet has no such
+    /// vehicle — as against not having been asked yet.
+    ///
+    /// The panel shows a spinner while a selection is being fetched, which is
+    /// right, and it has no other way to tell "still coming" from "there is
+    /// nothing to come". A board row naming a run the fleet cannot resolve
+    /// therefore span for ever. The lookup itself is fixed — see
+    /// `Fleet.drawnJourney` — and this is the guard that stops any *future*
+    /// unresolvable id doing the same thing: a dead end is a sentence, not a
+    /// spinner.
+    private(set) var selectedVehicleMissing = false
+
     /// The halves of a splitting train that the reader is *not* standing in,
     /// each drawn from where the two part company.
     ///
@@ -3110,6 +3122,7 @@ final class AppModel {
         switch selection {
         case .none, .station, .platform, .track, .choices:
             selectedVehicle = nil
+            selectedVehicleMissing = false
             departingVehicle = nil
             clearFormation()
             setSelectedGeometry(nil)
@@ -3127,6 +3140,7 @@ final class AppModel {
             // at, and a relation has both. So a line with nothing running on it
             // is drawn by exactly the code that draws the train you tapped.
             selectedVehicle = nil
+            selectedVehicleMissing = false
             departingVehicle = nil
             clearFormation()
             setSelectedGeometry(line.geometry)
@@ -3147,6 +3161,11 @@ final class AppModel {
     private func loadVehicle(id: String, at now: Timestamp) async {
         let found = await fleet.journey(id: id, at: now)
         let departing = await outgoing(of: found, at: now)
+        // Only where nothing was found *and* nothing is already on the panel: a
+        // vehicle that has finished its run while being watched should keep the
+        // card it had rather than replace it with an error.
+        let missing = found == nil && selectedVehicle == nil
+        if selectedVehicleMissing != missing { selectedVehicleMissing = missing }
 
         // The map highlights whatever the panel is describing. Drawing the run
         // that is over while the panel reads out the one about to leave is two

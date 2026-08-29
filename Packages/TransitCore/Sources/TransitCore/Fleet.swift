@@ -1382,8 +1382,17 @@ public actor Fleet {
         // run finds no track either — so an answer reached before `railnet.bin`
         // was mapped would put every funicular in the country on a rope, and
         // being memoised it would stay there for the life of the process.
-        if railnet.isReady { cableKinds[key] = resolved }
-        return resolved
+        if railnet.isReady {
+            cableKinds[key] = resolved.kind
+            // And an answer that was only reached because the window did not
+            // hold enough of the line to measure is kept, but marked, so the
+            // next window that holds more gets to change its mind. Without
+            // this, a line first seen during the clipped opening draw would
+            // wear that first guess for the life of the process.
+            if resolved.settled { unsettledCable.remove(key) }
+            else { unsettledCable.insert(key) }
+        }
+        return resolved.kind
     }
 
     /// Words a service uses about itself, in the four languages it might.
@@ -1405,11 +1414,94 @@ public actor Fleet {
         "funi", "funicular", "funiculaire", "funicolare", "funicolar",
         "standseilbahn", "standseilb", "drahtseilbahn", "minifunic",
     ]
+    /// And the words for the small cabin, which includes the smallest of all.
+    ///
+    /// A chair on a lift is filed as `SL` and is drawn as a gondola, because
+    /// what it is on this map is the same thing at the same size: a little body
+    /// hanging off a rope, a great many of them, one behind another. It is much
+    /// further from the eighty-seat car than it is from the six-seat pod.
     private static let saysGondola: Set<String> = [
         "gondelbahn", "gondola", "gondelb", "telecabine", "cabinovia",
+        "sesselbahn", "sessellift", "telesiege", "seggiovia",
     ]
 
-    private func resolveCable(_ journey: Journey) -> LayoutLibrary.CableKind {
+    /// At or under this, the cabins are running one behind another, in seconds.
+    ///
+    /// **Measured, and the gap it sits in is enormous.** Over a two-hour window
+    /// of the national timetable, every aerial line in the country falls into
+    /// one of two groups and there is nothing between them: the continuous ones
+    /// run at a median headway of **one minute or less** — Flims Foppa, Kriens–
+    /// Fräkmüntegg, Grindelwald–Männlichen, the Eiger Express, Marbachegg,
+    /// Sörenberg–Rossweid, Mägisalp–Planplatten, Wildhaus, Chur–Brambrüesch —
+    /// and the shuttles run at **five minutes or more**, nearly all of them at
+    /// fifteen or twenty. Three minutes is the middle of a gap with a factor of
+    /// five in it, so the threshold is not a tuning knob; anything from two to
+    /// four would separate the same lines.
+    static let gondolaHeadway: TimeInterval = 180
+
+    /// How many departures it takes before a headway means anything.
+    ///
+    /// Two runs is one gap and one gap is not a rate: a line whose window
+    /// happens to catch its two hourly departures forty seconds apart is not a
+    /// gondola. Three runs is two gaps and a median of them.
+    static let headwayNeedsRuns = 3
+
+    /// Every departure time on each cable line *and direction*, from the drawn
+    /// set, rebuilt when that set changes.
+    ///
+    /// Per direction, because the two halves of a shuttle leave their two ends
+    /// on the same clock: pooled, an hourly Luftseilbahn reads as a
+    /// half-hourly one, and on a line where the two ends are timetabled
+    /// together it reads as a service running every few seconds.
+    private var cableRuns: [String: [Int]] = [:]
+    private var cableRunsFor = -1
+    /// Lines whose kind was settled by a guess rather than by a measurement.
+    /// See `cableKind(of:)`.
+    private var unsettledCable: Set<String> = []
+
+    private func cableRunTimes() -> [String: [Int]] {
+        guard cableRunsFor != journeys.count else { return cableRuns }
+        // A different set of journeys is a different set of departures, so
+        // anything that could not be measured against the last one is given
+        // back its chance against this one.
+        for key in unsettledCable { cableKinds.removeValue(forKey: key) }
+        unsettledCable.removeAll(keepingCapacity: true)
+        var out: [String: [Int]] = [:]
+        for journey in journeys.values where journey.mode == .cable {
+            guard let first = journey.stops.first else { continue }
+            out[Self.runKey(journey), default: []].append(first.dep)
+        }
+        cableRuns = out
+        cableRunsFor = journeys.count
+        return out
+    }
+
+    private static func runKey(_ journey: Journey) -> String {
+        "\(journey.operatorName ?? "")|\(journey.line)|\(journey.stops.first?.name ?? "")"
+    }
+
+    /// The median gap between departures on this line and in this direction, in
+    /// seconds, or nil where too few of them are in the window to say.
+    ///
+    /// The median rather than the mean, and that is what makes it robust on the
+    /// only irregularity these lines have: a continuous gondola pauses over
+    /// lunch and at the ends of the day, and one thirty-minute hole in a run of
+    /// sixty-second gaps would pull an average clean across the threshold.
+    private func headway(of journey: Journey) -> TimeInterval? {
+        let times = cableRunTimes()[Self.runKey(journey)] ?? []
+        guard times.count >= Self.headwayNeedsRuns else { return nil }
+        let sorted = times.sorted()
+        var gaps: [TimeInterval] = []
+        gaps.reserveCapacity(sorted.count - 1)
+        for i in 1..<sorted.count { gaps.append(TimeInterval(sorted[i] - sorted[i - 1])) }
+        return gaps.sorted()[gaps.count / 2]
+    }
+
+    /// `settled` is false only where the answer is the fallback and the window
+    /// held too little of the line to do better. See `cableKind(of:)`.
+    private func resolveCable(
+        _ journey: Journey
+    ) -> (kind: LayoutLibrary.CableKind, settled: Bool) {
         // Everything the service says about itself, cut into words. Accents
         // folded away because the same name is written `téléphérique` and
         // `telepherique` in one timetable.
@@ -1421,9 +1513,9 @@ public actor Fleet {
                 .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
                 .map(String.init)
         )
-        if !said.isDisjoint(with: Self.saysFunicular) { return .funicular }
+        if !said.isDisjoint(with: Self.saysFunicular) { return (.funicular, true) }
 
-        guard journey.stops.count >= 2 else { return .funicular }
+        guard journey.stops.count >= 2 else { return (.funicular, true) }
 
         // Rails under it, on the class of graph a funicular is mapped in. Asked
         // leg by leg because a line with a mid-station may have one leg the
@@ -1445,22 +1537,41 @@ public actor Fleet {
             if let path = railnet.routeLeg(
                 key: cacheKey, from: from, to: to, mode: .cable
             ), path.count > 1 {
-                return .funicular
+                return (.funicular, true)
             }
         }
 
         // Nothing under it, so it hangs — but only if it is long enough to be a
         // ropeway at all. See `shortestRopeway`.
         let span = Geo.length(of: journey.stops.map(\.coord))
-        guard span >= Self.shortestRopeway else { return .funicular }
-        // A gondola where the name says so, and an aerial tramway car
-        // otherwise. That default is the right way round for this country's
-        // *timetabled* ropeways, which is what this is choosing for: the public
+        guard span >= Self.shortestRopeway else { return (.funicular, true) }
+
+        // It hangs. Which of the two things that hang it is comes down to how
+        // many of them there are, and the timetable says so outright.
+        //
+        // The name first, where there is one — `Gondelbahn`, `télécabine`,
+        // `Sesselbahn` — because a service that states what it is should be
+        // believed ahead of a measurement about it. But the names cannot be
+        // relied on: `Hasliberg Reuti (Gondelbahn)` and `Meiringen
+        // (Luftseilbahn)` are the two ends of *one* line, and they disagree.
+        if !said.isDisjoint(with: Self.saysGondola) { return (.gondola, true) }
+
+        // Then the rate, which is the honest distinction between the two
+        // machines and not a proxy for it. A gondola is a loop of rope with the
+        // cabins clamped onto it all the way round, so they arrive one behind
+        // another for as long as the line is open; an aerial tramway is one or
+        // two cars shuttling back and forth on a fixed rope, and every trip has
+        // to wait for the last one to come back. One minute against fifteen.
+        // See `gondolaHeadway`.
+        if let gap = headway(of: journey) {
+            return (gap <= Self.gondolaHeadway ? .gondola : .tramway, true)
+        }
+
+        // And the big car when nothing says otherwise. That default is the
+        // right way round for this country's *timetabled* ropeways: the public
         // network is mostly village Luftseilbahnen — Unterbäch, Eischoll,
-        // Jeizinen, Gspon, Isérables — carrying one big car apiece, and the
-        // continuous gondolas on it are the minority and usually say
-        // `Gondelbahn` on the station.
-        return said.isDisjoint(with: Self.saysGondola) ? .tramway : .gondola
+        // Jeizinen, Gspon, Isérables — carrying one car apiece.
+        return (.tramway, false)
     }
 
     // MARK: - Which journeys call where
@@ -2576,8 +2687,31 @@ public actor Fleet {
     /// A board lists what leaves for the next hour or more, so most of it has
     /// not left yet — and those rows do nothing when tapped if the only place
     /// to look them up is a fleet that by construction does not hold them.
+    /// The drawn vehicle a journey id names, whichever of its names was used.
+    ///
+    /// **Three ways to name one vehicle, and only one of them used to work.** A
+    /// chained working — an S1 renumbered at Gümligen, a train that changes
+    /// number en route — is one vehicle on the map and two or three trips in
+    /// the file. `Chains.build` folds them into a single journey under the
+    /// *first* leg's id, so the later legs' ids are keys of nothing: they are
+    /// in `chainOf`, which is built for exactly this and was being consulted by
+    /// nothing that answers a tap.
+    ///
+    /// What that looked like is the bug it was found as. A departure board
+    /// lists a run by whatever id the timetable filed it under, so a row for a
+    /// later leg handed back an id the fleet could not resolve; the panel asked
+    /// for it, got nil, and sat on the spinner it shows while a vehicle is
+    /// being fetched — for ever, because nothing was ever going to arrive.
+    private func drawnJourney(_ id: String) -> Journey? {
+        // `fleetByID()` first and not merely for its answer: it is what builds
+        // `chainOf`, so the fallback below has nothing to read until it has run.
+        if let direct = fleetByID()[id] { return direct }
+        if let chain = chainOf[id], let joined = chained[chain] { return joined }
+        return mirrored[id]
+    }
+
     public func journey(id: String, at now: Timestamp) -> VehicleSnapshot? {
-        guard let journey = fleetByID()[id] ?? mirrored[id] else { return nil }
+        guard let journey = drawnJourney(id) else { return nil }
         // `refined: false`, and that one word is the whole of the fix for a
         // vehicle that jumped when it was tapped.
         //
@@ -2663,7 +2797,7 @@ public actor Fleet {
     /// where the vehicle is being drawn, which is where the camera already is.
     /// Nothing to catch up to, and nothing done.
     public func settledPosition(of id: String, at now: Timestamp) -> Coord? {
-        guard let journey = fleetByID()[id] ?? mirrored[id] else { return nil }
+        guard let journey = drawnJourney(id) else { return nil }
         let moment = Double(now)
         let settling = (Positioning.settleShift(journey, at: moment) ?? 0) > 0
             && (journey.settle.map { $0.from + $0.over - moment } ?? 0) > Self.catchUpWithin
@@ -2688,7 +2822,7 @@ public actor Fleet {
     /// entitled to make is that the train it names has not terminated. See
     /// `RideWatch.hold`.
     public func isRunning(id: String, at now: Timestamp) -> Bool {
-        guard let journey = fleetByID()[id] ?? mirrored[id] else { return false }
+        guard let journey = drawnJourney(id) else { return false }
         return Positioning.position(of: journey, at: now) != nil
     }
 

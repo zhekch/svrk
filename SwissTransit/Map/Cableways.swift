@@ -46,18 +46,28 @@ enum Cableways {
     static let source = "transit-cableway"
     /// The stations and the towers: rigid, one elevation each.
     static let structures = "transit-cableway-structures"
-    /// The rope: draped, and drawn after the structures so a span meeting a
-    /// station is not painted over by the shed it runs into.
+    /// The rope, drawn taut between measured ends.
     static let ropes = "transit-cableway-ropes"
+    /// And the same rope over ground nobody has measured yet.
+    static let draped = "transit-cableway-ropes-draped"
 
     /// Which of the two layers a feature belongs to, and what colour it is.
     private enum Key {
         static let kind = "k"
+        /// A rope whose two ends have been measured against the terrain, and so
+        /// can be drawn taut at an absolute altitude.
         static let rope = "r"
+        /// A rope over ground the elevation tiles have not arrived for, draped
+        /// at a fixed height instead. See `install`.
+        static let draped = "d"
         static let structure = "s"
         static let colour = "c"
         static let base = "b"
         static let height = "h"
+        /// Metres above sea level at the start of this rope segment, and how
+        /// much it climbs over the segment's length.
+        static let from = "z0"
+        static let climb = "dz"
     }
 
     // MARK: - Paint
@@ -115,6 +125,12 @@ enum Cableways {
         if !style.sourceExists(withId: source) {
             var geojson = GeoJSONSource(id: source)
             geojson.data = .featureCollection(FeatureCollection(features: []))
+            // Line metrics, which is what `line-progress` is: the fraction of
+            // the way along a line, and the only thing that can vary a height
+            // *within* one feature. Without it the rope could climb only in
+            // steps, one per feature, and a rope that climbs eight hundred
+            // metres in steps is a staircase.
+            geojson.lineMetrics = true
             try style.addSource(geojson)
         }
 
@@ -129,34 +145,79 @@ enum Cableways {
             VehicleModels.setFlatOnTerrain(style, layer: structures)
         }
 
+        if !style.layerExists(withId: draped) {
+            // The fallback, and it is the drawing this feature started as: a
+            // rope carried a fixed height over whatever ground is under it.
+            // Correct along an even hillside and wrong across a valley, where
+            // it drapes into the hole instead of spanning it — but it needs no
+            // elevation tiles to have arrived, so it is what a span is drawn as
+            // for the second or two before the terrain under it is known.
+            var rope = LineLayer(id: draped, source: source)
+            rope.filter = Exp(.eq) { Exp(.get) { Key.kind }; Key.draped }
+            rope.lineColor = .expression(Exp(.get) { Key.colour })
+            rope.lineElevationReference = .constant(.ground)
+            rope.lineZOffset = .constant(Cableway.drawnRopeHeight)
+            trace(rope: &rope)
+            try style.addLayer(rope)
+        }
+
         if !style.layerExists(withId: ropes) {
             var rope = LineLayer(id: ropes, source: source)
             rope.filter = Exp(.eq) { Exp(.get) { Key.kind }; Key.rope }
             rope.lineColor = .expression(Exp(.get) { Key.colour })
-            // Over the ground under it rather than over sea level, which is the
-            // only one of the two a line strung along a mountain can use: the
-            // rope climbs eight hundred metres between its two stations, and an
-            // offset from sea level would put the top half of it underground and
-            // the bottom half in the sky.
-            rope.lineElevationReference = .constant(.ground)
-            rope.lineZOffset = .constant(Cableway.drawnRopeHeight)
-            // In points, and that is the reason this is a line at all. A rope
-            // is a mark of constant weight whatever the scale — heavy enough to
-            // follow across a valley at zoom 13, and never thickening into a
-            // girder at zoom 19.
-            rope.lineWidth = .expression(
-                Exp(.interpolate) {
-                    Exp(.linear); Exp(.zoom)
-                    13; 0.9
-                    16; 1.6
-                    19; 2.6
+            // **Above sea level, and straight between its ends.**
+            //
+            // A rope is not draped over anything. It is pulled tight between
+            // two points and it stays where that leaves it: level across a
+            // valley the ground falls away under, and nowhere near parallel to
+            // the hillside. Carried at a fixed height over the ground — which
+            // is what this drew before, and what `draped` still draws — it
+            // rippled over every hummock the terrain tiles have, and the
+            // cabins strung on it rippled with it.
+            //
+            // So each segment is given an absolute height at its start and how
+            // much it climbs, and `line-progress` — the fraction of the way
+            // along this feature — interpolates between them. That is the one
+            // mechanism in the style that can vary a height *inside* a feature,
+            // and it is exactly the shape of the problem: within a segment the
+            // rope is a straight line in three dimensions, and the renderer can
+            // be told so in one expression instead of a hundred short features
+            // stepping up a mountain.
+            rope.lineElevationReference = .constant(.sea)
+            rope.lineZOffset = .expression(
+                Exp(.sum) {
+                    Exp(.get) { Key.from }
+                    Exp(.product) {
+                        Exp(.get) { Key.climb }
+                        Exp(.lineProgress)
+                    }
                 }
             )
-            rope.lineCap = .constant(.round)
-            rope.lineJoin = .constant(.round)
-            rope.minZoom = minZoom
+            trace(rope: &rope)
             try style.addLayer(rope)
         }
+    }
+
+    /// What both rope layers look like, which is everything but their height.
+    ///
+    /// Named `trace` rather than `style` because the parameter every caller
+    /// already has in hand is called `style` and is a `MapboxMap`.
+    private static func trace(rope: inout LineLayer) {
+        // In points, and that is the reason this is a line at all. A rope is a
+        // mark of constant weight whatever the scale — heavy enough to follow
+        // across a valley at zoom 13, and never thickening into a girder at
+        // zoom 19.
+        rope.lineWidth = .expression(
+            Exp(.interpolate) {
+                Exp(.linear); Exp(.zoom)
+                13; 0.9
+                16; 1.6
+                19; 2.6
+            }
+        )
+        rope.lineCap = .constant(.round)
+        rope.lineJoin = .constant(.round)
+        rope.minZoom = minZoom
     }
 
     /// How the structures are painted and lit. The rope is a line and shares
@@ -191,6 +252,16 @@ enum Cableways {
     /// a line drawn beside the line the route overlay already draws.
     static let minZoom = VehicleShape.minZoom
 
+    /// How near a cabin has to be to a rope to be counted as hanging from it,
+    /// in metres.
+    ///
+    /// Generous, because the two are placed from the same geometry and the only
+    /// thing between them is a stop coordinate that is the station building
+    /// rather than the boarding point. A cabin further off than this is on some
+    /// other line, and hanging it from this one would drag it sideways through
+    /// the air.
+    static let snap = 120.0
+
     // MARK: - Building the features
 
     /// How finely a rope is sampled along its own span, in metres.
@@ -206,45 +277,70 @@ enum Cableways {
     /// resolution rather than this.
     private static let ropeStep = 25.0
 
-    /// Everything the plan implies, as features.
-    static func features(_ plan: Cableway.Plan, dark: Bool) -> [Feature] {
+    /// Everything the plan implies, as features, plus the ropes they hang from.
+    ///
+    /// `ground` answers with the drawn height of the terrain at a point, or nil
+    /// where the tile for it has not arrived — the same question and the same
+    /// nil `MapCoordinator.rest` asks of the renderer for the vehicles. A span
+    /// whose ends cannot be measured is drawn draped rather than not at all,
+    /// and `pending` says so, so the next frame asks again.
+    static func features(
+        _ plan: Cableway.Plan, dark: Bool, ground: (Coord) -> Double?
+    ) -> (features: [Feature], ropes: [Cableway.Rope], pending: Bool) {
         let paint = palette(dark: dark)
         var out: [Feature] = []
-        out.reserveCapacity(plan.spans.count * 2 + plan.stations.count * 4)
+        var ropes: [Cableway.Rope] = []
+        var pending = false
+        out.reserveCapacity(plan.spans.count * 4 + plan.stations.count * 4)
 
         for span in plan.spans {
             let walked = resampled(span.points, every: ropeStep)
-            if walked.count >= 2 {
-                var rope = Feature(geometry: .lineString(LineString(
-                    walked.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
-                )))
-                rope.properties = [
-                    Key.kind: .string(Key.rope),
-                    Key.colour: .string(paint.rope),
-                ]
-                out.append(rope)
-            }
-            for tower in Cableway.towers(along: span.points) {
-                // The mast, from the ground to the sheaves under the rope.
-                out.append(prism(
-                    box(
-                        at: tower.at, bearing: tower.bearing,
-                        length: Cableway.towerWidth, width: Cableway.towerWidth
-                    ),
-                    kind: Key.structure, colour: paint.tower,
-                    base: 0, height: sheaves
+            guard walked.count >= 2 else { continue }
+
+            guard let rope = Cableway.taut(along: walked, ground: ground) else {
+                // Nothing measured yet. Draped, at a fixed height, and asked
+                // about again next frame.
+                pending = true
+                out.append(line(
+                    walked, kind: Key.draped, colour: paint.rope, from: 0, climb: 0
                 ))
-                // And the crosshead the sheaves hang from, which is what turns a
-                // post into a pylon: it lies *across* the line, so the one thing
-                // a reader can tell about a tower from above is which way the
-                // rope runs over it.
-                out.append(prism(
-                    box(
-                        at: tower.at, bearing: tower.bearing,
-                        length: Cableway.towerHeadDepth, width: Cableway.towerHead
-                    ),
-                    kind: Key.structure, colour: paint.tower,
-                    base: sheaves, height: Cableway.drawnRopeHeight
+                for tower in Cableway.towers(along: span.points) {
+                    out.append(contentsOf: mast(
+                        at: tower.at, bearing: tower.bearing, paint: paint,
+                        base: 0, top: nil
+                    ))
+                }
+                continue
+            }
+            ropes.append(rope)
+
+            // One feature per straight stretch, each told where it starts and
+            // how much it climbs. The stretches meet at the bends, so the rope
+            // is continuous and every part of it is a straight line in three
+            // dimensions.
+            var cut = [0.0] + rope.bends + [rope.total]
+            cut = cut.reduce(into: [Double]()) { keep, d in
+                if keep.last.map({ d - $0 > 1 }) ?? true { keep.append(d) }
+            }
+            for i in 1..<max(2, cut.count) where i < cut.count {
+                let from = cut[i - 1], to = cut[i]
+                let piece = Cableway.slice(rope, from: from, to: to)
+                guard piece.count >= 2 else { continue }
+                out.append(line(
+                    piece, kind: Key.rope, colour: paint.rope,
+                    from: Cableway.height(of: rope, at: from),
+                    climb: Cableway.height(of: rope, at: to) - Cableway.height(of: rope, at: from)
+                ))
+            }
+
+            // A tower wherever the rope bends, which is where a tower actually
+            // is, and fill-ins down the straight stretches so a long clear span
+            // is still plainly being held up.
+            for at in Cableway.towerPoints(of: rope) {
+                guard let point = Cableway.position(rope, at: at) else { continue }
+                out.append(contentsOf: mast(
+                    at: point.coord, bearing: point.bearing, paint: paint,
+                    base: 0, top: Cableway.height(of: rope, at: at) - point.ground
                 ))
             }
         }
@@ -295,7 +391,46 @@ enum Cableways {
                 base: Cableway.drawnRopeHeight, height: stationTop
             ))
         }
-        return out
+        return (out, ropes, pending)
+    }
+
+    /// A tower: the mast, and the crosshead the sheaves hang from.
+    ///
+    /// `top` is how far above the ground here the rope is, or nil to fall back
+    /// to the fixed height a draped rope uses.
+    private static func mast(
+        at: Coord, bearing: Double, paint: Palette, base: Double, top: Double?
+    ) -> [Feature] {
+        let reach = max(4.0, top ?? Cableway.drawnRopeHeight)
+        let head = max(base + 1, reach - Cableway.gripDepth * VehicleShape.modelExaggeration)
+        return [
+            prism(
+                box(at: at, bearing: bearing,
+                    length: Cableway.towerWidth, width: Cableway.towerWidth),
+                kind: Key.structure, colour: paint.tower, base: base, height: head
+            ),
+            prism(
+                box(at: at, bearing: bearing,
+                    length: Cableway.towerHeadDepth, width: Cableway.towerHead),
+                kind: Key.structure, colour: paint.tower, base: head, height: reach
+            ),
+        ]
+    }
+
+    /// One rope segment.
+    private static func line(
+        _ points: [Coord], kind: String, colour: String, from: Double, climb: Double
+    ) -> Feature {
+        var feature = Feature(geometry: .lineString(LineString(
+            points.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        )))
+        feature.properties = [
+            Key.kind: .string(kind),
+            Key.colour: .string(colour),
+            Key.from: .number(from),
+            Key.climb: .number(climb),
+        ]
+        return feature
     }
 
     // MARK: - Turning metres into a polygon

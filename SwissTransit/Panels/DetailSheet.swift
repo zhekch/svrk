@@ -29,6 +29,16 @@ struct DetailSheet: View {
                             vehicle: model.departingVehicle ?? vehicle,
                             arrivedAs: model.departingVehicle == nil ? nil : vehicle
                         )
+                    } else if model.selectedVehicleMissing {
+                        // Asked for, and there is no such vehicle. Nearly
+                        // always a run that has finished, or one the board
+                        // listed by a name the fleet folded into another
+                        // working. See `AppModel.selectedVehicleMissing`.
+                        ContentUnavailableView(
+                            "Not running",
+                            systemImage: "clock.badge.xmark",
+                            description: Text("This service is not on the map right now.")
+                        )
                     } else {
                         ProgressView()
                     }

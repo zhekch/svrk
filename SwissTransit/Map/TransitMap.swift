@@ -2546,6 +2546,8 @@ final class MapCoordinator: NSObject {
         drawnShapesVisible = nil
         drewVehicleShapes = false
         drawnCableways = nil
+        ropes = []
+        cablewaysPending = false
         drawnFrameVersion = -1
         drawnStopsVersion = -1
         drawnHitboxes = nil
@@ -2932,6 +2934,17 @@ final class MapCoordinator: NSObject {
     /// same answer and stops.
     private var drawnCableways: Cableway.Plan?
 
+    /// The ropes the drawn cableways hang from, kept because two things need
+    /// them and they have to agree exactly: the line that draws a rope, and the
+    /// lift that hangs a cabin on it. See `rest`.
+    private var ropes: [Cableway.Rope] = []
+
+    /// Whether some span was drawn draped because the elevation tiles under it
+    /// had not arrived. While this is true the cableways are rebuilt every
+    /// frame, which is how a rope pulls itself taut a moment after the ground
+    /// under it turns up.
+    private var cablewaysPending = false
+
     /// The stations, ropes and towers under whatever is flying on them.
     ///
     /// Built from the *fleet* rather than from the drawn shapes, and the
@@ -2948,13 +2961,25 @@ final class MapCoordinator: NSObject {
         let wanted = model.zoom >= Cableways.minZoom
             ? Cableway.plan(for: model.vehicles)
             : Cableway.Plan()
-        guard wanted != drawnCableways else { return }
+        // Rebuilt when the set of lines changes, and also while any of them is
+        // still waiting on the ground under it — a rope cannot be pulled tight
+        // against terrain that has not loaded, so it is drawn draped and asked
+        // again. See `Cableways.features`.
+        guard wanted != drawnCableways || cablewaysPending else { return }
         drawnCableways = wanted
+        let built = Cableways.features(wanted, dark: isDarkTheme) { at in
+            guard model.terrain3D else { return 0 }
+            let height = style.elevation(at: CLLocationCoordinate2D(
+                latitude: at.lat, longitude: at.lon
+            ))
+            guard let height, height.isFinite else { return nil }
+            return height
+        }
+        ropes = built.ropes
+        cablewaysPending = built.pending
         style.updateGeoJSONSource(
             withId: Cableways.source,
-            geoJSON: .featureCollection(FeatureCollection(
-                features: Cableways.features(wanted, dark: isDarkTheme)
-            ))
+            geoJSON: .featureCollection(FeatureCollection(features: built.features))
         )
     }
 
@@ -3396,7 +3421,26 @@ final class MapCoordinator: NSObject {
             // there is nothing to keep in step. See `Silhouette.hover`.
             if print.placements.allSatisfy({ $0.model.unit.silhouette.hover > 0 }) {
                 let level = [Double](repeating: 0, count: print.placements.count)
-                out[print.id] = VehicleModels.Rest(grades: level, lifts: level)
+                // And it hangs from the rope rather than at a fixed height over
+                // the hill, which is the other half of pulling the rope tight.
+                //
+                // The mesh already carries the cabin at `Cableway.ropeHeight`
+                // over whatever ground the renderer stands it on. Where the
+                // rope is a taut line rather than a drape, that is the wrong
+                // height by exactly the gap between the two — so the gap is
+                // handed back as the wagon's lift, which is the same
+                // translation a coach spanning a dip is raised by. Nothing is
+                // measured twice: the height comes from the very profile the
+                // rope was drawn along, so the grip meets the line it is
+                // supposed to be clamped to whatever the ground below does.
+                var lifts = level
+                for (index, placement) in print.placements.enumerated() {
+                    guard let seat = ropes.lazy.compactMap({
+                        $0.at(placement.at, within: Cableways.snap)
+                    }).first else { continue }
+                    lifts[index] = seat.rope - seat.ground - Cableway.drawnRopeHeight
+                }
+                out[print.id] = VehicleModels.Rest(grades: level, lifts: lifts)
                 continue
             }
             let held = seats[print.id]
