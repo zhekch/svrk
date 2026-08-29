@@ -25,6 +25,31 @@ enum VehicleDot {
     /// missing from the map.
     static let labelMinZoom = 11.0
 
+    /// Where the *followed* vehicle's line number starts to go, and where it
+    /// has gone.
+    ///
+    /// Only the followed one, and only close in. A line number is what you
+    /// follow a vehicle by when it is a dot among fifty; it is the one thing on
+    /// the map that says which of them is the 8. Locked onto one and zoomed to
+    /// the length of the train, that question is already answered — the vehicle
+    /// in the middle of the screen, the one everything else is sliding past, is
+    /// plainly the one — and the label is left sitting over the roof of the
+    /// thing it is naming, in the way of the only view that shows it.
+    ///
+    /// Every other vehicle keeps its number at every zoom. They are the ones
+    /// still worth telling apart.
+    static let labelFadeZoom = 16.0
+    static let labelGoneZoom = 17.0
+
+    /// How long the number takes to go when following starts or stops.
+    ///
+    /// The zoom half of this fades on its own — it is a ramp over a zoom range,
+    /// so a pinch draws every frame of it. This is for the other half: tapping
+    /// follow while already zoomed in crosses the whole ramp in one frame, and
+    /// a label that is there and then is not reads as a glitch rather than as
+    /// something getting out of the way.
+    static let labelFadeSeconds = 0.35
+
     /// The layer's own `circle-radius`, with the handover to the drawn vehicle
     /// folded in.
     ///

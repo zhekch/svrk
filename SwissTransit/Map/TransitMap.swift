@@ -1079,7 +1079,7 @@ final class MapCoordinator: NSObject {
     /// feature back, fifteen times a second.
     private static func vehicleFeature(
         _ vehicle: VehicleSnapshot, at position: Coord, selected: Bool, emerged: Double,
-        tunnel: Double = 0
+        tunnel: Double = 0, followed: Double = 0
     ) -> Feature {
         var feature = Feature(geometry: .point(Point(
             CLLocationCoordinate2D(latitude: position.lat, longitude: position.lon)
@@ -1099,6 +1099,10 @@ final class MapCoordinator: NSObject {
             // fade happen in a disc too small to see it happen in.
             "shrink": .number(1 - 0.7 * emerged),
             "tunnel": .boolean(tunnel > 0.15),
+            // How far this vehicle is into being the one the camera is holding
+            // — 0 for everything else. The label layer spends it against the
+            // zoom. See `VehicleDot.labelFadeZoom`.
+            "followed": .number(followed),
         ]
         return feature
     }
@@ -2376,6 +2380,43 @@ final class MapCoordinator: NSObject {
                     11; 11.0; 15; 13.0; 18; 16.0
                 }
             )
+            // Gone over the vehicle the camera is holding, once the map is
+            // close enough that the vehicle is the picture. `followed` is 0 on
+            // everything else, so the whole product is 0 and their numbers are
+            // untouched at every zoom.
+            //
+            // A ramp over a zoom band rather than a threshold, because a
+            // threshold is what makes a label pop: a pinch through 16 would
+            // take the number out between one frame and the next. Spread over a
+            // zoom level, the number thins out as the vehicle grows into the
+            // screen, which is the handover actually happening.
+            // **The zoom interpolation is the outermost expression, and it has
+            // to be.** A data-driven paint property may combine zoom and
+            // feature expressions only with the zoom one at the top level; nest
+            // it inside an arithmetic expression — which is the natural way to
+            // write `1 - followed × ramp` — and the renderer refuses the
+            // property. What that costs is not this feature but every line
+            // number on the map, which is the failure this layer has had once
+            // already; see `text-allow-overlap` below.
+            //
+            // Written the legal way it is the same function: below the first
+            // zoom every vehicle's number is at full strength, above the second
+            // it is `1 - followed`, and the band between interpolates the two.
+            // A vehicle that is not being followed carries 0 and so is at 1 at
+            // both ends, which is to say untouched.
+            labels.textOpacity = .expression(
+                Exp(.interpolate) {
+                    Exp(.linear); Exp(.zoom)
+                    VehicleDot.labelFadeZoom
+                    1.0
+                    VehicleDot.labelGoneZoom
+                    // Asserted as a number, like every other `get` in this
+                    // file: the expression language is typed, and a property
+                    // fetched without an assertion has unknown type where
+                    // arithmetic wants a number.
+                    Exp(.subtract) { 1.0; Exp(.toNumber) { Exp(.get) { "followed" } } }
+                }
+            )
             labels.textOffset = .constant([0, -1.2])
             labels.textAnchor = .constant(.bottom)
             labels.textColor = .constant(StyleColor(UIColor.white))
@@ -2871,6 +2912,13 @@ final class MapCoordinator: NSObject {
     /// matters: `AppModel` keeps them out of observation, so asking "is this
     /// new?" from inside `updateUIView` does not register a dependency on the
     /// answer and cannot schedule the next update.
+    /// How far the followed vehicle's line number has faded out, 0 to 1, and
+    /// the clock it is stepped on. See `VehicleDot.labelFadeSeconds`.
+    private var followLabelFade = 0.0
+    private var followLabelAt: CFTimeInterval = 0
+    /// Which vehicle that fade belongs to.
+    private var fadedFollowId: String?
+
     private var drawnFrameVersion = -1
     private var drawnStopsVersion = -1
     /// Whether anything in each lane is part-way into a tunnel, and what the
@@ -2902,6 +2950,21 @@ final class MapCoordinator: NSObject {
         // The followed vehicle is written where the follow lane has it, not
         // where the last tick left it. See `followShift`.
         let shift = followId != nil ? followShift() : (lon: 0.0, lat: 0.0)
+        // How far the followed vehicle's number has faded, stepped on this
+        // tick's own clock. Reset when the camera takes hold of a different
+        // vehicle, so the one let go of gets its number back and the new one
+        // loses it from full strength rather than inheriting the last one's.
+        let clock = CACurrentMediaTime()
+        let dt = min(0.25, max(0, clock - followLabelAt))
+        followLabelAt = clock
+        if followId != fadedFollowId { fadedFollowId = followId; followLabelFade = 0 }
+        let wantedFade: Double = followId == nil ? 0 : 1
+        let step = VehicleDot.labelFadeSeconds > 0
+            ? dt / VehicleDot.labelFadeSeconds : 1
+        let gap = wantedFade - followLabelFade
+        followLabelFade = abs(gap) <= step
+            ? wantedFade : followLabelFade + (gap < 0 ? -step : step)
+
         let vehicleFeatures = model.vehicles.map { vehicle -> Feature in
             let moved = vehicle.id == followId
             let at = Coord(
@@ -2911,7 +2974,8 @@ final class MapCoordinator: NSObject {
             return Self.vehicleFeature(
                 vehicle, at: at,
                 selected: vehicle.id == selectedId, emerged: emergence[vehicle.id] ?? 0,
-                tunnel: tunnelIndex.fade(at: at, heading: vehicle.bearing)
+                tunnel: tunnelIndex.fade(at: at, heading: vehicle.bearing),
+                followed: moved ? followLabelFade : 0
             )
         }
         style.updateGeoJSONSource(
