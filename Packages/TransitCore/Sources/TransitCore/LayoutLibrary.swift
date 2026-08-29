@@ -62,10 +62,16 @@ public enum LayoutLibrary {
         // white band over it; the older stock does not, and red-on-red is what
         // that comes to.
         "RHB": Livery(body: "#c8102e", roof: "#9aa1ab", trim: "#f2f2f2", glass: "#2b3440", stroke: "#6d0a19", belt: "#f2f2f2"),
-        // Südostbahn. The Traverso and the Voralpen-Express stock are white and
-        // silver with a black band and red doors — not the black vehicles the
-        // first pass made of them.
-        "SOB": Livery(body: "#e9ebee", roof: "#8b8f95", trim: "#e2001a", glass: "#20262d", stroke: "#3a3d41", belt: "#1d1d1b"),
+        // Südostbahn, which is a *copper* company and was drawn as a white one.
+        //
+        // The Traverso — the Voralpen-Express and the Treno Gottardo, which is
+        // what nearly every SOB working on this map is — is wrapped in a warm
+        // metallic bronze with a black window band and a red line along the
+        // sill. It is the most distinctive paint on the eastern network and the
+        // one nothing else wears; drawn in the white the FLIRTs used to carry
+        // it read as an SBB unit with a dark stripe, which is the fleet it is
+        // most often standing next to.
+        "SOB": Livery(body: "#b4713a", roof: "#8b8f95", trim: "#e2001a", glass: "#20262d", stroke: "#5f3a15", belt: "#1d1d1b"),
         // Thurbo's GTWs: apple green, with the green carried over the whole
         // side and a white flash. One colour, so no band.
         "THU": Livery(body: "#5aa832", roof: "#9aa1ab", trim: "#ffffff", glass: "#22332a", stroke: "#255214"),
