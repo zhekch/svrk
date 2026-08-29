@@ -231,6 +231,14 @@ extension VehicleShape {
         /// six-metre one a deckhouse two-thirds the width gets — so at the same
         /// distance back the house was wider than the hull carrying it.
         var squareEnds: Bool = false
+        /// Whether this level is part of the hull, and so carries the paddle
+        /// boxes where the ship has any.
+        ///
+        /// The hull levels and only the hull levels: a sponson is a platform
+        /// built out from the ship's *side*, so it stops at the rail and the
+        /// promenade deck runs over the top of it. Given to the deckhouse as
+        /// well, a steamer came out as a cake stand.
+        var sponsons: Bool = false
     }
 
     /// Where a level's colour comes from, resolved against the unit and the
@@ -353,11 +361,12 @@ extension VehicleShape {
     /// A level, spelled out. Saves repeating the label list eight times below.
     static func level(
         _ role: MeshSlab.Role, _ base: Double, _ top: Double,
-        width: Double, rake: Double, fill: Fill, squareEnds: Bool = false
+        width: Double, rake: Double, fill: Fill,
+        squareEnds: Bool = false, sponsons: Bool = false
     ) -> Level {
         Level(
             role: role, base: base, top: top, width: width, rake: rake,
-            fill: fill, squareEnds: squareEnds
+            fill: fill, squareEnds: squareEnds, sponsons: sponsons
         )
     }
 
@@ -453,18 +462,93 @@ extension VehicleShape {
             )
         }
 
+        /// A ship, which is a hull with decks laid on it rather than a box with
+        /// bands painted round it.
+        ///
+        /// Four things separate this from `banded`, and each of them is a thing
+        /// that was wrong about every boat this map has ever drawn.
+        ///
+        /// **The hull is dark at the bottom.** Every working vessel on every
+        /// Swiss lake carries a black or dark green lower strake at the
+        /// waterline. It is a hand's breadth of the height and it is what makes
+        /// a white hull sit *in* the water instead of on top of it.
+        ///
+        /// **The decks step in, and they overhang.** A promenade deck is wider
+        /// than the saloon under it — that is what makes it a promenade — so
+        /// the widths do not decrease monotonically the way a coach's bands do.
+        ///
+        /// **The superstructure is held off both ends.** A lake boat has an
+        /// open foredeck and an open afterdeck, and drawn without them the
+        /// deckhouse ran into the stem and the ship became a pontoon.
+        ///
+        /// **The paddle boxes belong to the hull.** They are `sponsons: true`
+        /// on the three hull levels and on nothing above them.
+        func decked(_ decks: ShipDecks) -> Stack {
+            // The sheer stripe, painted on the hull side just under the deck
+            // edge — which is where a ship carries hers, and it matters that it
+            // is *under* rather than *on*.
+            //
+            // A level is a solid prism, not a ring, so whatever level stands
+            // highest at a given point owns the face a tilted camera sees. Put
+            // the company's colour at the top of the hull and its top face is
+            // the entire main deck: eight metres by sixty-eight of it, a whole
+            // ship painted navy by a stripe a handspan tall. Under the deck it
+            // is a stripe from the side, which is all it ever was, and the deck
+            // above it is free to be a deck.
+            let band = min(0.32, (decks.sheer - decks.boot) * 0.22)
+            var levels: [Level] = [
+                // The boot topping. `.running` rather than a colour of its own,
+                // because the fleet already has a name for near-black paint
+                // below the passengers and there is no sense in a second.
+                level(.chassis, 0, decks.boot, width: 1.0, rake: 0,
+                      fill: .running, sponsons: true),
+                level(.body, decks.boot, decks.sheer - band, width: 1.0, rake: 0,
+                      fill: .livery, sponsons: true),
+                level(.shoulder, decks.sheer - band, decks.sheer, width: 1.0, rake: 0.02,
+                      fill: .belt, sponsons: true),
+                // The main deck, full beam and topmost: what somebody looking
+                // down at a boat is actually looking at.
+                level(.roof, decks.sheer, decks.rail, width: 1.0, rake: 0.06,
+                      fill: .roof, sponsons: true),
+                level(.glazing, decks.rail, decks.saloon,
+                      width: decks.saloonWidth, rake: decks.saloonRake,
+                      fill: .glass, squareEnds: true),
+                level(.roof, decks.saloon, decks.promenade,
+                      width: decks.promenadeWidth, rake: decks.saloonRake,
+                      fill: .roof, squareEnds: true),
+            ]
+            if let upper = decks.upper {
+                levels.append(level(
+                    .glazing, decks.promenade, upper,
+                    width: decks.upperWidth, rake: decks.upperRake,
+                    fill: .glass, squareEnds: true
+                ))
+                if let boatDeck = decks.boatDeck {
+                    levels.append(level(
+                        .roof, upper, boatDeck,
+                        width: decks.upperWidth + 0.05, rake: decks.upperRake,
+                        fill: .roof, squareEnds: true
+                    ))
+                }
+            }
+            // `beltTop` is the sheer stripe, which on a ship is where the
+            // paint actually runs — not the top of the highest window, which
+            // is a rule about a coach's cant rail and means nothing here.
+            return Stack(levels: levels, beltTop: decks.rail, roofTop: decks.topDeck)
+        }
+
+        // A vessel is its class of vessel, whatever the kind says. Placed
+        // before the switch for the same reason `bands` is: `.hull` is one word
+        // for a paddle steamer, a motor ship and a panorama boat, and those are
+        // three different vessels.
+        if let ship = decks(of: unit) { return decked(ship) }
+
         switch unit.kind {
         case .hull:
-            // A boat is not a stack of bands, it is a hull with a house on it,
-            // and the house is most of what is visible. The rakes are large
-            // because a lake steamer's decks step in hard, and that stepping is
-            // how one is recognised from the shore.
-            return Stack(levels: [
-                level(.body, 0, 1.9, width: 1.0, rake: 0, fill: .livery),
-                level(.glazing, 1.9, 3.7, width: 0.80, rake: 1.15, fill: .glass, squareEnds: true),
-                level(.roof, 3.7, 4.3, width: 0.76, rake: 1.30, fill: .roof, squareEnds: true),
-                level(.dome, 4.3, 5.4, width: 0.34, rake: 2.60, fill: .roof, squareEnds: true),
-            ], beltTop: 3.7, roofTop: 5.4)
+            // Unreachable — `decks(of:)` above answers for every hull. Written
+            // out because the switch has to be, and written as the vessel that
+            // accessor would have given.
+            return decked(.motorLaunch)
 
         case .cabin:
             return banded(floor: 0.30, waist: 1.25, cant: 2.32, shoulder: 2.78, roof: 3.05)
@@ -546,6 +630,10 @@ extension VehicleShape {
         case .busFront: return min(1.4, length * 0.13)
         case .busRear: return min(0.55, length * 0.06)
         case .bow: return min(6.0, length * 0.26)
+        // A ship's deckhouse stops well short of her transom, and by less than
+        // it stops short of her stem: the afterdeck is where the passengers
+        // stand and the foredeck is where the ground tackle is.
+        case .stern: return min(3.4, length * 0.09)
         }
     }
 
@@ -571,7 +659,8 @@ extension VehicleShape {
             length: length, width: levelWidth,
             front: level.squareEnds ? squared : ends.front,
             back: level.squareEnds ? squared : ends.back,
-            steps: steps
+            steps: steps,
+            sponsons: level.sponsons ? sponsons(for: unit) : nil
         )
         return ring.map { (x: $0.x + back, y: $0.y) }
     }
@@ -735,6 +824,95 @@ extension VehicleShape {
                 top: (stack.roofTop + 1.85) * heightScale,
                 fill: runningGearColour
             ))
+        }
+        // What stands on a ship's decks: the funnel, the bridge and the mast.
+        //
+        // Bespoke slabs rather than levels in the stack, and they have to be.
+        // Every level is concentric on the body and held back from both ends by
+        // the same rake, which is exactly right for a deck and exactly wrong
+        // for everything above one: a funnel is at a *place* along the ship,
+        // and where that place is is most of what the object says. A steamer's
+        // funnel stands over her engine, which is over her paddles, which is
+        // amidships; a motor ship's stands over her diesels, which are right
+        // aft. Drawn concentrically both of them would be a chimney in the
+        // middle of the boat, and the two vessels would be one vessel again.
+        //
+        // The order along the hull is the identification, and on a steamer it
+        // runs, from aft: paddle boxes, funnel, wheelhouse, foremast. Anybody
+        // who has stood on a quay in Luzern knows that shape without being able
+        // to name a single dimension in it.
+        if let decks = decks(of: unit) {
+            let deck = decks.topDeck * heightScale
+            func oval(at x: Double, rx: Double, ry: Double) -> [MeshPoint] {
+                let steps = 10
+                return (0..<steps).map { i in
+                    let a = Double(i) / Double(steps) * 2 * .pi
+                    return MeshPoint(x: x + rx * cos(a), y: ry * sin(a))
+                }
+            }
+            if let funnel = decks.funnel, funnel.top > decks.topDeck {
+                let ry = max(0.35, half * funnel.radius)
+                // Longer fore-and-aft than it is wide, which is what a funnel
+                // is: an oval casing round a round uptake.
+                let ring = oval(
+                    at: unit.length * funnel.at, rx: ry * 1.28, ry: ry
+                )
+                // The black top, which is not decoration. A funnel is the
+                // oldest identification mark in shipping and nearly every one
+                // on a Swiss lake is a company colour under a black cap — so
+                // the barrel carries the operator and the cap says "ship".
+                let cap = min(1.2, (funnel.top - decks.topDeck) * 0.26)
+                out.append(LocalSlab(
+                    role: .dome, rings: [ring],
+                    base: deck, top: (funnel.top - cap) * heightScale,
+                    fill: layout.livery.trim
+                ))
+                out.append(LocalSlab(
+                    role: .dome, rings: [ring],
+                    base: (funnel.top - cap) * heightScale,
+                    top: funnel.top * heightScale,
+                    fill: runningGearColour
+                ))
+            }
+            if let bridge = decks.wheelhouse, bridge.top > decks.topDeck {
+                let along = max(1.2, unit.length * bridge.long) / 2
+                let across = max(0.6, half * bridge.wide)
+                let x = unit.length * bridge.at
+                let house = box(
+                    x0: x - along, x1: x + along, y0: -across, y1: across
+                )
+                // White like the rest of the superstructure, with the wheelhouse
+                // windows as a dark band under a thin roof — three slabs for the
+                // one object on the ship a passenger looks at from the shore.
+                let sill = deck + (bridge.top * heightScale - deck) * 0.30
+                let head = deck + (bridge.top * heightScale - deck) * 0.86
+                out.append(LocalSlab(
+                    role: .dome, rings: [house],
+                    base: deck, top: sill, fill: layout.livery.body
+                ))
+                out.append(LocalSlab(
+                    role: .glazing, rings: [house],
+                    base: sill, top: head, fill: glazing(layout.livery)
+                ))
+                out.append(LocalSlab(
+                    role: .roof, rings: [house],
+                    base: head, top: bridge.top * heightScale,
+                    fill: layout.livery.roof
+                ))
+            }
+            if let mast = decks.mast, mast.top > decks.topDeck {
+                // Thin, but not as thin as a real mast: a 25 cm pole is a
+                // sub-pixel line at any zoom a boat appears at, and drawn at
+                // the width that read on the page it was a second funnel.
+                let thick = max(0.16, half * 0.055)
+                let x = unit.length * mast.at
+                out.append(LocalSlab(
+                    role: .dome,
+                    rings: [box(x0: x - thick, x1: x + thick, y0: -thick, y1: thick)],
+                    base: deck, top: mast.top * heightScale,
+                    fill: layout.livery.roof
+                ))
+            }
         }
         // Not on something that hangs. A gondola carries no headlights and no
         // tail lamps, and the halo the flat drawing paints over each one is

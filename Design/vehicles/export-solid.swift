@@ -101,7 +101,11 @@ let drawings: [Drawing] = [
     drawing("trolleybus-zurich", .bus, category: "B", line: "31", operatorName: "VBZ"),
     drawing("postauto", .bus, category: "B", line: "101", operatorName: "PAG"),
     drawing("metro-lausanne", .metro, category: "M", line: "M2", operatorName: "TL"),
-    drawing("boat-cgn", .boat, category: "BAT", line: "1", operatorName: "CGN"),
+    // Line 2 rather than line 1, and the number matters: which of a lake
+    // fleet's dozen vessels a journey gets is hashed off its own id — see
+    // `LayoutLibrary.fleet(of:)` — and this one lands on a Belle Époque paddle
+    // steamer, which is the shape on the water worth having a drawing of.
+    drawing("boat-cgn", .boat, category: "BAT", line: "2", operatorName: "CGN"),
     drawing("funicular", .cable, category: "FUN", line: "1", operatorName: nil),
 ]
 

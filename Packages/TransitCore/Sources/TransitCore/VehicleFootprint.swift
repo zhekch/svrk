@@ -503,7 +503,9 @@ public enum VehicleShape {
             let unitPoints = unit.length / metresPerPoint
             let ring = outline(
                 length: unit.length, width: width, front: ends.front, back: ends.back,
-                steps: smoothness(lengthPoints: unitPoints, widthPoints: width / metresPerPoint)
+                steps: smoothness(lengthPoints: unitPoints, widthPoints: width / metresPerPoint),
+                // The one body in the country whose sides are not straight.
+                sponsons: sponsons(for: unit)
             )
             parts.append(FootprintPart(
                 role: .body, ring: frame.project(ring), fill: colour(of: unit, in: layout)
@@ -1094,8 +1096,17 @@ public enum VehicleShape {
         /// and any corner drawn here shows up as a notch in the middle of a
         /// tram.
         case gangway
-        /// The bow of a boat.
+        /// The bow of a boat: a fine, hollow entry to a nearly-sharp stem.
         case bow
+        /// The stern of a boat, which is nothing like the flat wall it used to
+        /// be drawn as.
+        ///
+        /// Swiss lake vessels are counter- or cruiser-sterned to a ship: the
+        /// after body closes in on a rounded transom about half the beam
+        /// across, and there is not a square corner anywhere on it. Drawn with
+        /// the chamfered box every unpowered end gets, a steamer read as a
+        /// pontoon that happened to be pointed at one end.
+        case stern
     }
 
     /// Which profile each end of a unit gets.
@@ -1144,12 +1155,36 @@ public enum VehicleShape {
         }
 
         if unit.kind == .hull {
-            return (.bow, .square(chamfer: unit.width * 0.18))
+            return (.bow, .stern)
         }
         return (
             end(cab: unit.cabFront, joined: joinedAhead, leading: true),
             end(cab: unit.cabBack, joined: joinedBehind, leading: false)
         )
+    }
+
+    /// The class of vessel this unit is, where it is one at all.
+    ///
+    /// One accessor rather than three readings of `silhouette.decks`, because
+    /// three places need the answer — the stack, the funnel, and the top view's
+    /// deckhouse — and they have to give the same one. It also puts the one
+    /// awkward case in a single spot: a `.hull` whose silhouette says nothing
+    /// is a record written before this fleet existed, and it is the small motor
+    /// ship every boat used to be drawn as.
+    public static func decks(of unit: VehicleUnit) -> ShipDecks? {
+        if let decks = unit.silhouette.decks { return decks }
+        return unit.kind == .hull ? .motorLaunch : nil
+    }
+
+    /// The paddle boxes this unit carries, if it carries any.
+    ///
+    /// Read off the class of ship rather than off a flag on the unit, for the
+    /// same reason every other shape fact is: a vessel that is a paddle steamer
+    /// has paddle boxes, and nothing else has to be told so. Nil for everything
+    /// on wheels and for every motor ship, which is most of what floats.
+    public static func sponsons(for unit: VehicleUnit) -> Sponsons? {
+        guard let box = decks(of: unit)?.paddle else { return nil }
+        return Sponsons(box)
     }
 
     /// How far back from the tip a profile reaches.
@@ -1205,7 +1240,15 @@ public enum VehicleShape {
         case .busFront: return min(width * 0.42, length * 0.34)
         case .busRear: return min(width * 0.24, length * 0.2)
         case .gangway: return 0
-        case .bow: return min(length * 0.30, width * 2.1)
+        // A ship's fine entry, and it used to be nearly a third of the vessel.
+        // On a 68 m boat that is twenty metres of taper — a wedge, not a hull,
+        // and it made every lake boat on the map read as a dart. The real
+        // forebody of a Swiss lake steamer runs about a sixth of her length
+        // from the stem before the sides are parallel.
+        case .bow: return min(length * 0.17, width * 1.7)
+        // Fuller and shorter than the bow, which is what makes a hull read as
+        // having a front and a back at all.
+        case .stern: return min(length * 0.13, width * 1.2)
         }
     }
 
@@ -1325,7 +1368,53 @@ public enum VehicleShape {
         case .busRear:
             return taper(depth: n, half: half, tip: 0.82, power: 0.55, steps: max(2, steps))
         case .bow:
-            return taper(depth: n, half: half, tip: 0.09, power: 0.72, steps: max(4, steps * 2))
+            // Hollow rather than straight — `power` well under 1 keeps the
+            // sides out near the full beam and turns them in hard at the last
+            // moment, which is the flare every displacement hull has and no
+            // wedge does. The tip is not a knife: a stem has a stempost, and at
+            // the zoom a boat is looked at, zero came out as a torn pixel.
+            return taper(depth: n, half: half, tip: 0.14, power: 0.62, steps: max(4, steps * 2))
+        case .stern:
+            // A counter stern: full most of the way aft and closing on a
+            // transom about four-tenths of the beam across.
+            return taper(depth: n, half: half, tip: 0.42, power: 0.60, steps: max(3, steps * 2))
+        }
+    }
+
+    /// The pair of bulges a paddle steamer's plan has and nothing else does.
+    ///
+    /// A sponson is the platform a paddle wheel is carried on and the box built
+    /// over it, and on a Swiss lake steamer the two of them together are the
+    /// widest part of the ship by a very long way: `La Suisse` is 8.6 m on the
+    /// waterline and 15.4 m across the boxes. From directly above — which is
+    /// the view this file exists to draw — that is not a detail, it is the
+    /// silhouette. A steamer is a slim hull that swells to nearly twice its
+    /// beam at midships and closes again, and no other vessel on any lake in
+    /// the country is that shape.
+    ///
+    /// Put in the **outline** rather than drawn over it, which is the whole
+    /// reason it is worth the trouble. The flat drawing and the solid are the
+    /// same `outline` at different heights — that is the promise the top view
+    /// makes when the map tilts — so a paddle box added as a decoration to one
+    /// of them would be a paddle box the other did not have, and the ship would
+    /// grow and shrink through the transition. Added here it is simply part of
+    /// the hull, and both drawings get it for nothing.
+    public struct Sponsons: Sendable, Hashable {
+        /// Where the middle of the boxes is, as a fraction of the length from
+        /// the stern.
+        public var at: Double
+        /// How much of the length they take.
+        public var long: Double
+        /// The width over the boxes as a multiple of the beam.
+        public var spread: Double
+
+        public init(at: Double, long: Double, spread: Double) {
+            self.at = at; self.long = long; self.spread = spread
+        }
+
+        /// The same thing as a class of ship states it.
+        public init(_ box: ShipDecks.PaddleBox) {
+            self.init(at: box.at, long: box.long, spread: box.spread)
         }
     }
 
@@ -1334,15 +1423,57 @@ public enum VehicleShape {
     /// The two ends carry all the shape; the sides are the straight lines
     /// between them, which fall out of the point order and never have to be
     /// written down. `x` runs from 0 at the back to `length` at the front.
+    ///
+    /// Unless the body has sponsons, in which case the sides carry shape too —
+    /// see `Sponsons`. The point order is what makes that cheap: the ring
+    /// already runs bow-to-stern down the starboard side and stern-to-bow back
+    /// up the port side, so a bulge is a handful of points spliced into each of
+    /// those two runs, in the direction that run is already going.
     public static func outline(
         length: Double, width: Double, front: EndProfile, back: EndProfile,
-        steps: Int = 3
+        steps: Int = 3, sponsons: Sponsons? = nil
     ) -> [(x: Double, y: Double)] {
         let head = end(front, length: length, width: width, steps: steps)
             .map { (x: length + $0.x, y: $0.y) }
         let tail = end(back, length: length, width: width, steps: steps)
             .map { (x: -$0.x, y: $0.y) }.reversed()
-        return head + Array(tail)
+        guard let sponsons, sponsons.spread > 1.001, length > 0 else {
+            return head + Array(tail)
+        }
+        let half = width / 2
+        // Held clear of both tapers. A box spliced into a run that is already
+        // curving in would put its aft edge inside the counter, which draws as
+        // a notch rather than as a bulge — and on a short hull with a deep bow
+        // that is exactly where the arithmetic lands it.
+        let noseRoot = length - depth(of: front, length: length, width: width)
+        let tailRoot = depth(of: back, length: length, width: width)
+        let reach = max(1.0, length * sponsons.long) / 2
+        let centre = min(max(length * sponsons.at, tailRoot + reach), noseRoot - reach)
+        let from = max(tailRoot + 0.05, centre - reach)
+        let to = min(noseRoot - 0.05, centre + reach)
+        guard to > from else { return head + Array(tail) }
+
+        // Flat-topped and hard-shouldered, because a paddle box is a drum with
+        // a fairing round it and not a lens. The cube inside `pow` is what
+        // holds the sides out at nearly full spread across the middle two
+        // thirds and then drops them; a plain cosine gave a hull that looked
+        // merely fat amidships, which is what a barge looks like.
+        let arc = max(3, steps + 2)
+        func side(_ sign: Double, forward: Bool) -> [(x: Double, y: Double)] {
+            (0...arc).map { i -> (x: Double, y: Double) in
+                let t = Double(i) / Double(arc)
+                let along = forward ? t : 1 - t
+                let u = abs(along - 0.5) * 2
+                let bulge = pow(max(0, 1 - pow(u, 3.0)), 0.42)
+                return (
+                    x: from + (to - from) * along,
+                    y: sign * half * (1 + (sponsons.spread - 1) * bulge)
+                )
+            }
+        }
+        // Starboard runs bow to stern, port runs stern to bow: the same order
+        // the ring is already in.
+        return head + side(1, forward: false) + Array(tail) + side(-1, forward: true)
     }
 
     /// How deep the painted cap on one end of a body is, in metres.
@@ -1425,6 +1556,56 @@ public enum VehicleShape {
         let frontDepth = depth(of: ends.front, length: length, width: width)
         let backDepth = depth(of: ends.back, length: length, width: width)
 
+        // A ship's roof is not a band, it is a deckhouse with a funnel on it.
+        //
+        // The generic rule below puts a rectangle down the middle of whatever
+        // it is given, and on a boat that is very nearly the wrong drawing: a
+        // vessel seen from directly above is a pale deck with a *shorter* white
+        // house standing on it and, on a steamer, a dark disc where the funnel
+        // is. The funnel especially — it is the one mark on a ship that a top
+        // view can carry, and every photograph taken from a hillside above
+        // Luzern is a white shape with a dark spot two-thirds of the way
+        // forward.
+        //
+        // Built from the same `ShipDecks` numbers and the same rakes the solid
+        // is built from, so the flat drawing and the model agree about where
+        // the house stops — which they must, because for a moment during the
+        // change from one to the other both are on the screen.
+        let ship = decks(of: unit)
+        if let decks = ship {
+            let houseBack = rake(of: ends.back, length: length) * decks.saloonRake
+            let houseFront = rake(of: ends.front, length: length) * decks.saloonRake
+            let houseLength = length - houseBack - houseFront
+            // Capped, for the reason the generic roof band below is inset: the deck
+            // is the least informative thing on a top view and the outline is
+            // the most, so a house drawn out to the ship's own sides — which a
+            // panorama boat's really is — hides the hull that says what she is.
+            // A hand of white each side keeps the vessel a vessel.
+            let houseWidth = width * min(decks.promenadeWidth, 0.84)
+            if houseLength > 1.0 {
+                let squared = EndProfile.square(chamfer: houseWidth * 0.22)
+                let ring = outline(
+                    length: houseLength, width: houseWidth,
+                    front: squared, back: squared, steps: 3
+                ).map { (x: $0.x + houseBack, y: $0.y) }
+                out.append(FootprintPart(
+                    role: .roof, ring: frame.project(ring),
+                    fill: roofColour(of: unit, livery: livery)
+                ))
+            }
+            if let funnel = decks.funnel {
+                let ry = max(0.35 * scale, half * funnel.radius)
+                let cx = length * funnel.at
+                let ring = (0..<10).map { i -> (x: Double, y: Double) in
+                    let a = Double(i) / 10 * 2 * .pi
+                    return (x: cx + ry * 1.28 * cos(a), y: ry * sin(a))
+                }
+                out.append(FootprintPart(
+                    role: .stripe, ring: frame.project(ring), fill: livery.trim
+                ))
+            }
+        }
+
         // The roof. Inset from both sides so the body colour survives along the
         // edges, and held back from the noses so a windscreen is not roofed
         // over. A double-decker's roof is the full width of the vehicle and
@@ -1446,7 +1627,7 @@ public enum VehicleShape {
         let inset = unit.doubleDeck ? half * 0.30 : (unit.kind == .bus ? half * 0.60 : half * 0.42)
         let roofFrom = backDepth + (unit.doubleDeck ? 0.3 : 0.5)
         let roofTo = length - frontDepth - (unit.doubleDeck ? 0.3 : 0.5)
-        if roofTo > roofFrom {
+        if ship == nil, roofTo > roofFrom {
             // The restaurant car gets the roof rather than a stripe, because
             // the roof is the largest thing on the drawing and finding the
             // restaurant on a sixteen-coach train is exactly the sort of
@@ -1679,7 +1860,7 @@ public enum VehicleShape {
         // is a moulded railcar front, a slab is the upright face of something
         // built to climb. None of them is ever drawn on a trailing end.
         case .wedge, .bulb, .slab: return true
-        case .busRear, .square, .gangway, .bow: return false
+        case .busRear, .square, .gangway, .bow, .stern: return false
         }
     }
 

@@ -238,6 +238,19 @@ public enum LayoutLibrary {
     /// worse than one colour for the whole fleet, because it is one colour for
     /// the whole fleet that flickers.
     public static func variant(operatorName: String?, mode: Mode, seed: String) -> Int {
+        // On the water it chooses the *ship* rather than the paint, and it is
+        // the same idea for the same reason. A lake fleet is a dozen individual
+        // vessels and no feed says which one is out today, so the mix is drawn
+        // honestly and the individual is not claimed. See `fleet(of:)`.
+        //
+        // Modulo the fleet's own size rather than something larger, because
+        // this number goes into `VehicleLayoutStore`'s cache key: one entry per
+        // ship on the lake is a dozen, and one entry per hash is thousands.
+        if mode == .boat {
+            let ships = fleet(of: operatorName?.uppercased() ?? "")
+            guard ships.count > 1 else { return 0 }
+            return Int(stableHash(seed) % UInt64(ships.count))
+        }
         guard let code = operatorName?.uppercased(), let set = variants[code],
               set.modes.contains(mode), set.liveries.count > 1
         else { return 0 }
@@ -260,6 +273,13 @@ public enum LayoutLibrary {
     public static func livery(
         operatorName: String?, mode: Mode, modeColour: String, variant: Int = 0
     ) -> Livery {
+        // The water first, because on the water the operator's own colours are
+        // reliably the wrong answer and the mode's are worse — see
+        // `boatLivery`. Here rather than in `stockLivery`, which is only
+        // consulted by `layout`: a *learned* formation is painted straight from
+        // this function, and a hook the learned path never reached would have
+        // repainted every boat somebody actually tapped on.
+        if mode == .boat { return boatLivery(operatorName: operatorName) }
         if let code = operatorName?.uppercased() {
             if let set = variants[code], set.modes.contains(mode), !set.liveries.isEmpty {
                 let count = set.liveries.count
@@ -281,6 +301,55 @@ public enum LayoutLibrary {
     /// trains are both white with grey and a red flash, so painting them from
     /// the operator's tin put two solid red worms across Lausanne that look
     /// nothing like the things they stand for.
+    /// What a lake vessel is painted, which is not what her owner's trains are.
+    ///
+    /// Every boat on this map used to be drawn in the mode's own light blue,
+    /// which is the colour of the *lake* — so a ship was a blue block on blue
+    /// water and the one place the map most needed a silhouette had none. The
+    /// operators that do have a livery in the table above made it worse rather
+    /// than better: BLS works the Thunersee, and `Blüemlisalp` is not a green
+    /// boat. She is white, like every other working vessel in the country.
+    ///
+    /// So the water gets its own tin, and it is the same tin for everybody with
+    /// one colour changed. That is not a simplification, it is what a Swiss
+    /// lake looks like: white hull, white superstructure, a near-black strake
+    /// at the waterline, pale decks — and then one company colour, carried in
+    /// the two places a ship has ever carried one, the sheer stripe along the
+    /// bulwark and the funnel. Funnel marks are the oldest identification
+    /// system in shipping and they work here for the reason they worked from a
+    /// pier: they are the only saturated thing on an otherwise white object.
+    static func boatLivery(operatorName: String?) -> Livery {
+        let accent: String
+        switch operatorName?.uppercased() ?? "" {
+        case "CGN": accent = "#123a6e"          // Léman, in CGN's deep blue
+        case "SGV": accent = "#c8102e"          // Vierwaldstättersee
+        case "ZSG": accent = "#0a4f9c"          // Zürichsee, the city's blue
+        case "BLS", "BLSSCHIFF": accent = "#00963f"  // Thun and Brienz
+        case "SBS": accent = "#005ca9"          // Bodensee
+        case "URH": accent = "#1c6fb0"          // Untersee und Rhein
+        case "LNM": accent = "#00609c"          // Neuchâtel, Bienne, Morat
+        case "BSG": accent = "#d8232a"          // Biel
+        case "SNL": accent = "#1b6ca8"          // Lugano
+        case "NLM": accent = "#0b5ea8"          // Lago Maggiore
+        case "SGZ", "ZBS": accent = "#e2001a"   // Zugersee
+        default: accent = "#2b4a6f"
+        }
+        return Livery(
+            // Not pure white. A hull in the sun is a hull with a sky on it, and
+            // #ffffff on a pale basemap is a hole rather than a ship.
+            body: "#f4f6f8",
+            // Decks, seen from above, which on these ships is planking and
+            // pale painted steel — warmer than the cold grey every train roof
+            // in this file wears, and that difference is worth keeping: from
+            // straight down, the deck is most of what a boat is.
+            roof: "#bab4a8",
+            trim: accent,
+            glass: "#22303f",
+            stroke: "#3c434c",
+            belt: accent
+        )
+    }
+
     static func stockLivery(
         mode: Mode, line: String?, operatorName: String?, category: String? = nil,
         base: Livery
@@ -735,11 +804,25 @@ public enum LayoutLibrary {
             }
         }
 
-        public static func boat(length: Double, beam: Double) -> [VehicleUnit] {
+        /// One vessel, of a named class of vessel.
+        ///
+        /// `beam` is the hull's beam on the waterline and not the width over
+        /// the paddle boxes, which is the number a steamer's own registry
+        /// quotes second and the one the drawing works out for itself — see
+        /// `ShipDecks.PaddleBox.spread`. Giving it the over-boxes figure here
+        /// would have widened the hull instead of adding the boxes, and a
+        /// steamer would have come out as a very fat motor ship.
+        public static func ship(
+            length: Double, beam: Double, _ silhouette: Silhouette
+        ) -> [VehicleUnit] {
             [VehicleUnit(
                 kind: .hull, length: length, width: beam, cabFront: true,
-                band: .none, doors: 0, silhouette: .boatHull
+                band: .none, doors: 0, silhouette: silhouette
             )]
+        }
+
+        public static func boat(length: Double, beam: Double) -> [VehicleUnit] {
+            ship(length: length, beam: beam, .boatHull)
         }
 
         public static func cabin(length: Double, width: Double = 2.6, cars: Int = 1) -> [VehicleUnit] {
@@ -750,6 +833,165 @@ public enum LayoutLibrary {
                     band: .none, doors: 2, silhouette: .funicularCar
                 )
             }
+        }
+    }
+
+    // MARK: - The lake fleets
+
+    /// One vessel: what she is called, how big she is, and what shape of ship.
+    ///
+    /// Named, and the names are real. Nothing on screen ever prints one — the
+    /// panel is told `Dampfschiff` or `Motorschiff`, which is a claim about the
+    /// *class* and is true of whichever ship it turns out to be. The names are
+    /// here because they are what the dimensions were read off, and a table of
+    /// anonymous numbers is a table nobody can check.
+    struct Vessel: Sendable {
+        var name: String
+        var length: Double
+        var beam: Double
+        var shape: Silhouette
+
+        init(_ name: String, _ length: Double, _ beam: Double, _ shape: Silhouette) {
+            self.name = name; self.length = length; self.beam = beam; self.shape = shape
+        }
+
+        /// What the panel is told this is.
+        var kindName: String {
+            switch shape {
+            case .paddleSteamer: return "Dampfschiff"
+            case .panoramaShip: return "Panoramaschiff"
+            default: return "Motorschiff"
+            }
+        }
+    }
+
+    /// What a lake operator actually floats.
+    ///
+    /// The one place in this library where the entries are individual vehicles
+    /// rather than classes, and it has to be: a lake fleet is a dozen ships, no
+    /// two of them alike, three of which were launched before the First World
+    /// War. There is no class to average — `Stadt Luzern` is not a member of a
+    /// type, she is a ship.
+    ///
+    /// **Which one is running is not knowable**, exactly as which livery a
+    /// Geneva tram wears is not knowable: no feed this app reads carries a
+    /// vessel name. So the choice is hashed off the journey's own id — see
+    /// `variant(operatorName:mode:seed:)` — which is stable for as long as the
+    /// journey exists and arbitrary beyond that. The claim being made is about
+    /// the *mix* on the lake and never about the individual boat, and on the
+    /// Vierwaldstättersee that mix really is five paddle steamers among the
+    /// motor ships, all summer, every summer.
+    static func fleet(of code: String) -> [Vessel] {
+        switch code {
+        // Lac Léman: the largest surviving fleet of Belle Époque paddle
+        // steamers anywhere in the world, and eight of them are CGN's.
+        case "CGN":
+            return [
+                Vessel("La Suisse", 78.5, 8.6, .paddleSteamer),
+                Vessel("Simplon", 78.5, 8.6, .paddleSteamer),
+                Vessel("Savoie", 68.0, 8.4, .paddleSteamer),
+                Vessel("Rhône", 68.3, 8.4, .paddleSteamer),
+                Vessel("Montreux", 68.3, 8.4, .paddleSteamer),
+                Vessel("Vevey", 66.0, 8.4, .paddleSteamer),
+                Vessel("Italie", 66.0, 8.4, .paddleSteamer),
+                Vessel("Henry-Dunant", 55.0, 9.6, .motorVessel),
+                Vessel("Lausanne", 50.0, 9.4, .motorVessel),
+                Vessel("Ville-de-Genève", 47.0, 9.0, .motorVessel),
+                Vessel("Léman", 40.0, 8.4, .motorVessel),
+                Vessel("NaviExpress", 45.0, 10.6, .panoramaShip),
+            ]
+        // The Vierwaldstättersee, which runs five steamers and two of the
+        // glassiest ships in the country out of the same berths at Luzern.
+        case "SGV":
+            return [
+                Vessel("Stadt Luzern", 63.5, 8.0, .paddleSteamer),
+                Vessel("Schiller", 63.0, 7.7, .paddleSteamer),
+                Vessel("Uri", 62.7, 7.5, .paddleSteamer),
+                Vessel("Unterwalden", 62.3, 7.5, .paddleSteamer),
+                Vessel("Gallia", 61.0, 7.4, .paddleSteamer),
+                Vessel("Waldstätter", 55.0, 10.0, .motorVessel),
+                Vessel("Titlis", 47.0, 8.6, .motorVessel),
+                Vessel("Rütli", 40.0, 8.0, .motorVessel),
+                Vessel("Saphir", 48.0, 10.2, .panoramaShip),
+                Vessel("Diamant", 47.8, 10.4, .panoramaShip),
+                Vessel("Cirrus", 34.0, 8.4, .panoramaShip),
+            ]
+        // The Zürichsee: two steamers, one all-glass ship, and a lot of
+        // ordinary motor boats on the short crossings.
+        case "ZSG":
+            return [
+                Vessel("Stadt Zürich", 59.2, 6.9, .paddleSteamer),
+                Vessel("Stadt Rapperswil", 59.0, 6.9, .paddleSteamer),
+                Vessel("Panta Rhei", 51.0, 11.7, .panoramaShip),
+                Vessel("Helvetia", 55.0, 9.6, .motorVessel),
+                Vessel("Wädenswil", 48.0, 9.0, .motorVessel),
+                Vessel("Linth", 40.0, 8.2, .motorVessel),
+                Vessel("Albis", 33.0, 7.4, .motorVessel),
+                Vessel("Etzel", 33.0, 7.4, .motorVessel),
+            ]
+        // The Thuner- and Brienzersee, worked by BLS — which is the reason the
+        // paint below cannot be read off the operator. BLS is a green railway
+        // and its ships are white like everybody else's.
+        case "BLS", "BLSSCHIFF":
+            return [
+                Vessel("Blüemlisalp", 63.5, 7.2, .paddleSteamer),
+                Vessel("Berner Oberland", 56.0, 9.6, .motorVessel),
+                Vessel("Stadt Thun", 50.0, 9.0, .motorVessel),
+                Vessel("Jungfrau", 47.0, 8.6, .motorVessel),
+                Vessel("Niesen", 44.0, 8.4, .motorVessel),
+                Vessel("Brienz", 38.0, 7.8, .motorVessel),
+            ]
+        // The Bodensee, which has no steamer left and one catamaran.
+        case "SBS":
+            return [
+                Vessel("Säntis", 55.0, 10.0, .motorVessel),
+                Vessel("St. Gallen", 50.0, 9.6, .motorVessel),
+                Vessel("Thurgau", 47.0, 9.2, .motorVessel),
+                Vessel("Zürich", 40.0, 8.6, .motorVessel),
+                Vessel("Konstanz", 32.6, 10.6, .panoramaShip),
+            ]
+        // The Untersee and the Rhine down to Schaffhausen: shallow, narrow
+        // water, and therefore small flat ships.
+        case "URH":
+            return [
+                Vessel("Schaffhausen", 42.0, 8.4, .motorVessel),
+                Vessel("Thurgau", 38.0, 8.0, .motorVessel),
+                Vessel("Munot", 33.0, 7.4, .motorVessel),
+                Vessel("Stein am Rhein", 33.0, 7.4, .motorVessel),
+            ]
+        case "LNM":
+            return [
+                Vessel("Ville de Neuchâtel", 45.0, 8.8, .motorVessel),
+                Vessel("Fribourg", 40.0, 8.4, .motorVessel),
+                Vessel("Cygne", 33.0, 7.4, .motorVessel),
+            ]
+        // Biel, and the country's first solar catamaran with it.
+        case "BSG":
+            return [
+                Vessel("Petersinsel", 38.0, 8.0, .motorVessel),
+                Vessel("Rousseau", 33.0, 7.4, .motorVessel),
+                Vessel("MobiCat", 33.0, 12.0, .panoramaShip),
+            ]
+        case "SNL":
+            return [
+                Vessel("Lugano", 40.0, 8.2, .motorVessel),
+                Vessel("Ceresio", 35.0, 7.6, .motorVessel),
+                Vessel("Milano", 33.0, 7.4, .motorVessel),
+            ]
+        case "NLM":
+            return [
+                Vessel("Verbania", 45.0, 8.8, .motorVessel),
+                Vessel("Locarno", 40.0, 8.2, .motorVessel),
+            ]
+        case "SGZ", "ZBS":
+            return [
+                Vessel("Rigi", 40.0, 8.2, .motorVessel),
+                Vessel("Schwan", 33.0, 7.4, .motorVessel),
+            ]
+        default:
+            // A lake this table has never heard of runs one ordinary motor
+            // ship, which is what nearly all of them do.
+            return [Vessel("Motorschiff", 42.0, 8.6, .motorVessel)]
         }
     }
 
@@ -887,7 +1129,8 @@ public enum LayoutLibrary {
     /// and 43 m Flexitys, Basel 43 m. A bus is 12 m unless the operator is one
     /// of the four cities that run articulated fleets on most of their routes.
     static func road(
-        mode: Mode, operatorName: String?, line: String? = nil, category: String? = nil
+        mode: Mode, operatorName: String?, line: String? = nil, category: String? = nil,
+        variant: Int = 0
     ) -> ([VehicleUnit], String) {
         let code = operatorName?.uppercased() ?? ""
         switch mode {
@@ -928,11 +1171,25 @@ public enum LayoutLibrary {
                 firstClassAtFront: false, nose: .blunt, silhouette: .metroCar
             ), "MS2")
         case .boat:
-            switch code {
-            case "CGN": return (Stock.boat(length: 68.0, beam: 8.6), "Belle Époque")
-            case "ZSG": return (Stock.boat(length: 55.0, beam: 10.0), "Motorschiff")
-            default:    return (Stock.boat(length: 45.0, beam: 9.0), "Motorschiff")
+            // A catamaran is a catamaran whoever owns it, and the feed says so
+            // outright: `Categories` folds the product code `KAT` into this
+            // mode alongside the ordinary boats. Both of the country's real
+            // ones — the Bodensee crossing and Biel's solar boat — are wide,
+            // low, glass-sided ships and nothing like the fleet around them.
+            if normalise(category) == "KAT" {
+                return (
+                    Stock.ship(length: 33.0, beam: 11.4, .panoramaShip),
+                    "Katamaran"
+                )
             }
+            let ships = fleet(of: code)
+            // `variant` is the hash of the journey's own id — right about the
+            // mix on the lake, never about the individual ship. See `fleet`.
+            let ship = ships[((variant % ships.count) + ships.count) % ships.count]
+            return (
+                Stock.ship(length: ship.length, beam: ship.beam, ship.shape),
+                ship.kindName
+            )
         case .cable:
             // `.cable` is four completely different vehicles wearing one word,
             // and it used to draw one twelve-metre pod for all of them.
@@ -1088,7 +1345,8 @@ public enum LayoutLibrary {
 
         guard mode == .train else {
             let (units, name) = road(
-                mode: mode, operatorName: operatorName, line: line, category: category
+                mode: mode, operatorName: operatorName, line: line, category: category,
+                variant: variant
             )
             return VehicleLayout(units: units, livery: paint, name: name).resolvingStripes()
         }

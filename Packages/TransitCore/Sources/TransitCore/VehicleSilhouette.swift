@@ -126,8 +126,47 @@ public enum Silhouette: String, Sendable, Codable, Hashable, CaseIterable {
 
     // MARK: Water
 
-    /// A lake boat.
+    /// A lake boat nothing more is known about: a small motor ship, which is
+    /// what most of what floats on a Swiss lake actually is.
+    ///
+    /// Kept as the water's `.generic`, and kept drawn as it always was. Every
+    /// boat on the map was one of these before the fleet below existed, and a
+    /// record written by an older build still says so.
     case boatHull
+    /// A Belle Époque paddle steamer: a *Dampfschiff*.
+    ///
+    /// The one vehicle in this whole vocabulary that somebody would cross a
+    /// country to look at, and the one the old single boat shape was furthest
+    /// from. Switzerland runs the largest fleet of them left anywhere — eight
+    /// on the Léman, five on the Vierwaldstättersee, two on the Zürichsee, one
+    /// each on the Thuner- and the Brienzersee — and not one of them is a
+    /// motor launch with a box on it. A steamer is a long fine hull with two
+    /// enormous **paddle boxes** bulging out at midships to nearly twice the
+    /// beam, two decks of white superstructure set well inboard of them, a
+    /// tall funnel over the engine, a bridge just forward of it and a mast
+    /// forward of that.
+    ///
+    /// The paddle boxes are the whole of it from above, which is why they are
+    /// in the *plan* rather than in the elevation: from directly overhead a
+    /// steamer is a shape no other vessel on the lake has, a slim hull that
+    /// swells and closes again in the middle. See `VehicleFootprint.Sponsons`.
+    case paddleSteamer
+    /// A post-war motor ship: a *Motorschiff*.
+    ///
+    /// The workhorse of every lake fleet — `Ville-de-Genève`, `Helvetia`,
+    /// `Waldstätter`, `Berner Oberland`. Lower and blunter than a steamer, one
+    /// long glazed saloon with an open sun deck over its after half, a squat
+    /// funnel well aft where the diesels are, and no paddle boxes at all.
+    case motorVessel
+    /// A modern panorama ship: `Panta Rhei`, `Diamant`, `Saphir`, and the
+    /// catamarans.
+    ///
+    /// Glass from the deck to the roof and nearly the full beam of the ship,
+    /// because that is what the fare buys. Very low, very wide, and with no
+    /// funnel worth drawing — which makes it the exact opposite of the steamer
+    /// tied up at the next berth, and that contrast is most of why it is worth
+    /// telling the two apart.
+    case panoramaShip
 }
 
 extension Silhouette {
@@ -147,7 +186,8 @@ extension Silhouette {
         case .tramCar, .metroCar, .aerialCabin: return .blunt
         case .generic, .intercityCoach, .doubleDeckCoach, .panoramaCoach,
              .sleeperCoach, .luggageVan, .electricLoco, .shunter, .gtwPower,
-             .cityBus, .trolleybus, .coachBus, .boatHull:
+             .cityBus, .trolleybus, .coachBus,
+             .boatHull, .paddleSteamer, .motorVessel, .panoramaShip:
             return nil
         }
     }
@@ -431,7 +471,254 @@ extension Silhouette {
                 roofWidth: 0.84, underWidth: 0.94
             )
 
+        case .boatHull, .paddleSteamer, .motorVessel, .panoramaShip:
+            // A ship is not a stack of bands. See `ShipDecks` below, which is
+            // the same idea in the vocabulary a vessel is actually described
+            // in: a hull, a sheer line, and decks laid over it.
+            return nil
+        }
+    }
+}
+
+
+// MARK: - What a ship is made of
+
+/// The decks one class of vessel is built from, in real metres above the
+/// waterline.
+///
+/// The water's answer to `BodyBands`, and it has to be its own vocabulary
+/// rather than a rename of that one. A coach is a box with horizontal bands
+/// painted on it and the bands are the whole description; a ship is a hull with
+/// separate structures *laid on top of it*, each shorter than the one below,
+/// with a funnel and a bridge standing at named places along the length. None
+/// of that can be said in floors and cant rails, and said in them anyway a
+/// steamer came out as a blue brick with a lid — which is what every boat in
+/// this country looked like on the map until now.
+///
+/// Everything is in the ship's own metres above the waterline, because that is
+/// where a vessel's zero honestly is: what is under it is under the lake.
+public struct ShipDecks: Sendable, Hashable {
+    /// The top of the black lower strake — the boot topping at the waterline.
+    /// Every working ship on every Swiss lake has one, and it is what stops a
+    /// white hull reading as a paper boat.
+    public var boot: Double
+    /// The top of the painted hull side: the main deck's edge.
+    public var sheer: Double
+    /// The top of the bulwark, and where the sheer stripe is painted.
+    public var rail: Double
+
+    /// The main saloon: the top of its glass, how wide it is as a share of the
+    /// beam, and how far its ends are held off the ship's — a fore-and-aft
+    /// deckhouse never runs to the stem.
+    public var saloon: Double
+    public var saloonWidth: Double
+    public var saloonRake: Double
+    /// The promenade deck laid over the saloon, and its width. Wider than the
+    /// glass under it on purpose: a promenade deck *overhangs*, which is what
+    /// gives a lake boat the shadow line down its side that a barge has not.
+    public var promenade: Double
+    public var promenadeWidth: Double
+
+    /// The upper saloon, where the ship has a second storey of it. Nil on a
+    /// single-decker.
+    public var upper: Double?
+    public var upperWidth: Double
+    public var upperRake: Double
+    /// The boat deck laid over the upper saloon.
+    public var boatDeck: Double?
+
+    /// The bridge, standing on the topmost deck.
+    public var wheelhouse: Deckhouse?
+    /// The funnel, where the ship has one worth drawing. A panorama ship does
+    /// not: its exhaust goes up a mast, and a funnel drawn on one is a claim
+    /// about a vessel built specifically not to have it.
+    public var funnel: Funnel?
+    /// The mast, forward.
+    public var mast: Mast?
+    /// The paddle boxes, on the one class that has them.
+    public var paddle: PaddleBox?
+
+    /// Something standing on a deck: where along the ship its middle is, how
+    /// long and how wide it is, and how high it reaches.
+    ///
+    /// `at` and `long` are fractions of the ship's length measured from the
+    /// **stern**, because that is the direction the plan outline runs in — see
+    /// `VehicleFootprint.outline`, whose `x` is zero at the transom. `wide` is
+    /// a fraction of the beam; `top` is metres above the waterline.
+    public struct Deckhouse: Sendable, Hashable {
+        public var at: Double
+        public var long: Double
+        public var wide: Double
+        public var top: Double
+        public init(at: Double, long: Double, wide: Double, top: Double) {
+            self.at = at; self.long = long; self.wide = wide; self.top = top
+        }
+    }
+
+    /// A funnel: where it stands, how fat it is as a share of the half beam,
+    /// and how high it reaches.
+    ///
+    /// Over the engine, which on a paddle steamer means over the paddles and
+    /// therefore very near amidships, and on a motor ship means well aft. That
+    /// difference is worth more than it sounds: funnel position is how ships
+    /// have been told apart at a distance since there were funnels.
+    public struct Funnel: Sendable, Hashable {
+        public var at: Double
+        public var radius: Double
+        public var top: Double
+        public init(at: Double, radius: Double, top: Double) {
+            self.at = at; self.radius = radius; self.top = top
+        }
+    }
+
+    public struct Mast: Sendable, Hashable {
+        public var at: Double
+        public var top: Double
+        public init(at: Double, top: Double) { self.at = at; self.top = top }
+    }
+
+    /// A pair of paddle boxes: where they are along the hull, how much of its
+    /// length they take, and how far out they push it.
+    ///
+    /// `spread` is the ship's width **over the boxes** as a multiple of its
+    /// hull beam, and the real numbers are startling: `La Suisse` is 8.6 m on
+    /// the waterline and 15.4 m across the paddle boxes, which is 1.79. That
+    /// one number is why a steamer cannot be drawn as a slim hull with a house
+    /// on it — from above it is nearly twice as wide in the middle as it is at
+    /// either end.
+    public struct PaddleBox: Sendable, Hashable {
+        public var at: Double
+        public var long: Double
+        public var spread: Double
+        public init(at: Double, long: Double, spread: Double) {
+            self.at = at; self.long = long; self.spread = spread
+        }
+    }
+
+    public init(
+        boot: Double, sheer: Double, rail: Double,
+        saloon: Double, saloonWidth: Double, saloonRake: Double,
+        promenade: Double, promenadeWidth: Double,
+        upper: Double? = nil, upperWidth: Double = 0.6, upperRake: Double = 2.2,
+        boatDeck: Double? = nil,
+        wheelhouse: Deckhouse? = nil, funnel: Funnel? = nil,
+        mast: Mast? = nil, paddle: PaddleBox? = nil
+    ) {
+        self.boot = boot
+        self.sheer = sheer
+        self.rail = rail
+        self.saloon = saloon
+        self.saloonWidth = saloonWidth
+        self.saloonRake = saloonRake
+        self.promenade = promenade
+        self.promenadeWidth = promenadeWidth
+        self.upper = upper
+        self.upperWidth = upperWidth
+        self.upperRake = upperRake
+        self.boatDeck = boatDeck
+        self.wheelhouse = wheelhouse
+        self.funnel = funnel
+        self.mast = mast
+        self.paddle = paddle
+    }
+
+    /// The highest deck anything stands on: what the funnel, the bridge and the
+    /// mast are all measured up from.
+    public var topDeck: Double { boatDeck ?? promenade }
+
+    /// The small motor ship, which is what most of what floats on a Swiss lake
+    /// actually is — and what every boat on this map was drawn as before there
+    /// was a fleet to choose from.
+    ///
+    /// Named rather than written out where it is wanted, because it is wanted
+    /// in two places: it is what `.boatHull` is, and it is what a hull whose
+    /// class was never recorded falls back to. Two copies of one vessel is how
+    /// the two quietly stop being the same vessel.
+    public static let motorLaunch = ShipDecks(
+        boot: 0.45, sheer: 1.90, rail: 2.12,
+        saloon: 3.70, saloonWidth: 0.82, saloonRake: 1.15,
+        promenade: 4.20, promenadeWidth: 0.86,
+        wheelhouse: .init(at: 0.66, long: 0.10, wide: 0.36, top: 5.40),
+        mast: .init(at: 0.62, top: 6.60)
+    )
+}
+
+extension Silhouette {
+    /// The decks this class of ship is built from, or nil for everything that
+    /// runs on wheels.
+    ///
+    /// Real vessels, and the numbers are theirs. A Swiss lake steamer's hull
+    /// side is about 2.3 m out of the water, its promenade deck is a bit over
+    /// 5 m up and its funnel top is at ten and a half — so the funnel is twice
+    /// the height of the hull, which is exactly the proportion a photograph of
+    /// one shows and exactly the proportion a box with a lid on it does not.
+    public var decks: ShipDecks? {
+        switch self {
         case .boatHull:
+            // The small motor ship, and deliberately the closest of the four to
+            // what every boat on this map looked like before there were four:
+            // a hull to 1.9 m, a glazed saloon to 3.7 and a deck over it. What
+            // it gains is a bridge that stands where a bridge stands — forward,
+            // over the saloon — instead of a block in the middle of the roof.
+            return .motorLaunch
+
+        case .paddleSteamer:
+            // `La Suisse`, `Stadt Luzern`, `Blüemlisalp`, `Stadt Zürich`. Two
+            // full decks of superstructure held well inboard, a funnel over the
+            // engine at midships, the bridge immediately forward of it, and the
+            // paddle boxes under both.
+            //
+            // The arrangement is the identification, and it runs from aft
+            // forward: paddles at half the length, funnel just ahead of them,
+            // wheelhouse just ahead of that, foremast forward of everything.
+            // Photographed from any angle, that order is what says steamer.
+            return ShipDecks(
+                boot: 0.62, sheer: 2.35, rail: 2.88,
+                saloon: 4.70, saloonWidth: 0.86, saloonRake: 1.55,
+                promenade: 5.20, promenadeWidth: 0.92,
+                upper: 6.85, upperWidth: 0.58, upperRake: 2.60,
+                boatDeck: 7.30,
+                wheelhouse: .init(at: 0.64, long: 0.075, wide: 0.34, top: 8.95),
+                funnel: .init(at: 0.555, radius: 0.42, top: 10.60),
+                mast: .init(at: 0.845, top: 10.90),
+                paddle: .init(at: 0.505, long: 0.165, spread: 1.74)
+            )
+
+        case .motorVessel:
+            // `Ville-de-Genève`, `Helvetia`, `Waldstätter`, `Berner Oberland`.
+            // A metre lower than a steamer everywhere, a saloon that runs
+            // nearly the whole length because there is no machinery amidships
+            // to work around, and a short fat funnel right aft over the
+            // diesels.
+            return ShipDecks(
+                boot: 0.55, sheer: 2.15, rail: 2.55,
+                saloon: 4.30, saloonWidth: 0.90, saloonRake: 1.05,
+                promenade: 4.75, promenadeWidth: 0.95,
+                upper: 6.05, upperWidth: 0.60, upperRake: 2.30,
+                boatDeck: 6.45,
+                wheelhouse: .init(at: 0.70, long: 0.085, wide: 0.36, top: 7.95),
+                funnel: .init(at: 0.325, radius: 0.34, top: 8.30),
+                mast: .init(at: 0.80, top: 9.20)
+            )
+
+        case .panoramaShip:
+            // `Panta Rhei`, `Diamant`, `Saphir`, and the lake catamarans. Wide,
+            // low and glazed to the ship's own sides — the glass is 0.96 of the
+            // beam because on these there is barely a hull side above the deck
+            // to be anything else. No funnel: the exhaust goes up inside the
+            // mast, and one drawn here would be the single most conspicuous
+            // wrong thing on the vessel.
+            return ShipDecks(
+                boot: 0.42, sheer: 1.80, rail: 2.05,
+                saloon: 3.95, saloonWidth: 0.96, saloonRake: 0.72,
+                promenade: 4.35, promenadeWidth: 0.99,
+                upper: 5.60, upperWidth: 0.68, upperRake: 1.90,
+                boatDeck: 5.95,
+                wheelhouse: .init(at: 0.72, long: 0.07, wide: 0.30, top: 7.10),
+                mast: .init(at: 0.60, top: 8.60)
+            )
+
+        default:
             return nil
         }
     }
