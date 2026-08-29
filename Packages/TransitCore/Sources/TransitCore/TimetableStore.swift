@@ -473,6 +473,55 @@ public final class TimetableStore: @unchecked Sendable {
         return "ch:1:sboid:\(parts[3])"
     }
 
+    /// The operator an `agency_id` names, for the runs that carry no journey
+    /// reference to read one out of.
+    ///
+    /// A hand-written table, which this codebase avoids and which is the right
+    /// answer here for one reason: the alternative is not a better table, it is
+    /// **no operator at all**. 164,000 of the two million trips in the packed
+    /// year carry no journey reference — the marker is "none", not an empty
+    /// string — and 29 agencies have not got one on a single run. For those
+    /// there is nothing to parse, so `operatorRef(ofJourneyRef:)` returns nil,
+    /// the register is never asked, and the vehicle comes out with no company:
+    /// no name in the panel, no livery, and no class of stock, because
+    /// `LayoutLibrary` keys the paint *and* the shape on the operator code. A
+    /// Matterhorn Gotthard train to Zermatt was drawn as a standard-gauge FLIRT
+    /// in plain mode-red.
+    ///
+    /// **Kept honest by being small and by being checked against the data
+    /// rather than remembered.** Every row below was read out of the packed
+    /// timetable itself — the agency's own lines, headsigns and mode — and
+    /// nothing is entered on a hunch. Most of the ref-less agencies are French,
+    /// German and Austrian, and those stay out: the register is the Swiss one
+    /// and has never heard of them, so nil is the true answer and a guess would
+    /// be worse than the blank. What is left is one company and a scatter of
+    /// eleven-row bus workings not worth a row.
+    ///
+    /// The proper fix is upstream — the packer should write the SBOID into the
+    /// class record, and then this goes away. Until it does, this is the only
+    /// place the two key spaces can be joined, because the `agency_id` is
+    /// already read and then dropped.
+    static func operatorRef(ofAgency agency: String?) -> String? {
+        guard let agency else { return nil }
+        return sboidByAgency[agency]
+    }
+
+    /// `agency_id` → SBOID, for the ref-less Swiss agencies that can be
+    /// identified from what they run.
+    ///
+    /// **48 and 93 are both the Matterhorn Gotthard Bahn**, which is what the
+    /// merger of the BVZ and the Furka Oberalp is still filed as two halves of.
+    /// 48 runs R43–R46 and the Glacier Express over Andermatt, Disentis,
+    /// Oberwald and Realp; 93 runs R40–R42 down the Mattertal to Täsch, Zermatt
+    /// and Visp. Both are trains, both are metre gauge, and neither carries a
+    /// journey reference on a single one of its 688 runs. The Gornergrat is not
+    /// either of them — it is a separate company with its own rack railway, and
+    /// none of its stops appears under either id.
+    private static let sboidByAgency: [String: String] = [
+        "48": "ch:1:sboid:100029",
+        "93": "ch:1:sboid:100029",
+    ]
+
     /// The moments the packed feed can answer for.
     ///
     /// The whole point of having an archive rather than a snapshot: `feedStart`
@@ -713,7 +762,11 @@ public final class TimetableStore: @unchecked Sendable {
             category: nil,
             line: info.line ?? "",
             number: string(record.number),
-            operatorName: Self.operatorRef(ofJourneyRef: ref).flatMap(operatorName),
+            // The journey reference first, because it is this run's own word
+            // for who is running it; the agency id only where there is no
+            // reference to read. See `operatorRef(ofAgency:)`.
+            operatorName: (Self.operatorRef(ofJourneyRef: ref)
+                ?? Self.operatorRef(ofAgency: info.agency)).flatMap(operatorName),
             operatorFull: nil,
             to: info.headsign,
             from: calls[0].name,

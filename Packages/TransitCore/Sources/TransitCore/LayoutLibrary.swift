@@ -813,6 +813,23 @@ public enum LayoutLibrary {
 
     // MARK: - What each line runs
 
+    /// Operator and line → class, for a line whose number is not its own.
+    ///
+    /// `byLine` below is keyed on the line alone, which is safe for the
+    /// national products — there is one IC 1 and one IR 16 — and is not safe
+    /// for a regional number. Line numbers repeat: there is an R 41 in the
+    /// Mattertal and another in the Jura, and they are different companies
+    /// running different trains. So a regional entry has to say whose line it
+    /// means, and this is looked at before the plain table.
+    ///
+    /// `R12` is Spiez–Frutigen, on the north ramp of the Lötschberg, worked by
+    /// the Lötschberger the ramp is named after — not by the double-deck MUTZ
+    /// that BLS runs on the Bern S-Bahn, which is what `localByOperator` would
+    /// otherwise hand it.
+    static let byOperatorLine: [String: String] = [
+        "BLS|R12": "LOETSCHBERGER",
+    ]
+
     /// Line → class, for the services worth naming individually.
     ///
     /// Uppercased and stripped of spaces, because the feed publishes an IC 1 as
@@ -828,11 +845,6 @@ public enum LayoutLibrary {
         "IR26": "IC2000", "IR27": "IC2000", "IR35": "KISS", "IR36": "KISS",
         "IR37": "DOSTO4", "IR46": "DOSTO4", "IR65": "EWIV", "IR66": "EWIV",
         "IR70": "DOSTO4", "IR75": "DOSTO4", "IR90": "ICN", "IR95": "EWIV",
-        // Regional, where the line runs something its operator's usual stock is
-        // not. `R12` is Spiez–Frutigen, on the north ramp of the Lötschberg,
-        // and it is worked by the Lötschberger the ramp is named after — not by
-        // the double-deck MUTZ that BLS runs on the Bern S-Bahn.
-        "R12": "LOETSCHBERGER",
         // Named trains.
         "GEX": "RHBRAKE", "BEX": "GOLDENPASS", "PE": "TRAVERSO", "VAE": "TRAVERSO",
         "GPX": "GPX",
@@ -1090,7 +1102,8 @@ public enum LayoutLibrary {
         // SBB *intercity* is not a four-car DTZ.
         let isLocal = ["S", "SN", "SP", "R", "RB", "RE", "IRE"].contains(categoryKey)
 
-        let className = byLine[lineKey]
+        let className = byOperatorLine["\(operatorKey)|\(lineKey)"]
+            ?? byLine[lineKey]
             ?? (isLocal ? localByOperator[operatorKey] : nil)
             ?? byCategory[categoryKey]
             ?? localByOperator[operatorKey]
