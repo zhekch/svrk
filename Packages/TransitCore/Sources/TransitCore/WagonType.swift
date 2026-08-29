@@ -133,13 +133,31 @@ public struct StoredWagon: Sendable, Codable, Hashable {
     /// What the formation service called it. Nil falls back to reading the
     /// name — see `WagonCatalogue.band(of:)` and `kind(of:)`.
     public var kind: CoachKind?
+    /// Whether the gangway in front of this vehicle cannot be walked through.
+    ///
+    /// The service's own word for where one unit ends and the next begins, and
+    /// the only one that works on every train. A blocked gangway in the middle
+    /// of a formation is not a closed door — it is the *outside* of two cab
+    /// ends with couplers between them, because there is no gangway to walk
+    /// through in the first place. Two four-car FLIRTs, two IC2000 sets, an EC
+    /// worked by two Astoros: all of them say it, whatever their cars are
+    /// called, and none of them needs a class name to be understood.
+    ///
+    /// This is evidence rather than a deduction, which is why it is stored at
+    /// all — see the note at the top of this file. The panel has read it since
+    /// it was first drawn (`FormationView.naturalLayout`) and the map could
+    /// not, because the wagons the map is built from threw it away at the door;
+    /// so the same train came back as two units in the strip at the bottom of
+    /// the screen and as one long rake on the map above it.
+    public var startsUnit: Bool
 
-    public init(type: WagonType?, kind: CoachKind? = nil) {
+    public init(type: WagonType?, kind: CoachKind? = nil, startsUnit: Bool = false) {
         self.type = type
         self.kind = kind
+        self.startsUnit = startsUnit
     }
 
-    enum CodingKeys: String, CodingKey { case type = "t", kind = "k" }
+    enum CodingKeys: String, CodingKey { case type = "t", kind = "k", startsUnit = "u" }
 
     /// Written short, because there are thousands of these and the long
     /// spellings were the file.
@@ -147,12 +165,20 @@ public struct StoredWagon: Sendable, Codable, Hashable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encodeIfPresent(type, forKey: .type)
         try c.encodeIfPresent(kind, forKey: .kind)
+        // Written only when true, which is a handful of vehicles in any file:
+        // one flag per coupled join, and nothing at all on the great majority
+        // of trains that are a single unit.
+        if startsUnit { try c.encode(true, forKey: .startsUnit) }
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         type = try c.decodeIfPresent(WagonType.self, forKey: .type)
         kind = try c.decodeIfPresent(CoachKind.self, forKey: .kind)
+        // Absent on every record written before this was read, which is the
+        // right answer for them: no evidence either way, so the names are all
+        // there is and `setStarts` falls back to reading them.
+        startsUnit = try c.decodeIfPresent(Bool.self, forKey: .startsUnit) ?? false
     }
 }
 
@@ -453,6 +479,13 @@ public enum WagonCatalogue {
         // and an ICN all end in several metres of unbroken taper.
         let streamlined = ["ICE", "TGV", "ETR", "RABE501", "RABE503", "RABDE500"]
         if streamlined.contains(where: { raw.hasPrefix($0) }) { return .streamlined }
+        // The Lötschberger, which is a FLIRT with a different face on it. BLS
+        // had the front redesigned for the RegioExpress work it does over the
+        // Lötschberg, and what came back is nearly flat — a wide upright screen
+        // with the corners taken off, and none of the deep one-piece moulding
+        // every other Stadler product in the country wears. Drawn with the
+        // family's bulb it was a rounded snout on a train that has not got one.
+        if raw.hasPrefix("RABE535") { return .blunt }
         return nil
     }
 
@@ -691,6 +724,45 @@ public enum WagonCatalogue {
         return 1
     }
 
+    /// The shape a body with no strong claim of its own should take from the
+    /// train around it, or nil where the train says nothing.
+    ///
+    /// The rule the class table states and cannot carry out. `Bt`, `ABt`, `BDt`
+    /// are read as suburban cabs, which is right on a Domino and on nearly
+    /// everything else in the country — and wrong on the one part of the
+    /// network where it shows most. The Wengernalp's trailers are `Bt`, so a
+    /// working up to Kleine Scheidegg came back as a rack railcar with an
+    /// upright front pushing a coach with a *moulded snout*, which is a
+    /// suburban railcar's face on a mountain vehicle that has never had one.
+    /// The name cannot settle it — the same string is both — so the train has
+    /// to, and the train is only visible from here.
+    ///
+    /// Narrow on purpose: only the mountain and metre-gauge families, and only
+    /// where a vehicle in the same formation is named as one. Everything else
+    /// keeps the shape its own name claims.
+    static func houseShape(among wagons: [StoredWagon]) -> WagonTraits? {
+        let named = wagons.compactMap { $0.type.map { traits(of: $0) } }
+        return named.first { house in
+            switch house.silhouette {
+            case .rackTrainCar, .rackTrailer, .rackUnit, .narrowGaugeUnit, .funicularCar:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    /// The shapes a name claims only because it had nothing better to say.
+    ///
+    /// A driving trailer or a plain lettered coach: both are read off a class
+    /// letter that describes what is *inside* the vehicle, which is the same
+    /// letter on a valley floor and at two thousand metres. These are the ones
+    /// the train is allowed to overrule; anything that names a shape outright
+    /// — a KISS, a Giruno, a GTW module — is not.
+    static let borrowedShapes: Set<Silhouette> = [
+        .suburbanUnit, .intercityCoach, .generic,
+    ]
+
     /// Where one multiple unit ends and the next one begins.
     ///
     /// Two four-car FLIRTs coupled to make an eight-car train are not an
@@ -705,8 +777,8 @@ public enum WagonCatalogue {
     /// **Read off the position suffix, which is already on disk.** The register
     /// numbers the cars of a set — `RABe511_6_1` is car one of a six-car 511 —
     /// and `WagonType` keeps those underscores deliberately, so the evidence
-    /// has been in every record ever written. Where the trailing number stops
-    /// climbing and starts again, a new unit has begun. Nothing needs
+    /// has been in every record ever written. Where that run of numbers
+    /// breaks, a new unit has begun. Nothing needs
     /// migrating and no new field is stored, which is the whole bargain this
     /// file makes: the names stay, and the reading of them improves.
     ///
@@ -714,24 +786,63 @@ public enum WagonCatalogue {
     /// unit gives `[0]`, and a train with no suffixes at all gives `[0]` too —
     /// which is exactly what was drawn before, and the right answer when there
     /// is no evidence either way.
+    ///
+    /// **A unit is a run, not a rising number.** The first reading of this
+    /// asked only whether the position had stopped climbing, and that is not
+    /// the same question. A set coupled on the other way round counts *down* —
+    /// `1,2,3,4` followed by `4,3,2,1` is two four-car units, the second of
+    /// them turned — and read a step at a time every one of those descending
+    /// cars looked like the start of a new set. What came back was four
+    /// one-car units in the middle of a train, and a one-car unit has a cab at
+    /// both ends: a coach in the middle of a KISS drawn as a capsule with a
+    /// windscreen on each end, which is a vehicle that does not exist.
+    ///
+    /// So a unit is a run of *consecutive* numbers, in either direction, and a
+    /// new one begins only where that run genuinely breaks: the number repeats,
+    /// it jumps by more than one, or it turns round. Each of those is a fact
+    /// about the formation; "smaller than the last one" on its own is not.
     static func setStarts(in wagons: [StoredWagon]) -> [Int] {
+        // What the service said, wherever it said anything. A blocked gangway
+        // is a fact about *this* train reported by the operator of it, and it
+        // outranks anything a class name can be made to imply: it is right on
+        // hauled stock, on migrated classes, on rolling stock nobody has
+        // written a rule for, and on the EuroCity out of Milano whose cars are
+        // named by what is inside them and say nothing about how many trains
+        // are coupled together. See `StoredWagon.startsUnit`.
+        let stated = wagons.indices.filter { $0 > 0 && wagons[$0].startsUnit }
+        if !stated.isEmpty { return [0] + stated }
+
+        let positions = wagons.map { $0.type.flatMap(setPosition) }
+        // A suffix every car shares is not a position, it is part of the class
+        // name — and read as one it makes every car its own unit. Two distinct
+        // numbers somewhere in the train is the least evidence that the suffix
+        // counts anything at all.
+        guard Set(positions.compactMap { $0 }).count > 1 else { return [0] }
+
         var starts = [0]
         var previous: Int?
-        for (index, wagon) in wagons.enumerated() {
+        /// Which way the current run is counting, once two cars have said so.
+        var direction: Int?
+        for (index, position) in positions.enumerated() {
             // A locomotive is not part of a numbered set and must not break
             // one: a rake with an engine in the middle is a different fact and
             // the suffixes either side of it go on running.
-            guard let position = wagon.type.flatMap(setPosition) else {
+            guard let position else {
                 previous = nil
+                direction = nil
                 continue
             }
-            // Down, or level, means a new set. Level because a two-car unit
-            // coupled to another two-car unit runs 1,2,1,2 — and because a
-            // repeat is as much a restart as a decrease is.
-            if let previous, position <= previous, index > 0 {
-                starts.append(index)
+            defer { previous = position }
+            guard let last = previous, index > 0 else { continue }
+            let step = position - last
+            // Consecutive, and going the same way the run has been going.
+            if abs(step) == 1, direction == nil || direction == step {
+                direction = step
+                continue
             }
-            previous = position
+            starts.append(index)
+            // The new unit has said nothing yet about which way it counts.
+            direction = nil
         }
         return starts
     }
@@ -801,6 +912,9 @@ public enum WagonCatalogue {
         // Where each coupled unit begins. `[0]` for an ordinary train; two
         // entries for two units coupled nose to tail. See `setStarts`.
         let starts = Set(setStarts(in: wagons))
+        // What the rest of the train is, for the bodies whose own names do not
+        // say. See `houseShape`.
+        let house = houseShape(among: wagons)
         /// Whether this body is the *last* of its unit — the one whose back end
         /// faces the nose of the next unit along.
         func endsAUnit(_ index: Int) -> Bool {
@@ -831,7 +945,7 @@ public enum WagonCatalogue {
             let leading = index == 0
             // The name where there is one; the line's usual stock where there
             // is not; a plain standard-gauge coach where there is neither.
-            let traits = wagon.type.map { self.traits(of: $0) }
+            var traits = wagon.type.map { self.traits(of: $0) }
                 ?? template.map {
                     WagonTraits(
                         doubleDeck: $0.doubleDeck, width: $0.width, nose: $0.nose,
@@ -847,6 +961,16 @@ public enum WagonCatalogue {
                     )
                 }
                 ?? .unknown
+            // And the train's own shape over any of them, for a body that only
+            // claimed one because its name had nothing better to offer. The
+            // width comes with it: the bodies of a train are all one width, and
+            // a 2.9 m trailer behind a 2.66 m rack railcar is a step in the
+            // side of a vehicle that has not got one.
+            if let house, borrowedShapes.contains(traits.silhouette) {
+                traits.silhouette = house.silhouette
+                traits.width = house.width
+                traits.nose = house.nose
+            }
 
             // A locomotive has a cab at both ends wherever it is standing.
             //

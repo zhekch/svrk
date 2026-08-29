@@ -97,6 +97,12 @@ public enum Silhouette: String, Sendable, Codable, Hashable, CaseIterable {
     /// The open-sided trailer a rack railcar pushes: almost all window, and a
     /// roof that reads as a canopy rather than as the top of a box.
     case rackTrailer
+    /// A modern articulated rack unit: the Stadler sets that have worked
+    /// Vitznau–Rigi Kulm since 2021, and the ones on order for Arth-Goldau.
+    /// Not a railcar pushing a trailer — one 35 m vehicle in two sections over
+    /// a centre joint, panoramic glass most of the way up the side, and a flat
+    /// upright cab at each end.
+    case rackUnit
     /// A funicular car, which is a staircase with walls: the body steps down
     /// the slope rather than lying along it.
     case funicularCar
@@ -137,7 +143,7 @@ extension Silhouette {
         case .highSpeedPower, .highSpeedCar: return .streamlined
         case .doubleDeckUnit: return .wedge
         case .suburbanUnit, .lowFloorUnit, .narrowGaugeUnit: return .bulb
-        case .rackTrainCar, .rackTrailer, .funicularCar: return .slab
+        case .rackTrainCar, .rackTrailer, .rackUnit, .funicularCar: return .slab
         case .tramCar, .metroCar, .aerialCabin: return .blunt
         case .generic, .intercityCoach, .doubleDeckCoach, .panoramaCoach,
              .sleeperCoach, .luggageVan, .electricLoco, .shunter, .gtwPower,
@@ -374,6 +380,15 @@ extension Silhouette {
             return BodyBands(
                 floor: 0.90, waist: 1.42, cant: 2.86, shoulder: 3.12, roof: 3.55,
                 roofWidth: 0.78, underWidth: 0.72
+            )
+        case .rackUnit:
+            // Taller and glassier than the car it replaces, and without the
+            // deep overhanging roof: the whole selling point of the Stadler
+            // sets is the window, so the sill is low, the cant rail is high
+            // and what is left over the top of it is a gutter.
+            return BodyBands(
+                floor: 0.88, waist: 1.96, cant: 2.98, shoulder: 3.42, roof: 3.80,
+                roofWidth: 0.82, underWidth: 0.74
             )
         case .funicularCar:
             return BodyBands(

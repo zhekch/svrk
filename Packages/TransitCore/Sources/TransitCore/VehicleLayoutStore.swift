@@ -764,12 +764,23 @@ public final class VehicleLayoutStore: @unchecked Sendable {
             ?? stops.first
         else { return [] }
 
-        return stop.coaches.map {
+        // Where the train is really two trains, which the service states and
+        // the map used to throw away. Read from both sides of the join because
+        // it is published twice and not always consistently — the same reading
+        // the coach strip in the panel has always made, so the two drawings of
+        // one train now agree about how many trains it is. See
+        // `FormationView.naturalLayout` and `StoredWagon.startsUnit`.
+        let coaches = stop.coaches
+        return coaches.indices.map { index in
             // The service's own code alongside the register's name. It states
             // what a name can only imply — which vehicle is the engine, which
             // car of a unit is the first-class one — and neither is knowable
             // from the name of a `RABe 511` whose every car is a `RABe 511`.
-            StoredWagon(type: WagonType($0.typeName), kind: $0.kind)
+            StoredWagon(
+                type: WagonType(coaches[index].typeName), kind: coaches[index].kind,
+                startsUnit: index > 0
+                    && (coaches[index].noAccessForward || coaches[index - 1].noAccessBackward)
+            )
         }
     }
 

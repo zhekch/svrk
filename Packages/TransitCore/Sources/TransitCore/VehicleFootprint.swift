@@ -1198,7 +1198,7 @@ public enum VehicleShape {
         // Measured against the width, like the tram front it is a cousin of: a
         // rack railcar's front is a wall with the corners taken off, and it
         // stays that shape however wide the body is drawn.
-        case .slab: return min(width * 0.30, length * 0.22)
+        case .slab: return min(width * 0.20, length * 0.14)
         // Half the width and a bit: the end of a tram is very nearly a
         // semicircle, and that is what it should stay however wide it is drawn.
         case .tramFront: return min(width * 0.5, length * 0.4)
@@ -1290,8 +1290,17 @@ public enum VehicleShape {
         case .wedge:
             // Wide at the tip because it is: the plan of a double-deck unit's
             // nose is nearly a coach end. What makes it a wedge happens in
-            // elevation, not here.
-            return taper(depth: n, half: half, tip: 0.44, power: 0.70, steps: steps)
+            // elevation, not here — the roof steps down a storey over six
+            // metres, and *that* is what a KISS's front is.
+            //
+            // Written first at 0.44, which is the opposite of what the sentence
+            // above says: a body drawn to under half its width over four and a
+            // half metres is a cone, and a MUTZ standing in a station came out
+            // pointed like something built for 250 km/h. The real front is a
+            // flat screen nearly the full width of the vehicle with the corners
+            // pulled in, so the tip is most of the body and the taper is a
+            // shoulder rather than a point.
+            return taper(depth: n, half: half, tip: 0.74, power: 0.52, steps: steps)
         case .bulb:
             // Full, and closing late. Below 0.6 the sides run at nearly the
             // body's width and then turn in hard at the very end, which is
@@ -1299,7 +1308,16 @@ public enum VehicleShape {
             // product in the country.
             return taper(depth: n, half: half, tip: 0.52, power: 0.52, steps: max(3, steps))
         case .slab:
-            return taper(depth: n, half: half, tip: 0.80, power: 0.62, steps: max(2, steps))
+            // The flattest end in the vocabulary, and it has to be: everything
+            // that wears one — a rack railcar, a funicular car, the Stadler
+            // sets on the Rigi — has a *wall* at the front with a windscreen in
+            // it and the corners rounded off. Drawn at 0.80 over a third of the
+            // body's width it still came out as a curve, because the width is
+            // exaggerated on the map and the depth grew with it: at the zoom
+            // the models appear at, a third of a drawn width is two metres of
+            // taper on a vehicle whose real front is a single sheet of glass.
+            // Shallower and blunter, and it reads as the wall it is.
+            return taper(depth: n, half: half, tip: 0.88, power: 0.45, steps: max(2, steps))
         case .tramFront:
             return taper(depth: n, half: half, tip: 0.74, power: 0.55, steps: max(2, steps))
         case .busFront:
@@ -1325,6 +1343,50 @@ public enum VehicleShape {
         let tail = end(back, length: length, width: width, steps: steps)
             .map { (x: -$0.x, y: $0.y) }.reversed()
         return head + Array(tail)
+    }
+
+    /// How deep the painted cap on one end of a body is, in metres.
+    ///
+    /// The moulding around a windscreen and the hand of body behind it, which
+    /// is what a company that paints its ends paints. Measured off the nose it
+    /// is drawn on, so an upright rack front gets a shallow cap and a raked cab
+    /// a deeper one — and floored, because a slab front is barely a metre deep
+    /// in plan and the paint on the real vehicle carries on past it.
+    static func capDepth(
+        of profile: EndProfile, length: Double, width: Double
+    ) -> Double {
+        guard hasScreen(profile) else { return 0 }
+        let nose = depth(of: profile, length: length, width: width)
+        return min(max(nose, width * 0.55), length * 0.32)
+    }
+
+    /// One side of a body outline, cut off at a station along its length.
+    ///
+    /// Sutherland–Hodgman against a single vertical line, which is all that is
+    /// needed here and is exact: every outline in this file is convex — two
+    /// tapers with straight sides between them — so one pass either keeps a
+    /// piece or returns nothing, and there is no case where a clip has to come
+    /// back as two rings.
+    static func clipped(
+        _ ring: [(x: Double, y: Double)], at station: Double, keepingAhead: Bool
+    ) -> [(x: Double, y: Double)] {
+        guard ring.count >= 3 else { return [] }
+        func inside(_ point: (x: Double, y: Double)) -> Bool {
+            keepingAhead ? point.x >= station : point.x <= station
+        }
+        var out: [(x: Double, y: Double)] = []
+        out.reserveCapacity(ring.count + 2)
+        for (index, current) in ring.enumerated() {
+            let previous = ring[(index + ring.count - 1) % ring.count]
+            if inside(current) != inside(previous) {
+                // The two are on opposite sides, so they cannot share an `x`
+                // and the division is safe.
+                let t = (station - previous.x) / (current.x - previous.x)
+                out.append((x: station, y: previous.y + (current.y - previous.y) * t))
+            }
+            if inside(current) { out.append(current) }
+        }
+        return out.count >= 3 ? out : []
     }
 
     // MARK: - What is painted on it
@@ -1399,6 +1461,32 @@ public enum VehicleShape {
                 ),
                 fill: unit.band == .dining ? diningRoofColour : roofColour(of: unit, livery: livery)
             ))
+        }
+
+        // The ends, where the company paints them differently from the sides.
+        //
+        // Filed as a marking rather than as a body, and that is not a label
+        // quibble: the app counts `.body` parts to know how many wagons a
+        // footprint has and matches them to the placements one for one — see
+        // `VehicleModels` — so a second body-coloured polygon on the same
+        // wagon would put every lift and every opacity after it on the wrong
+        // vehicle. It is paint on a body that has already been drawn.
+        if livery.ends != livery.body {
+            let body = outline(
+                length: length, width: width, front: ends.front, back: ends.back
+            )
+            for front in [true, false] {
+                let end = front ? ends.front : ends.back
+                let cap = capDepth(of: end, length: length, width: width)
+                guard cap > 0, length > cap * 2.4 else { continue }
+                let ring = clipped(
+                    body, at: front ? length - cap : cap, keepingAhead: front
+                )
+                guard ring.count >= 3 else { continue }
+                out.append(FootprintPart(
+                    role: .stripe, ring: frame.project(ring), fill: livery.ends
+                ))
+            }
         }
 
         // The windscreen, on whichever ends have one.

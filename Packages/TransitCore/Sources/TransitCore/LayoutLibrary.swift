@@ -139,10 +139,10 @@ public enum LayoutLibrary {
         //
         // Rigi Bahnen. Deep red bodies under a *cream roof* that is most of
         // what one sees from above and from a hillside — the open-sided
-        // trailers are more roof than body. The two lines up the mountain are
-        // painted differently from each other (Vitznau red, Arth-Rigi blue and
-        // white) and the register files both under `RB`, so the red is the one
-        // that is right more often.
+        // trailers are more roof than body. This is the Arth-Goldau line's
+        // stock and the works trains; Vitznau's Stadler sets are cream with
+        // olive ends and are painted in `stockLivery`, which is the only place
+        // that knows which of the mountain's two railways a working is on.
         "RB": Livery(body: "#a01c22", roof: "#e6e1d2", trim: "#efe9d8", glass: "#2b3440", stroke: "#5e0f13"),
         // The Pilatus railway: the steepest in the world, and a deep crimson.
         "PB": Livery(body: "#b01329", roof: "#8d9298", trim: "#f2f2f2", glass: "#2b3440", stroke: "#66091a"),
@@ -275,7 +275,35 @@ public enum LayoutLibrary {
     /// trains are both white with grey and a red flash, so painting them from
     /// the operator's tin put two solid red worms across Lausanne that look
     /// nothing like the things they stand for.
-    static func stockLivery(mode: Mode, line: String?, operatorName: String?, base: Livery) -> Livery {
+    static func stockLivery(
+        mode: Mode, line: String?, operatorName: String?, category: String? = nil,
+        base: Livery
+    ) -> Livery {
+        // The Rigi's Vitznau line, for the same reason and a stronger one: the
+        // register files both of the mountain's railways under `RB`, and since
+        // 2021 the two are not the same colour. The Stadler sets on 82 are a
+        // cream train with a dark window band and *olive* driving ends — the
+        // one livery in the country whose ends are the first thing anybody
+        // names — and painted from the company's tin they came out as the deep
+        // red of the cars they replaced.
+        // The GoldenPass Express, which is a dark blue train and is drawn from
+        // two companies' tins depending on where it is: BLS pulls it from
+        // Interlaken to Zweisimmen and MOB pushes it on to Montreux, so read
+        // from the operator it was green for half its run and mid-blue for the
+        // other half, and it is neither. The train is painted, not the fleet.
+        if normalise(line) == "GPX" || normalise(category) == "GPX" {
+            return Livery(
+                body: "#16304e", roof: "#8f959c", trim: "#c8a75a",
+                glass: "#22303f", stroke: "#0a1c2f", belt: "#c8a75a"
+            )
+        }
+        if operatorName?.uppercased() == "RB", normalise(line) == "82" {
+            return Livery(
+                body: "#e3dbc6", roof: "#b6b9bd", trim: "#3b4046",
+                glass: "#2b3440", stroke: "#6f6a58",
+                belt: "#3b4046", ends: "#63644d"
+            )
+        }
         guard operatorName?.uppercased() == "TL", mode == .metro else { return base }
         return Livery(
             body: "#eef1f4", roof: "#9198a1", trim: "#e30613",
@@ -517,8 +545,50 @@ public enum LayoutLibrary {
             return units
         }
 
+        /// The GoldenPass Express, which is neither of the trains beside it.
+        ///
+        /// A `narrowRake` with a locomotive at the head and plain ends was
+        /// wrong about the two things anybody recognises it by. It is worked
+        /// *push-pull from a panoramic control car* — an `Ast 181` at one end,
+        /// the locomotive and an interface car at the other, so the shape at
+        /// the front is a driving car with a raked screen and not a machine —
+        /// and its coaches are dark blue, which no other train in the country
+        /// is. See `stockLivery`, which paints it whichever company's
+        /// locomotive happens to be on the back that day.
+        ///
+        /// The interface car earns its place: the couplers at the two ends of
+        /// this train are not the same, because the train is not on the same
+        /// gauge at the two ends of its journey, and the `Bsi` is what stands
+        /// between the automatic coupler of the rake and the buffers of a BLS
+        /// locomotive.
+        public static func goldenPassExpress(
+            coaches: Int = 5, coachLength: Double = 18.8, width: Double = 2.70
+        ) -> [VehicleUnit] {
+            var units: [VehicleUnit] = [VehicleUnit(
+                kind: .drivingCar, length: coachLength, width: width,
+                cabFront: true, band: .first, doors: 2,
+                // A slight one. The control car's front is a raked screen with
+                // the corners drawn in — a moulding rather than a point, and
+                // nothing like the flat wall on the end of a coach.
+                nose: .bulb, silhouette: .panoramaCoach
+            )]
+            for index in 0..<max(1, coaches) {
+                units.append(VehicleUnit(
+                    kind: .coach, length: coachLength, width: width,
+                    band: index == 0 ? .first : .second, doors: 2,
+                    silhouette: .panoramaCoach
+                ))
+            }
+            units.append(VehicleUnit(
+                kind: .locomotive, length: 16.6, width: width,
+                cabFront: true, cabBack: true, pantographs: 2,
+                band: .none, doors: 0, silhouette: .electricLoco
+            ))
+            return units
+        }
+
         /// A rack railway train: a railcar, and the trailers it pushes up the
-        /// hill in front of it.
+        /// hill in front of it.""
         ///
         /// The shape the map was most obviously wrong about, and it was wrong
         /// twice over. A Rigi, Pilatus, Jungfrau or Gornergrat working arrives
@@ -556,6 +626,40 @@ public enum LayoutLibrary {
                 silhouette: .rackTrainCar
             ))
             return units
+        }
+
+        /// A modern articulated rack unit: one vehicle in two sections.
+        ///
+        /// Not a railcar pushing a trailer, which is what every other cog
+        /// railway in the country runs and what this one ran until 2021. Six
+        /// Stadler sets have worked Vitznau–Rigi Kulm since then, and they are
+        /// a different vehicle in every way a top view can see: 34.8 m over the
+        /// couplers rather than 31, one body rather than two with a gap in it,
+        /// a cab at each end rather than a cab and a driving trailer, and a
+        /// centre joint with a bellows in it where the coupler used to be.
+        ///
+        /// The joint is the part worth being careful about. Two sections over
+        /// an articulation are continuous — no gap, no chamfer, no second
+        /// windscreen — so the ends of the *unit* are the only two ends there
+        /// are, which is exactly what `.bellows` says.
+        public static func rackUnit(
+            length: Double = 34.8, width: Double = 2.70
+        ) -> [VehicleUnit] {
+            let section = length / 2
+            return [
+                VehicleUnit(
+                    kind: .drivingCar, length: section, width: width,
+                    cabFront: true, pantographs: 1,
+                    band: .none, doors: 2, joint: .none,
+                    silhouette: .rackUnit
+                ),
+                VehicleUnit(
+                    kind: .drivingCar, length: section, width: width,
+                    cabBack: true,
+                    band: .none, doors: 2, joint: .bellows,
+                    silhouette: .rackUnit
+                ),
+            ]
         }
 
         /// A gondola, an aerial tramway cabin, or a chair on a lift.
@@ -664,7 +768,16 @@ public enum LayoutLibrary {
         case "FLIRT":   return (Stock.multipleUnit(cars: 4, carLength: 18.6, doors: 2), "RABe 523 FLIRT")
         case "FLIRT6":  return (Stock.multipleUnit(cars: 6, carLength: 17.6, doors: 2), "RABe 523 FLIRT, 6 cars")
         case "TRAVERSO": return (Stock.multipleUnit(cars: 4, carLength: 18.6, dining: true, silhouette: .lowFloorUnit), "RABe 526 Traverso")
-        case "NINA":    return (Stock.multipleUnit(cars: 3, carLength: 20.0, doors: 2), "RABe 525 NINA")
+        // The NINA, at the length it is: a three-car unit is 47.7 m over the
+        // couplers, not the sixty metres three intercity-ish bodies came to.
+        case "NINA":    return (Stock.multipleUnit(cars: 3, carLength: 15.9, width: 3.03, doors: 2), "RABe 525 NINA")
+        // The Lötschberger — a NINA with a longer body count and a front BLS
+        // had redesigned. Four sections over 62.7 m, three metres wide, and
+        // nearly flat at the ends where every other Stadler product in the
+        // country carries a deep moulded nose. See `WagonCatalogue.nose`, which
+        // says the same thing from the class name, so a fetched formation and
+        // this guess draw the same vehicle.
+        case "LOETSCHBERGER": return (Stock.multipleUnit(cars: 4, carLength: 15.7, width: 3.03, doors: 2, nose: .blunt), "RABe 535 Lötschberger")
         case "GTW":     return (Stock.gtw(), "RABe 526 GTW")
         case "DOMINO":  return (Stock.pushPull(coaches: 3, coachLength: 25.0, firstClassAtRear: false, coach: .suburbanUnit, locomotive: .suburbanUnit), "RBDe 560 Domino")
         case "ICE":     return (Stock.powerCarSet(coaches: 12, coachLength: 26.4, powerCar: 20.6), "ICE 1")
@@ -679,6 +792,7 @@ public enum LayoutLibrary {
         case "CAPRICORN": return (Stock.multipleUnit(cars: 4, carLength: 19.0, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "RhB ABe 4/16 Capricorn")
         case "RHBRAKE": return (Stock.narrowRake(coaches: 6, coachLength: 16.4, panorama: true), "RhB Ge 4/4 + panorama coaches")
         case "GOLDENPASS": return (Stock.narrowRake(coaches: 5, coachLength: 15.0, panorama: true), "MOB panoramic")
+        case "GPX": return (Stock.goldenPassExpress(), "GoldenPass Express")
         case "ADLER":   return (Stock.multipleUnit(cars: 4, carLength: 17.5, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "zb ABeh 150 ADLER")
         case "KOMET":   return (Stock.multipleUnit(cars: 3, carLength: 17.4, width: VehicleUnit.metreGaugeWidth, silhouette: .narrowGaugeUnit), "MGB ABDeh 4/8 Komet")
         // The catch-all for a metre-gauge company with no entry of its own,
@@ -708,8 +822,14 @@ public enum LayoutLibrary {
         "IR26": "IC2000", "IR27": "IC2000", "IR35": "KISS", "IR36": "KISS",
         "IR37": "DOSTO4", "IR46": "DOSTO4", "IR65": "EWIV", "IR66": "EWIV",
         "IR70": "DOSTO4", "IR75": "DOSTO4", "IR90": "ICN", "IR95": "EWIV",
+        // Regional, where the line runs something its operator's usual stock is
+        // not. `R12` is Spiez–Frutigen, on the north ramp of the Lötschberg,
+        // and it is worked by the Lötschberger the ramp is named after — not by
+        // the double-deck MUTZ that BLS runs on the Bern S-Bahn.
+        "R12": "LOETSCHBERGER",
         // Named trains.
         "GEX": "RHBRAKE", "BEX": "GOLDENPASS", "PE": "TRAVERSO", "VAE": "TRAVERSO",
+        "GPX": "GPX",
     ]
 
     /// Category → class, for everything the line table does not name.
@@ -720,6 +840,7 @@ public enum LayoutLibrary {
         "ICE": "ICE4", "TGV": "TGV", "RJ": "RJX", "RJX": "RJX",
         "EC": "ETR610", "EN": "NIGHTJET", "NJ": "NIGHTJET", "CNL": "NIGHTJET",
         "PE": "TRAVERSO", "GEX": "RHBRAKE", "BEX": "GOLDENPASS", "VAE": "TRAVERSO",
+        "GPX": "GPX",
         "RHB": "ALLEGRA", "D": "EWIV", "EXT": "EWIV",
     ]
 
@@ -813,7 +934,7 @@ public enum LayoutLibrary {
             // recognisable vehicles and one that is wrong about all of them.
             switch normalise(category) {
             case "CC":
-                return cogRailway(code)
+                return cogRailway(code, line: line)
             case "GB", "SL":
                 // A gondola cabin seats six or eight and is a shade over two
                 // metres long; a chair on a lift is smaller still. Both hang.
@@ -862,11 +983,26 @@ public enum LayoutLibrary {
     /// Jungfrau and Wengernalp cars are metre-gauge and nearly as long as a
     /// tram module. Drawn at one size they would all be the Jungfrau, which on
     /// the Pilatus is a vehicle three times too big for the mountain.
-    static func cogRailway(_ code: String) -> ([VehicleUnit], String) {
+    static func cogRailway(_ code: String, line: String?) -> ([VehicleUnit], String) {
         switch code {
         // Rigi Bahnen: standard gauge — the only rack railway in the country
-        // that is — and the trailers behind the railcar are open at the sides.
+        // that is — and the two lines up the mountain no longer run the same
+        // vehicle as each other.
+        //
+        // **82 is Vitznau–Rigi Kulm**, and since 2021 it is worked by six
+        // Stadler articulated sets: one 34.8 m vehicle in two sections, cream
+        // with olive ends. Nothing about the old picture survives — not the
+        // length, not the number of bodies, not the gap in the middle, and
+        // certainly not the red.
+        //
+        // **81 is Arth-Goldau–Rigi Kulm**, which still runs the BDhe 4/4 and
+        // its open-sided trailer and has four of the same Stadler sets on order
+        // for 2030. Until they arrive the old drawing is the right one, which
+        // is why this is keyed on the line and not on the company.
         case "RB":
+            if normalise(line) == "82" {
+                return (Stock.rackUnit(), "Rigi Stadler")
+            }
             return (
                 Stock.rackTrain(
                     railcar: 16.6, trailers: 1, trailerLength: 14.4,
@@ -925,7 +1061,7 @@ public enum LayoutLibrary {
         modeColour: String, variant: Int = 0
     ) -> VehicleLayout {
         let paint = stockLivery(
-            mode: mode, line: line, operatorName: operatorName,
+            mode: mode, line: line, operatorName: operatorName, category: category,
             base: livery(
                 operatorName: operatorName, mode: mode,
                 modeColour: modeColour, variant: variant

@@ -343,6 +343,24 @@ public struct Livery: Sendable, Codable, Hashable {
     public var glass: String
     /// The outline. Dark against a dark basemap reads better than black.
     public var stroke: String
+    /// The two ends, where the company paints them differently from the sides.
+    ///
+    /// Rarer than a belt and, on the fleets that have it, the first thing
+    /// anybody names. The Stadler rack units on the Rigi are a cream train with
+    /// *olive* driving ends — a photograph of one is a pale body between two
+    /// dark caps, and painted in one colour it is a cream box and could be
+    /// anybody's. A Wengernalp car's yellow front is the same fact.
+    ///
+    /// Only where somebody drives from, which is what makes it an end rather
+    /// than a stripe: it is the moulding around the windscreen and the metre or
+    /// two of body behind it, so a gangway or the flat end of an intermediate
+    /// coach never wears it. See `VehicleShape.mesh`, which cuts the cap off
+    /// each end that has a screen in it and paints only that.
+    ///
+    /// Defaults to the body, so nothing acquires ends it does not have.
+    var endsOverride: String?
+    public var ends: String { endsOverride ?? body }
+
     /// The colour of the vehicles that pull, where the company paints them
     /// differently from the ones that are pulled.
     ///
@@ -358,7 +376,7 @@ public struct Livery: Sendable, Codable, Hashable {
 
     public init(
         body: String, roof: String, trim: String, glass: String, stroke: String,
-        powered: String? = nil, belt: String? = nil
+        powered: String? = nil, belt: String? = nil, ends: String? = nil
     ) {
         self.body = body
         self.roof = roof
@@ -367,6 +385,7 @@ public struct Livery: Sendable, Codable, Hashable {
         self.stroke = stroke
         self.poweredOverride = powered
         self.beltOverride = belt
+        self.endsOverride = ends
     }
 }
 

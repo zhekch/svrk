@@ -240,6 +240,9 @@ extension VehicleShape {
         /// The band above the windows, which on most Swiss stock is not the
         /// body colour. See `Livery.belt`.
         case belt
+        /// The cap on a driving end, where the company paints it differently
+        /// from the sides. See `Livery.ends`.
+        case ends
         case glass
         case roof
         case underframe
@@ -625,14 +628,62 @@ extension VehicleShape {
             )
         }
 
+        // How much of each end is painted the end colour, where the company
+        // paints its ends at all. Zero on everything else, which is nearly
+        // every fleet in the country — and zero is what turns all of this off.
+        //
+        // Cut out of the body rather than laid over it. A cap drawn on top of
+        // the level it covers is two lids at one height fighting for the same
+        // pixels; a cap the body has been shortened to make room for is two
+        // solids meeting at a seam nobody can see, because the only face they
+        // share is inside the vehicle.
+        let painted = layout.livery.ends != layout.livery.body
+        let caps = (
+            front: painted ? capDepth(of: ends.front, length: unit.length, width: width) : 0,
+            back: painted ? capDepth(of: ends.back, length: unit.length, width: width) : 0
+        )
+        /// The body's own outline before anything was cut out of it, for the
+        /// lamps, which are set into the nose and have to know where it is.
+        var wholeBody: [MeshPoint]?
         for level in stack.levels {
-            let ring = local(plan(level, unit: unit, ends: ends, width: width, steps: steps))
+            let ring = plan(level, unit: unit, ends: ends, width: width, steps: steps)
             guard ring.count >= 3 else { continue }
-            out.append(LocalSlab(
-                role: level.role, rings: [ring],
-                base: level.base * heightScale, top: level.top * heightScale,
-                fill: colour(level.fill, of: unit, in: layout)
-            ))
+            if wholeBody == nil, level.role == .body { wholeBody = local(ring) }
+            let base = level.base * heightScale
+            let top = level.top * heightScale
+            func slab(_ outline: [(x: Double, y: Double)], _ fill: String) {
+                guard outline.count >= 3 else { return }
+                out.append(LocalSlab(
+                    role: level.role, rings: [local(outline)],
+                    base: base, top: top, fill: fill
+                ))
+            }
+            // The levels wearing the company's colours, and only those: a
+            // window band stays glass through the cap and a roof stays grey
+            // over it, which is what the real vehicle does.
+            let wearsPaint = level.fill == .livery || level.fill == .belt
+            // Measured off this level's own outline rather than off the body's,
+            // because a level high up the vehicle has already given its nose
+            // away to the rake and its tip is nowhere near the body's.
+            let from = ring.map(\.x).min() ?? 0
+            let to = ring.map(\.x).max() ?? 0
+            guard wearsPaint, caps.front + caps.back > 0,
+                  to - from > (caps.front + caps.back) * 1.5
+            else {
+                slab(ring, colour(level.fill, of: unit, in: layout))
+                continue
+            }
+            let cap = colour(.ends, of: unit, in: layout)
+            var middle = ring
+            if caps.back > 0 {
+                slab(clipped(ring, at: from + caps.back, keepingAhead: false), cap)
+                middle = clipped(middle, at: from + caps.back, keepingAhead: true)
+            }
+            if caps.front > 0 {
+                slab(clipped(ring, at: to - caps.front, keepingAhead: true), cap)
+                middle = clipped(middle, at: to - caps.front, keepingAhead: false)
+            }
+            slab(middle, colour(level.fill, of: unit, in: layout))
         }
         // The lamps, set into the two ends, and part of the wagon rather than
         // beside it.
@@ -689,8 +740,14 @@ extension VehicleShape {
         // tail lamps, and the halo the flat drawing paints over each one is
         // placed off the ground rather than off the mesh — so a lit cabin would
         // have had its lamps eight metres below itself.
+        //
+        // Off the *whole* body's outline, which is why it was kept above. A
+        // vehicle with painted ends has had its body cut into a cap, a middle
+        // and a cap, and the first of those the list holds is the one at the
+        // tail — so a headlamp placed on "the first body slab" would have been
+        // set into the back of the train, a metre and a half from the coupler.
         if unit.silhouette.hover == 0, lamps.head || lamps.tail,
-           let body = out.first(where: { $0.role == .body }) ?? out.first {
+           let body = wholeBody ?? out.first?.rings.first {
             let z = stack.lampHeight * heightScale
             for front in [true, false] where front ? lamps.head : lamps.tail {
                 guard let lamp = lampPair(
@@ -920,10 +977,9 @@ extension VehicleShape {
     }
 
     static func lampPair(
-        on body: LocalSlab, front: Bool, half: Double, height: Double
+        on ring: [MeshPoint], front: Bool, half: Double, height: Double
     ) -> LocalSlab? {
-        guard let ring = body.rings.first,
-              let anchor = lampAnchor(on: ring, front: front, half: half)
+        guard let anchor = lampAnchor(on: ring, front: front, half: half)
         else { return nil }
         let across = anchor.across
         let reach = lampReach, wide = lampWide, tall = lampTall
@@ -1049,6 +1105,10 @@ extension VehicleShape {
             return unit.closed || unit.band == .dining
                 ? colour(of: unit, in: layout)
                 : layout.livery.belt
+        // Off the livery rather than off the unit. A closed van takes its own
+        // colour from `colour(of:in:)` above, and this level is only ever cut
+        // for a vehicle whose livery says its ends are painted at all.
+        case .ends: return layout.livery.ends
         case .glass: return glazing(layout.livery)
         case .roof:
             return unit.band == .dining ? diningRoofColour : roofColour(of: unit, livery: layout.livery)
