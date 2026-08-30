@@ -10,7 +10,8 @@ import TransitCore
 struct FeedActivity: Equatable {
     var progress = RefreshProgress()
     var status = FleetStatus.empty
-    /// Nil on the manual cadence, where a refresh taking longer than the
+    var dataMode: TransitDataMode = .all
+    /// Nil while live data is Off, where a refresh taking longer than the
     /// interval is not a thing that can happen.
     var interval: TimeInterval?
     /// What failed to load out of the bundle at launch. Collected since the
@@ -22,20 +23,21 @@ struct FeedActivity: Equatable {
     init(
         progress: RefreshProgress = RefreshProgress(),
         status: FleetStatus = .empty,
+        dataMode: TransitDataMode = .all,
         interval: TimeInterval? = nil,
         problems: [String] = [],
         limits: OTDClient.Limits? = nil
     ) {
         self.progress = progress
         self.status = status
+        self.dataMode = dataMode
         self.interval = interval
         self.problems = problems
         self.limits = limits
     }
 
-    /// A refresh that takes longer than the gap between refreshes means the app
-    /// is downloading continuously — and that the cadence chosen in Settings is
-    /// not the cadence being kept.
+    /// A refresh that takes longer than the fixed gap between refreshes means
+    /// the app is downloading continuously.
     var overrunsCadence: Bool {
         guard let interval, status.refreshSeconds > 0 else { return false }
         return status.refreshSeconds > interval
@@ -98,6 +100,8 @@ struct VehicleLegend: View {
 
             Divider()
 
+            Label("Live data off", systemImage: "circle.fill")
+                .foregroundStyle(.gray)
             Label("Live data available", systemImage: "circle.fill")
                 .foregroundStyle(.green)
             Label("Refreshing live data", systemImage: "circle.fill")
@@ -127,7 +131,7 @@ private struct FeedActivityReadout: View {
         VStack(alignment: .leading, spacing: 10) {
             headline
 
-            if activity.progress.isRunning { running }
+            if activity.dataMode != .off, activity.progress.isRunning { running }
 
             VStack(alignment: .leading, spacing: 4) {
                 row("Fleet", fleet)
@@ -155,7 +159,7 @@ private struct FeedActivityReadout: View {
     private var headline: some View {
         HStack(spacing: 7) {
             Circle().fill(tint).frame(width: 7, height: 7)
-            Text(activity.progress.phase.label)
+            Text(activity.dataMode == .off ? "Live data off" : activity.progress.phase.label)
                 .font(.subheadline.weight(.semibold))
             Spacer(minLength: 0)
             if let elapsed = activity.progress.elapsed, activity.progress.isRunning {
@@ -243,6 +247,7 @@ private struct FeedActivityReadout: View {
     }
 
     private var tint: Color {
+        if activity.dataMode == .off { return .gray }
         switch activity.progress.phase {
         case .failed: return .red
         case .idle: return activity.status.journeys > 0 ? .green : .red
@@ -252,6 +257,7 @@ private struct FeedActivityReadout: View {
 
     /// What the platform says is left, in its own words.
     private var budget: String? {
+        guard activity.dataMode != .off else { return nil }
         guard let limits = activity.limits else { return nil }
         var parts: [String] = []
         if let remaining = limits.remaining, let limit = limits.limit {
@@ -265,22 +271,24 @@ private struct FeedActivityReadout: View {
 
     private var warnings: [String] {
         var found: [String] = []
-        if case let .failed(reason) = activity.progress.phase {
-            found.append(reason)
-            // A 429 says only that something was refused. Which limit, and how
-            // long it lasts, are two different answers — a minute, or until
-            // midnight — and the difference decides whether waiting is worth it.
-            if reason.contains("429") || reason.contains("quota") {
-                found.append(refusalAdvice)
+        if activity.dataMode != .off {
+            if case let .failed(reason) = activity.progress.phase {
+                found.append(reason)
+                // A 429 says only that something was refused. Which limit, and how
+                // long it lasts, are two different answers — a minute, or until
+                // midnight — and the difference decides whether waiting is worth it.
+                if reason.contains("429") || reason.contains("quota") {
+                    found.append(refusalAdvice)
+                }
+            } else if let error = activity.status.lastError {
+                found.append(error)
             }
-        } else if let error = activity.status.lastError {
-            found.append(error)
-        }
-        if activity.overrunsCadence, let interval = activity.interval {
-            found.append("""
-            A refresh takes longer than the \(Int(interval / 60))-minute cadence, \
-            so the app is downloading almost continuously.
-            """)
+            if activity.overrunsCadence, let interval = activity.interval {
+                found.append("""
+                A refresh takes longer than the \(Int(interval / 60))-minute cadence, \
+                so the app is downloading almost continuously.
+                """)
+            }
         }
         found.append(contentsOf: activity.problems.map { "Did not load — \($0)" })
         return found
@@ -341,4 +349,3 @@ private struct FeedActivityReadout: View {
     .padding()
     .preferredColorScheme(.dark)
 }
-

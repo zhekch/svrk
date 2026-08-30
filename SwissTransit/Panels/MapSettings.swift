@@ -95,7 +95,8 @@ struct MapSettingsSheet: View {
                         get: { model.solidVehicles },
                         set: { model.solidVehicles = $0 }
                     ))
-                    if model.solidVehicles {
+                    .disabled(!model.detailedVehicles)
+                    if model.detailedVehicles, model.solidVehicles {
                         Toggle("Tunnels", isOn: Binding(
                             get: { model.ghostTunnels },
                             set: { model.ghostTunnels = $0 }

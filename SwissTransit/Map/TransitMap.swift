@@ -1020,7 +1020,7 @@ final class MapCoordinator: NSObject {
             bakedModels: model.bakedModels,
             showingSolids: showingSolids,
             lampsLit: lampsLit,
-            solidVehicles: model.solidVehicles,
+            solidVehicles: model.detailedVehicles && model.solidVehicles,
             terrain: model.terrain3D,
             ghostTunnels: model.ghostTunnels,
             hitboxes: model.showWagonHitboxes,
@@ -1483,7 +1483,8 @@ final class MapCoordinator: NSObject {
         } else {
             turning = false
         }
-        let awaitingSolidWork = showingSolids && model.solidVehicles
+        let awaitingSolidWork = showingSolids && model.detailedVehicles
+            && model.solidVehicles
             && modelStore.hasPendingWork
         return predicting || catching || turning || awaitingSolidWork || followFadeInProgress
     }
@@ -1892,7 +1893,7 @@ final class MapCoordinator: NSObject {
     private func applySolidity() {
         guard styleReady, let mapView else { return }
         let camera = mapView.mapboxMap.cameraState
-        let wanted = model.solidVehicles
+        let wanted = model.detailedVehicles && model.solidVehicles
             ? VehicleShape.solidity(pitch: camera.pitch, zoom: camera.zoom)
             : 0
         // A hundredth is well under what a frame can show, and the guard is
@@ -3807,7 +3808,7 @@ final class MapCoordinator: NSObject {
         // is a line beside the route overlay's own line and a station is a
         // tenth of a pixel, and every one of them is still a polygon being
         // parsed. See `Cableways.minZoom`.
-        let wanted = model.zoom >= Cableways.minZoom
+        let wanted = model.detailedVehicles && model.zoom >= Cableways.minZoom
             ? model.cableways.merging(Cableway.plan(for: model.vehicles))
             : Cableway.Plan()
         let planChanged = wanted != drawnCableways
@@ -4142,7 +4143,8 @@ final class MapCoordinator: NSObject {
         var resting: [String: VehicleModels.Rest] = [:]
         var wagonLifts: [String: [Double]] = [:]
         var wagonOpacities: [String: [Double]] = [:]
-        if let style = mapView?.mapboxMap, model.solidVehicles {
+        if let style = mapView?.mapboxMap,
+           model.detailedVehicles, model.solidVehicles {
             // One point per wagon, naming a mesh the style already holds. The
             // meshes for anything new on screen are registered here, a few per
             // tick — see `VehicleModelStore.names`.

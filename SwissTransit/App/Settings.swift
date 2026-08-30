@@ -3,7 +3,7 @@ import Foundation
 /// The settings that outlive the app.
 ///
 /// A preference that comes back changed is worse than one that was never
-/// offered: the refresh cadence set to Off and found on again next launch does
+/// offered: live data set to Off and found on again next launch does
 /// not read as a default, it reads as the app forgetting — and the only way to
 /// keep it is to set it again every time. So everything the two settings sheets
 /// offer is written when it changes and read back when the model is built.

@@ -35,53 +35,36 @@ enum LocateMode {
     case bearing
 }
 
-/// How often to reconcile the map against the live national feed.
+/// Which live transit sources the app is allowed to ask.
 ///
-/// This used to be a choice about megabytes. SIRI-ET had no regional filter, so
-/// every refresh returned the whole country — 7.93 MB on the wire inflating to
-/// 64.5 MB of XML — and the setting existed because that is a real cost on a
-/// metered plan, not because anybody wants a slower map.
-///
-/// Two changes took that away. The timetable moved on to the device, so the map
-/// draws with no network at all; and the corrections now come from
-/// GTFS-Realtime, which carries the same national deviations as protobuf —
-/// **1.31 MB on the wire, 4.05 MB decoded** — six times less to fetch and
-/// sixteen times less to walk. So this is now a choice about how soon a
-/// cancellation shows up, and every option is a usable map.
-enum RefreshCadence: String, CaseIterable, Identifiable, Sendable {
-    case live = "Live"
-    case relaxed = "Every 5 min"
-    case manual = "Manual"
-    /// Never fetch the live feed at all.
-    ///
-    /// Worth being a setting rather than a thing you achieve by not pressing
-    /// the button, because it is a coherent way to run the app: the map comes
-    /// from `timetable.bin` and delays come from OJP per journey, and what you
-    /// give up is knowing about cancellations and unscheduled runs anywhere you
-    /// are not looking.
+/// This is one authority for every network producer rather than a refresh
+/// switch beside several requests that ignored it. The on-device timetable is
+/// enough to keep the map useful in every mode.
+enum TransitDataMode: String, CaseIterable, Identifiable, Sendable {
+    /// The national realtime feed, disruptions and engineering works, plus
+    /// proactive OJP timing and formation lookups for vehicles in view.
+    case all = "All"
+    /// Keep GTFS-Realtime current, but ask OJP and the formation service only
+    /// for a vehicle somebody opens.
+    case onDemand = "On demand"
+    /// No live transit-data requests at all.
     case off = "Off"
 
     var id: String { rawValue }
 
-    var seconds: TimeInterval? {
-        switch self {
-        // The feed is cached upstream for thirty seconds and allows two calls a
-        // minute, so a minute is as fresh as it can usefully be.
-        case .live: return 60
-        case .relaxed: return 300
-        case .manual, .off: return nil
-        }
-    }
-
-    /// Whether the feed may be fetched at all, including by hand.
-    var allowsFetching: Bool { self != .off }
+    /// GTFS-Realtime is the one continuous source retained by On demand. Five
+    /// minutes keeps it useful without turning that smaller mode into a hidden
+    /// high-frequency download.
+    var refreshInterval: TimeInterval? { self == .off ? nil : 300 }
 
     var detail: String {
         switch self {
-        case .live: return "Cancellations within a minute. About 79 MB an hour — best on Wi-Fi."
-        case .relaxed: return "About 16 MB an hour. Delays are live on any train you tap either way."
-        case .manual: return "Only when you ask. The timetable draws the map regardless."
-        case .off: return "Timetable and OJP only. Cancellations and extra trains will not show."
+        case .all:
+            return "All live data, including disruptions and engineering works."
+        case .onDemand:
+            return "GTFS Realtime, with OJP and train formations only for vehicles you open."
+        case .off:
+            return "No live transit-data requests. The on-device timetable still draws the map."
         }
     }
 }
@@ -473,7 +456,7 @@ final class AppModel {
             // and they say so by going through `push`.
             if !isNavigating, !history.isEmpty { history.removeAll() }
             if case .vehicle = selection {
-                vehicleFollow = followSelectedVehicle ? .centred : .off
+                vehicleFollow = .centred
             } else {
                 vehicleFollow = .off
             }
@@ -664,93 +647,21 @@ final class AppModel {
         }
     }
 
-    /// Whether a vehicle close enough to be drawn to scale is drawn that way
-    /// rather than left as a dot.
-    ///
-    /// A switch rather than a fact, because it is a real trade: the shape says
-    /// how long the train is and which end the locomotive is on, and the dot is
-    /// easier to pick out of a station throat with thirty of them in it.
-    var showVehicleShapes = Settings.bool("showVehicleShapes", or: true) {
+    /// Whether vehicles may become flat footprints or solid models when the
+    /// map is close enough. Off leaves every mode as a dot and also removes the
+    /// fixed structures and ropes drawn for cableways.
+    var detailedVehicles = Settings.bool("detailedVehicles", or: true) {
         didSet {
-            guard showVehicleShapes != oldValue else { return }
-            Settings.set(showVehicleShapes, "showVehicleShapes")
+            guard detailedVehicles != oldValue else { return }
+            Settings.set(detailedVehicles, "detailedVehicles")
+            if detailedVehicles, started, !backgroundWorkSuspended,
+               powerFactor == 1, dataMode == .all {
+                startLearning()
+            } else if !detailedVehicles {
+                learningTask?.cancel()
+                learningTask = nil
+            }
             requestTick()
-        }
-    }
-
-    /// Whether the map redraws often enough for a vehicle drawn to scale to
-    /// glide rather than step.
-    ///
-    /// A dot moves a metre or two a second and fifteen frames a second was
-    /// generous for it. A two-hundred-metre train at zoom 17 covers seventy
-    /// points in that second, and the eye reads seventy points of jump as a
-    /// stutter however smooth the map itself is. So the frame rate goes up when
-    /// the map is close in — and only then, because the extra frames are only
-    /// worth their power where there is something to see in them.
-    var smoothMotion = Settings.bool("smoothMotion", or: true) {
-        didSet {
-            guard smoothMotion != oldValue else { return }
-            Settings.set(smoothMotion, "smoothMotion")
-        }
-    }
-
-    /// Whether spare formation-service quota is spent learning what the trains
-    /// in view are actually made of.
-    ///
-    /// Off, the map draws from `LayoutLibrary` — what each line normally runs —
-    /// and corrects a train only when somebody taps it. On, the trains on
-    /// screen are asked about a few at a time, so what the map shows converges
-    /// on what is actually running. Small requests, and they stop well short of
-    /// the limit so a tap is never refused; see
-    /// `FormationService.foregroundReserve`.
-    var learnFormations = Settings.bool("learnFormations", or: true) {
-        didSet {
-            guard learnFormations != oldValue else { return }
-            Settings.set(learnFormations, "learnFormations")
-        }
-    }
-
-    /// Whether a tap that landed on several things offers all of them instead
-    /// of picking one.
-    ///
-    /// On, because the ranking it replaces is a guess about intent and this is
-    /// not — see `ChoicePanel`. Off for anyone who would rather have the guess
-    /// and the single tap: a list is a second tap on every ambiguous touch, and
-    /// at platform zoom on a station throat nearly every touch is ambiguous.
-    var askWhenSeveral = Settings.bool("askWhenSeveral", or: true) {
-        didSet {
-            guard askWhenSeveral != oldValue else { return }
-            Settings.set(askWhenSeveral, "askWhenSeveral")
-        }
-    }
-
-    /// Whether vehicles that share one alignment are fanned out across
-    /// plausible parallel tracks.
-    ///
-    /// Nothing in any feed this app reads says which track a train is on
-    /// between stations, so every service matched to the same route relation is
-    /// drawn on the same line — and on the approach to Bern that is six trains
-    /// stacked on one another. Spreading them is a *drawing* decision and it is
-    /// worth being honest about which way it errs: the trains really are on
-    /// parallel tracks, so a fan across track centres is closer to the truth
-    /// than a stack, but which of them is on which track is a guess.
-    var spreadVehicles = Settings.bool("spreadVehicles", or: true) {
-        didSet {
-            guard spreadVehicles != oldValue else { return }
-            Settings.set(spreadVehicles, "spreadVehicles")
-        }
-    }
-
-    /// Whether the camera stays on a vehicle once it has been tapped.
-    ///
-    /// A vehicle that has been opened is a vehicle somebody is watching, and
-    /// watching it used to mean chasing it across the screen with a thumb. The
-    /// first drag of the map turns it off again — following is a convenience,
-    /// not a mode to have to escape from.
-    var followSelectedVehicle = Settings.bool("followSelectedVehicle", or: true) {
-        didSet {
-            guard followSelectedVehicle != oldValue else { return }
-            Settings.set(followSelectedVehicle, "followSelectedVehicle")
         }
     }
 
@@ -883,8 +794,8 @@ final class AppModel {
     /// me what the driver sees" are different requests, and the last one is the
     /// only way a map answers "which side does it leave from" without words.
     ///
-    /// Separate from the `followSelectedVehicle` setting: the setting decides
-    /// where a freshly opened vehicle starts, this is where it has got to.
+    /// A freshly opened vehicle starts centred; this is where the reader has
+    /// moved that camera attachment since.
     enum VehicleFollow: Equatable {
         /// Open, and the camera is wherever it was left.
         case off
@@ -1059,35 +970,14 @@ final class AppModel {
         requestTick()
     }
 
-    // Five minutes rather than every minute. A live refresh is 7 MB each time,
-    // and the map interpolates between calls from the timetable it already has
-    // — so the minute-by-minute poll bought a little accuracy on delay figures
-    // at five times the data.
-    var cadence: RefreshCadence = Settings.choice("cadence", or: .relaxed) {
+    /// One selector governs all live transit requests. In particular, Off also
+    /// cancels foreground OJP/formation work; those requests no longer sit
+    /// outside the setting that claims to turn live data off.
+    var dataMode: TransitDataMode = Settings.choice("dataMode", or: .all) {
         didSet {
-            guard cadence != oldValue else { return }
-            Settings.set(cadence, "cadence")
-            if !cadence.allowsFetching { cancelRefreshOperation() }
-            restartRefreshLoop()
-        }
-    }
-
-    /// Whether to fetch SIRI-SX's planned half — the engineering-works
-    /// catalogue. Off, and remembered.
-    ///
-    /// Measured live: 4.26 MB on the wire, 112 MB of XML, 1,340 situations,
-    /// four times a day. It is the largest recurring download left in the app,
-    /// and what it buys is possessions booked weeks out — which is not what
-    /// either question this app asks a disruption feed is about. The incident
-    /// wire, 30 KB and about today, is unaffected.
-    var includesPlannedWorks: Bool = UserDefaults.standard.bool(forKey: "situations.planned") {
-        didSet {
-            guard includesPlannedWorks != oldValue else { return }
-            UserDefaults.standard.set(includesPlannedWorks, forKey: "situations.planned")
-            Task { [situations] in
-                await situations.setIncludesPlanned(includesPlannedWorks)
-                await refreshDisruptions()
-            }
+            guard dataMode != oldValue else { return }
+            Settings.set(dataMode, "dataMode")
+            applyDataMode()
         }
     }
     var isOnWiFi = true
@@ -1404,7 +1294,9 @@ final class AppModel {
     /// opacity and the flat footprints at what is left of it, so tilting the
     /// map hands one picture over to the other rather than showing both.
     var solidity: Double {
-        solidVehicles ? VehicleShape.solidity(pitch: pitch, zoom: zoom) : 0
+        detailedVehicles && solidVehicles
+            ? VehicleShape.solidity(pitch: pitch, zoom: zoom)
+            : 0
     }
 
     /// Tilt the map by hand.
@@ -1657,7 +1549,10 @@ final class AppModel {
     /// makes the rare one survivable.
     private func keepTimingsLive() {
         liveTimingTask?.cancel()
-        guard !backgroundWorkSuspended else { liveTimingTask = nil; return }
+        guard !backgroundWorkSuspended, dataMode == .all else {
+            liveTimingTask = nil
+            return
+        }
         liveTimingTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -1697,7 +1592,7 @@ final class AppModel {
 
     /// One pass of that sweep. Returns how many runs it actually asked about.
     private func sweepLiveTimings() async -> Int {
-        guard !backgroundWorkSuspended, powerFactor == 1,
+        guard !backgroundWorkSuspended, dataMode == .all, powerFactor == 1,
               await loads.isConfigured else { return 0 }
         let now = Timestamp(clock.nowSeconds())
         let candidates = await fleet.awaitingLiveTiming(in: viewport, at: now)
@@ -1787,7 +1682,7 @@ final class AppModel {
         await situations.configure(token: Secrets.sxToken)
         // Before `keepAnswers`, so a catalogue stored by an earlier session is
         // not read back in when the setting says it is not wanted.
-        await situations.setIncludesPlanned(includesPlannedWorks)
+        await situations.setIncludesPlanned(dataMode == .all)
         let names = await fleet.operatorNamer()
         await situations.nameOperators(with: names)
         await situations.keepAnswers(
@@ -1969,7 +1864,7 @@ final class AppModel {
     private func restartRefreshLoop() {
         refreshTask?.cancel()
         guard !backgroundWorkSuspended else { refreshTask = nil; return }
-        guard let interval = cadence.seconds else { return }
+        guard let interval = dataMode.refreshInterval else { return }
         refreshTask = Task { [weak self] in
             // The stored snapshot has just been replayed, so the first fetch can
             // wait a moment and let the map settle.
@@ -1983,7 +1878,7 @@ final class AppModel {
             // its interval now simply starts the next one when it is done —
             // that is as fast as the app can go, and `refreshSeconds` on the
             // status says so out loud rather than quietly stretching the
-            // cadence the user picked.
+            // five-minute interval the data modes use.
             var next = ContinuousClock.now
             while !Task.isCancelled {
                 await self?.refreshNow()
@@ -2008,7 +1903,10 @@ final class AppModel {
     /// this only has to knock often enough for the shorter of them.
     private func restartSituationLoop() {
         situationTask?.cancel()
-        guard !backgroundWorkSuspended else { situationTask = nil; return }
+        guard !backgroundWorkSuspended, dataMode == .all else {
+            situationTask = nil
+            return
+        }
         situationTask = Task { [weak self] in
             var next = ContinuousClock.now
             while !Task.isCancelled {
@@ -2024,9 +1922,7 @@ final class AppModel {
     }
 
     func refreshNow() async {
-        // `.off` means off, including the button. A setting that the manual
-        // control quietly overrides is not a setting.
-        guard cadence.allowsFetching, !backgroundWorkSuspended else { return }
+        guard dataMode != .off, !backgroundWorkSuspended else { return }
         if let running = refreshOperationTask {
             await running.value
             return
@@ -2128,6 +2024,46 @@ final class AppModel {
         // One last read, so the panel ends on what actually happened rather
         // than on whatever the last quarter-second sample caught.
         progress = fleet.monitor.current
+    }
+
+    /// Apply a live-data choice immediately, including to work already owned
+    /// by the model. Changing to Off is therefore a cancellation boundary, not
+    /// merely a promise that the next timer will do nothing.
+    private func applyDataMode() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        situationTask?.cancel()
+        situationTask = nil
+        liveTimingTask?.cancel()
+        liveTimingTask = nil
+        learningTask?.cancel()
+        learningTask = nil
+
+        if dataMode == .off {
+            cancelRefreshOperation()
+            cancelSelectionWork(clearPresentation: false)
+        }
+
+        guard started, !backgroundWorkSuspended else { return }
+        restartRefreshLoop()
+
+        let applying = dataMode
+        Task { @MainActor [weak self, situations] in
+            await situations.setIncludesPlanned(applying == .all)
+            guard let self, self.dataMode == applying,
+                  !self.backgroundWorkSuspended else { return }
+            if applying == .all {
+                self.restartSituationLoop()
+                if self.powerFactor == 1 {
+                    self.startLearning()
+                    if self.openingFinished { self.keepTimingsLive() }
+                }
+            }
+            if applying != .off, self.selection != .none {
+                self.scheduleSelectionRefresh()
+            }
+            await self.refreshDisruptions()
+        }
     }
 
     /// The learned formations as a file, for handing to whoever wants to keep
@@ -2406,7 +2342,7 @@ final class AppModel {
         // point. Once a second is still finer than the screen can show, and it
         // is fifteen times less work.
         if zoom < Self.stillZoom { return .seconds(1) }
-        guard smoothMotion, showVehicleShapes, zoom >= VehicleShape.minZoom else {
+        guard detailedVehicles, zoom >= VehicleShape.minZoom else {
             return .milliseconds(66)
         }
         return Self.pace(
@@ -2868,7 +2804,7 @@ final class AppModel {
         let box = viewport
         let frameZoom = zoom
         let frameMetresPerPoint = metresPerPoint
-        let canDrawShapes = showVehicleShapes && frameZoom >= VehicleShape.minZoom
+        let canDrawShapes = detailedVehicles && frameZoom >= VehicleShape.minZoom
         let selectedID: String? = {
             if case let .vehicle(id) = selection { return id }
             return nil
@@ -2898,11 +2834,11 @@ final class AppModel {
             hiddenModes: hiddenModes,
             dotSpacing: spacing,
             shapesPossible: canDrawShapes,
-            solidShapes: solidVehicles
+            solidShapes: detailedVehicles && solidVehicles
                 && VehicleShape.solidity(pitch: pitch, zoom: frameZoom) > 0,
             bakedModels: bakedModels,
             standingVehicles: standingVehicles,
-            spreadVehicles: spreadVehicles,
+            spreadVehicles: true,
             pixelsPerPoint: UIScreen.main.nativeScale
         )
     }
@@ -3286,7 +3222,7 @@ final class AppModel {
 
     /// Lay out every vehicle that is big enough on screen to be worth it.
     /// Whether anything on screen could be drawn as a vehicle rather than a dot.
-    var shapesPossible: Bool { showVehicleShapes && zoom >= VehicleShape.minZoom }
+    var shapesPossible: Bool { detailedVehicles && zoom >= VehicleShape.minZoom }
 
     /// How far through the change from dot to drawing each vehicle is.
     ///
@@ -3579,6 +3515,11 @@ final class AppModel {
     /// so it is run on every selection change and every time the notices
     /// themselves are re-read, rather than cached against the selection.
     private func refreshDisruptions() async {
+        guard dataMode == .all else {
+            vehicleDisruptions = []
+            stopDisruptions = []
+            return
+        }
         let now = clock.nowSeconds()
         let expected = selection
         let generation = selectionGeneration
@@ -3683,7 +3624,8 @@ final class AppModel {
         _ request: UInt64, vehicleID: String,
         expected: Selection, generation: UInt64
     ) -> Bool {
-        selectionIsCurrent(expected, generation: generation)
+        dataMode != .off
+            && selectionIsCurrent(expected, generation: generation)
             && request == occupancyRequestGeneration
             && vehicleID == occupancyVehicleID
     }
@@ -3692,7 +3634,8 @@ final class AppModel {
         _ request: UInt64, key: FormationKey,
         expected: Selection, generation: UInt64
     ) -> Bool {
-        selectionIsCurrent(expected, generation: generation)
+        dataMode != .off
+            && selectionIsCurrent(expected, generation: generation)
             && request == formationRequestGeneration
             && key == formationKey
     }
@@ -3701,7 +3644,8 @@ final class AppModel {
         _ request: UInt64, key: FormationKey,
         expected: Selection, generation: UInt64
     ) -> Bool {
-        selectionIsCurrent(expected, generation: generation)
+        dataMode != .off
+            && selectionIsCurrent(expected, generation: generation)
             && request == branchRequestGeneration
             && key == formationKey
     }
@@ -3810,7 +3754,7 @@ final class AppModel {
     private func loadOccupancy(
         of vehicle: VehicleSnapshot?, expected: Selection, generation: UInt64
     ) {
-        guard let vehicle, !vehicle.stops.isEmpty else {
+        guard dataMode != .off, let vehicle, !vehicle.stops.isEmpty else {
             occupancyTask?.cancel(); occupancyTask = nil
             occupancyRequestGeneration &+= 1
             occupancyVehicleID = nil
@@ -3952,7 +3896,8 @@ final class AppModel {
         of vehicle: VehicleSnapshot?, arriving: VehicleSnapshot?,
         expected: Selection, generation: UInt64
     ) {
-        guard let vehicle, vehicle.mode == .train, !vehicle.stops.isEmpty else {
+        guard dataMode != .off, let vehicle, vehicle.mode == .train,
+              !vehicle.stops.isEmpty else {
             clearFormation()
             return
         }
@@ -4116,7 +4061,10 @@ final class AppModel {
     /// guess until the answer arrives and redrawn when it does.
     private func startLearning() {
         learningTask?.cancel()
-        guard !backgroundWorkSuspended else { learningTask = nil; return }
+        guard !backgroundWorkSuspended, dataMode == .all, detailedVehicles else {
+            learningTask = nil
+            return
+        }
         learningTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -4148,7 +4096,8 @@ final class AppModel {
     /// that an S9 is six cars rather than four changes a drawing that is not
     /// being made.
     private func formationsWorthLearning(limit: Int) -> [VehicleSnapshot] {
-        guard learnFormations, isOnline, shapesPossible, !vehicles.isEmpty else { return [] }
+        guard dataMode == .all, detailedVehicles, isOnline,
+              shapesPossible, !vehicles.isEmpty else { return [] }
         let midLon = (viewport.west + viewport.east) / 2
         let midLat = (viewport.south + viewport.north) / 2
 
@@ -4521,7 +4470,7 @@ final class AppModel {
         // matters for a vehicle is *how many vehicles are in reach*, and that
         // is measured against footprints already built for this frame: no
         // timetable, no boards, nothing to wait for.
-        if askWhenSeveral, case .vehicle = best,
+        if case .vehicle = best,
            vehicles.count(where: {
                distance(to: $0, lon: lon, lat: lat, lifted: solidTaps) <= reach
            }) <= 1 {
@@ -4529,7 +4478,7 @@ final class AppModel {
             return
         }
 
-        if askWhenSeveral {
+        do {
             let options = await tapChoices(
                 lon: lon, lat: lat, at: now, reach: reach, plateReach: plateReach,
                 platformShapes: platformShapes, stationShapes: stationShapes,
@@ -4843,6 +4792,7 @@ final class AppModel {
     /// Guarded on the selection still being the same stop: the request takes a
     /// moment, and in that time the user may well have tapped something else.
     private func fillStationFromMirror(placeId: String, at now: Timestamp) async {
+        guard dataMode == .all else { return }
         guard await fleet.fillFromMirror(placeId: placeId, at: now) else { return }
         guard case let .station(current) = selection, current.id == placeId else { return }
         guard let better = await fleet.stationBoard(placeId: placeId, at: now),
@@ -5173,7 +5123,7 @@ final class AppModel {
     /// Refresh the fixed cableway plan only when the held view or service day
     /// changes. Unlike cabins, none of this geometry moves between frames.
     private func refreshCablewaysIfNeeded(at now: Timestamp) async {
-        guard !hiddenModes.contains(.cable) else {
+        guard detailedVehicles, !hiddenModes.contains(.cable) else {
             if !cableways.isEmpty {
                 cableways = Cableway.Plan()
                 cablewaysRevision &+= 1
@@ -5257,7 +5207,7 @@ final class AppModel {
         // than that a train is a dot, a dot has no height, and a dot on a
         // mountain is where the railway is — which is the truth as far as a
         // plan view is concerned.
-        guard solidVehicles, ghostTunnels, trackTunnelBit != 0,
+        guard detailedVehicles, solidVehicles, ghostTunnels, trackTunnelBit != 0,
               zoom >= VehicleShape.solidMinZoom - 0.6
         else {
             if !tunnels.isEmpty { tunnels = []; tunnelRevision += 1; tunnelsViewport = nil }

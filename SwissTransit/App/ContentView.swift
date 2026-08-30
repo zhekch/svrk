@@ -684,6 +684,7 @@ struct StatusPill: View {
     /// Orange is that case — something to draw, but the last attempt to bring
     /// it up to date failed.
     private var statusColor: Color {
+        if model.dataMode == .off { return .gray }
         if model.isRefreshing { return .yellow }
         if case .failed = model.progress.phase { return model.status.journeys > 0 ? .orange : .red }
         return model.status.journeys > 0 ? .green : .red
@@ -733,7 +734,8 @@ extension FeedActivity {
         self.init(
             progress: model.progress,
             status: model.status,
-            interval: model.cadence.seconds,
+            dataMode: model.dataMode,
+            interval: model.dataMode.refreshInterval,
             problems: model.loaded?.problems ?? [],
             limits: model.limits
         )

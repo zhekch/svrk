@@ -175,37 +175,18 @@ struct SettingsSheet: View {
         NavigationStack {
             List {
                 Section {
-                    Picker("Refresh", selection: Binding(
-                        get: { model.cadence },
-                        set: { model.cadence = $0 }
+                    Picker("Data", selection: Binding(
+                        get: { model.dataMode },
+                        set: { model.dataMode = $0 }
                     )) {
-                        ForEach(RefreshCadence.allCases) { Text($0.rawValue).tag($0) }
+                        ForEach(TransitDataMode.allCases) { Text($0.rawValue).tag($0) }
                     }
-                    Button {
-                        Task { await model.refreshNow() }
-                    } label: {
-                        Label(model.isRefreshing ? "Refreshing…" : "Refresh now",
-                              systemImage: "arrow.clockwise")
-                    }
-                    .disabled(model.isRefreshing)
-
-                    Toggle("Engineering works", isOn: Binding(
-                        get: { model.includesPlannedWorks },
-                        set: { model.includesPlannedWorks = $0 }
-                    ))
                 } header: {
                     Text("Live data")
                 } footer: {
-                    Text(model.includesPlannedWorks
-                         ? "Planned possessions add 4.3 MB every six hours — about 17 MB a day."
-                         : "Disruptions happening now are always fetched. "
-                           + "Planned possessions weeks out are not, saving about 17 MB a day.")
+                    Text(model.dataMode.detail)
                 }
 
-                // Three sections where there was one. "Show" had grown to hold
-                // everything that happened to be a toggle: what is drawn, how
-                // it is drawn, and what the app does while you use it. Only the
-                // first of those answers the question the header asks.
                 Section {
                     ForEach(Mode.allCases, id: \.self) { mode in
                         Toggle(isOn: Binding(
@@ -238,32 +219,9 @@ struct SettingsSheet: View {
                 }
 
                 Section {
-                    Toggle("Vehicles to scale", isOn: Binding(
-                        get: { model.showVehicleShapes }, set: { model.showVehicleShapes = $0 }
-                    ))
-                    Toggle("Spread parallel vehicles", isOn: Binding(
-                        get: { model.spreadVehicles }, set: { model.spreadVehicles = $0 }
-                    ))
-                    Toggle("Smooth movement", isOn: Binding(
-                        get: { model.smoothMotion }, set: { model.smoothMotion = $0 }
-                    ))
-                } header: {
-                    Text("How vehicles are drawn")
-                } footer: {
-                    Text("""
-                    To scale, a train is as long as it really is; otherwise \
-                    every vehicle is a dot. Spreading pulls apart the ones \
-                    sharing a track, so the one you meant is the one you tap.
-                    """)
-                }
-
-                Section {
-                    Toggle("Ask when several things are under a tap", isOn: Binding(
-                        get: { model.askWhenSeveral }, set: { model.askWhenSeveral = $0 }
-                    ))
-                    Toggle("Follow the vehicle you open", isOn: Binding(
-                        get: { model.followSelectedVehicle },
-                        set: { model.followSelectedVehicle = $0 }
+                    Toggle("Detailed vehicles", isOn: Binding(
+                        get: { model.detailedVehicles },
+                        set: { model.detailedVehicles = $0 }
                     ))
                     Toggle("Notice the service you are on", isOn: Binding(
                         get: { model.rides.enabled },
@@ -273,13 +231,7 @@ struct SettingsSheet: View {
                     Text("Behaviour")
                 }
 
-                // The toggle that learns them now sits with the count of what
-                // it has learned and the button that hands them over, rather
-                // than a screen away from both under a different header.
                 Section {
-                    Toggle("Learn train formations", isOn: Binding(
-                        get: { model.learnFormations }, set: { model.learnFormations = $0 }
-                    ))
                     LabeledContent("Formations learned") {
                         Text("\(model.layouts.count) trains, \(model.layouts.patternCount) lines")
                             .font(.caption.monospacedDigit())
