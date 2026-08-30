@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Combine
 import MapboxMaps
 import TransitCore
 
@@ -71,6 +72,7 @@ enum Basemap: String, CaseIterable, Identifiable {
 /// drawn.
 struct TransitMap: UIViewRepresentable {
     @Bindable var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
     let basemap: Basemap
 
     func makeCoordinator() -> MapCoordinator { MapCoordinator(model: model) }
@@ -128,13 +130,18 @@ struct TransitMap: UIViewRepresentable {
         // decided per moment rather than once, because a compass spinning a
         // wedge nobody can see is pure loss. See `Coordinator.applyLocationPolicy`.
         mapView.location.options.puckBearing = .heading
-        context.coordinator.attach(to: mapView)
+        context.coordinator.attach(to: mapView, locationActive: scenePhase == .active)
         return mapView
     }
 
     func updateUIView(_ mapView: MapView, context: Context) {
+        context.coordinator.setLocationActive(scenePhase == .active)
         context.coordinator.apply(basemap: basemap)
         context.coordinator.draw()
+    }
+
+    static func dismantleUIView(_ mapView: MapView, coordinator: MapCoordinator) {
+        coordinator.detach(from: mapView)
     }
 }
 
@@ -307,20 +314,22 @@ final class MapCoordinator: NSObject {
         guard let mapView, let paced = pacedInterval else { return }
 
         let wanted: CAFrameRateRange
-        if !cameraSettled {
+        if !locationActive {
+            // The scene is covered or backgrounded. UIKit will normally stop
+            // presenting it entirely; this one-hertz ceiling also closes the
+            // inactive interval before suspension takes effect.
+            wanted = CAFrameRateRange(minimum: 1, maximum: 1, preferred: 1)
+        } else if !cameraSettled {
             wanted = .default
-        } else if model.isFollowingVehicle {
+        } else if model.isFollowingVehicle, followLink?.isPaused == false {
             // The camera is being written by the follow link rather than by the
-            // model, so the map has to keep up with that lane and not this one.
-            wanted = Self.followRange
+            // model, so it may interpolate once between model positions. It is
+            // still bounded by the *effective* model pace: that interval already
+            // carries Low Power Mode, thermal pressure and a covered map, and a
+            // fixed 60 Hz range here used to silently undo all three.
+            wanted = Self.followRange(for: paced)
         } else {
-            let hz = Float(min(120, max(1, (1 / paced.seconds).rounded())))
-            // A range rather than a single number. Naming one rate as minimum,
-            // maximum and preferred says the link cannot be served at anything
-            // else, and on a panel with no exact divisor for it that is a
-            // request iOS has to round *up*. A floor of half the rate leaves it
-            // a divisor it actually has.
-            wanted = CAFrameRateRange(minimum: max(1, hz / 2), maximum: hz, preferred: hz)
+            wanted = Self.pacedRange(for: paced)
         }
 
         guard wanted != renderRange else { return }
@@ -329,7 +338,7 @@ final class MapCoordinator: NSObject {
         followLink?.preferredFrameRateRange = wanted
     }
 
-    /// What the follow lane is held to, which is *not* the model's rate.
+    /// What the follow lane is held to.
     ///
     /// The follow link deliberately runs faster than the model: it carries the
     /// followed vehicle on past the last tick's position — see `followShift` —
@@ -338,11 +347,30 @@ final class MapCoordinator: NSObject {
     /// throw that interpolation away and make following *worse*, which is the
     /// one place in this map worth spending frames on.
     ///
-    /// Sixty rather than the panel's maximum, because the prediction it is
-    /// computing is a straight line: the second sixty frames on a 120 Hz phone
-    /// are drawn from the same velocity as the first sixty and land half a
-    /// millimetre from them. On a 60 Hz phone this changes nothing at all.
-    private static let followRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+    /// Twice the model rate, up to sixty, gives each model position one
+    /// interpolated frame. When the phone has already doubled or quadrupled the
+    /// model interval this naturally becomes thirty or fifteen. A covered map's
+    /// one-second interval is kept at one rather than doubled: there is no second
+    /// visible frame to interpolate while an opaque sheet is over it.
+    private static func followRange(for interval: Duration) -> CAFrameRateRange {
+        let seconds = max(1.0 / 120, interval.seconds)
+        let preferred = Float(seconds >= 0.5
+            ? 1
+            : min(60, max(1, (2 / seconds).rounded())))
+        return CAFrameRateRange(
+            minimum: max(1, preferred / 2), maximum: preferred, preferred: preferred
+        )
+    }
+
+    /// The renderer's ordinary range at the rate the model can provide data.
+    /// A range rather than one mandatory number gives iOS a lower panel divisor
+    /// when the exact preferred rate is unavailable.
+    private static func pacedRange(for interval: Duration) -> CAFrameRateRange {
+        let hz = Float(min(120, max(1, (1 / max(1.0 / 120, interval.seconds)).rounded())))
+        return CAFrameRateRange(
+            minimum: max(1, hz / 2), maximum: hz, preferred: hz
+        )
+    }
 
     /// The camera moved. What that means depends entirely on who moved it.
     ///
@@ -352,10 +380,34 @@ final class MapCoordinator: NSObject {
     /// cap would come off for as long as following lasted and never go back on
     /// — a followed map never goes idle.
     private func cameraMoved() {
-        reportViewport()
-        cameraSettled = model.isFollowingVehicle
+        // A finger keeps the immediate feedback path. The follower, on the
+        // other hand, changes only centre and bearing on every display refresh;
+        // unprojecting the eight-point viewport at that rate feeds no decision
+        // the model can make between its own ticks. Keep its feedback frequent
+        // enough to load ahead while avoiding a renderer round-trip per frame.
+        if gestureCameraActive || !model.isFollowingVehicle {
+            reportViewport()
+        } else {
+            let now = CACurrentMediaTime()
+            if now - followViewportAt >= Self.followViewportInterval {
+                followViewportAt = now
+                reportViewport()
+            } else {
+                // Pitch/solidity and lamp attitude are camera-owned and cheaper
+                // than rebuilding the geographic viewport. Preserve their frame
+                // path even when the bounding-box report is being coalesced.
+                applySolidity()
+            }
+        }
+        cameraSettled = model.isFollowingVehicle && !gestureCameraActive
         setRenderRate()
     }
+
+    private static let followViewportInterval: CFTimeInterval = 0.1
+    private var followViewportAt: CFTimeInterval = 0
+    private var gestureCameraCount = 0
+    private var customTiltActive = false
+    private var gestureCameraActive: Bool { gestureCameraCount > 0 || customTiltActive }
 
     // MARK: - What the phone is asked to work out about itself
 
@@ -365,11 +417,52 @@ final class MapCoordinator: NSObject {
     /// builds its provider with `kCLLocationAccuracyBest` and no distance
     /// filter — a GNSS receiver at full duty cycle and a continuous Wi-Fi scan,
     /// from launch, for the whole session — and this app never asked for that.
-    /// Ten metres is more than enough for both things it does with a fix: draw
-    /// a dot on a map of a country, and match a trail against the fleet, which
+    /// A hundred metres is enough to draw a dot on a map of a country; ten is
+    /// enough once a trail is actually being matched against the fleet, which
     /// discards anything worse than seventy metres before it looks at it. See
     /// `RideWatch.accurateEnough`.
     private let locationProvider = AppleLocationProvider()
+
+    /// Whether the map is attached to an active scene. Replacing the map's
+    /// publisher with an empty one is what actually removes the provider's last
+    /// observer; changing accuracy alone would leave CoreLocation running while
+    /// the app is covered or in the background.
+    private var locationActive = false
+    /// Nil is Mapbox's initial/default model, true is our provider, and false
+    /// is the empty inactive model. The third state matters when a view is
+    /// created while its scene is already inactive: the SDK default must still
+    /// be replaced before anything can subscribe to it.
+    private var locationConnected: Bool?
+
+    /// A coarse fix can still say, independently of its horizontal accuracy,
+    /// that the phone is moving at transit speed. Promote on that raw signal
+    /// before `RideWatch` rejects the point for being wider than its matching
+    /// threshold, otherwise coarse acquisition can never reach the accurate
+    /// mode needed to build a ride trail.
+    private var rawMotionUntil: CFTimeInterval = 0
+    /// A short evidence-quality acquisition around a known stop. Coarse
+    /// location is enough to decide whether a stop is nearby, but not enough
+    /// to distinguish its platforms or establish a stationary cluster.
+    private var nearTransitUntil: CFTimeInterval = 0
+    /// Re-applies the policy when a temporary precision reason expires. Core
+    /// Location may produce no callback while a stationary phone is searching,
+    /// so waiting for the next fix can otherwise leave GNSS at full duty
+    /// indefinitely.
+    private var precisionPolicyTask: Task<Void, Never>?
+    /// The cheap stop-grid probe is asynchronous because Fleet is an actor.
+    /// Only one may be outstanding, and repeated coarse fixes are throttled.
+    private var stationProbeTask: Task<Void, Never>?
+    /// Identifies the probe whose result is still allowed to clear the task
+    /// handle or promote location accuracy. Cancellation alone is not enough:
+    /// Fleet may already be inside synchronous actor work when the scene leaves,
+    /// and that old task can return after a new active-scene probe has begun.
+    private var stationProbeGeneration: UInt64 = 0
+    private var stationProbeAfter: CFTimeInterval = 0
+    private static let rawMotionSampleAge: TimeInterval = 10
+    private static let rawMotionGrace: CFTimeInterval = 20
+    private static let nearTransitGrace: CFTimeInterval = 30
+    private static let stationProbeInterval: CFTimeInterval = 45
+    private static let precisionPolicyPoll: CFTimeInterval = 5
 
     /// Whether the data model currently in place carries a heading publisher,
     /// or nil before one has ever been installed.
@@ -381,30 +474,43 @@ final class MapCoordinator: NSObject {
     /// locate button changes state — which between them cover every way either
     /// answer below can change, at about a second's granularity.
     ///
-    /// The distance filter stays off wherever rides are being matched, and that
-    /// is not an oversight. `RideWatch` reads a *stationary* phone as evidence
-    /// — a train standing at a terminus is still your train, and four minutes
-    /// of not moving is how the claim is finally given up — and a distance
-    /// filter makes a stationary phone produce no fixes at all, which is a
-    /// different state entirely and the one the tunnel hold is for.
+    /// The distance filter stays off once a ride is active, and that is not an
+    /// oversight. `RideWatch` reads a *stationary* phone as evidence — a train
+    /// standing at a terminus is still your train, and four minutes of not
+    /// moving is how the claim is finally given up — and a distance filter
+    /// makes a stationary phone produce no fixes at all, which is a different
+    /// state entirely and the one the tunnel hold is for.
     private func applyLocationPolicy() {
         guard let mapView else { return }
-        // Precise where a fix is being read for its own sake: a trail being
-        // fitted to a journey, or a camera locked to the puck. Otherwise the
-        // fix is only ever a dot on a national map, and a hundred metres with a
-        // filter over it puts that dot in the same place for a fraction of the
-        // power.
-        let precise = model.rides.enabled || model.locateMode != .unfocused
+
+        guard locationActive else {
+            disconnectLocation(from: mapView)
+            return
+        }
+
+        // Precise where a fix is being read for its own sake: a camera locked
+        // to the puck, a trail already moving or fitted to a journey, or the
+        // short acquisition grace opened by a raw speed sample. Merely enabling
+        // ride detection does not hold GNSS at full duty for the whole session.
+        let rides = model.rides
+        let now = CACurrentMediaTime()
+        let recentlyMoving = rides.enabled && now < rawMotionUntil
+        let acquiringNearby = rides.enabled && now < nearTransitUntil
+        let precise = model.locateMode != .unfocused
+            || rides.ride != nil || rides.holding || rides.moving
+            || recentlyMoving || acquiringNearby || nearbyOfferVisible
         let options = AppleLocationProvider.Options(
             distanceFilter: precise ? kCLDistanceFilterNone : 25,
             desiredAccuracy: precise
                 ? kCLLocationAccuracyNearestTenMeters
-                : kCLLocationAccuracyHundredMeters
+                : kCLLocationAccuracyHundredMeters,
+            activityType: .otherNavigation
         )
         if locationProvider.options != options { locationProvider.options = options }
 
         let heading = headingIsVisible
-        guard heading != appliedHeading else { return }
+        guard locationConnected != true || heading != appliedHeading else { return }
+        locationConnected = true
         appliedHeading = heading
         mapView.location.options.puckBearingEnabled = heading
         // **`puckBearingEnabled` alone does not stop the compass.** That flag
@@ -417,6 +523,119 @@ final class MapCoordinator: NSObject {
             location: locationProvider.onLocationUpdate.eraseToAnyPublisher(),
             heading: heading ? locationProvider.onHeadingUpdate.eraseToAnyPublisher() : nil
         )
+    }
+
+    /// Stop both CoreLocation streams without replacing our provider (and its
+    /// cached last fix). `AppleLocationProvider` starts on its first observer
+    /// and stops on its last; the empty model releases those observations.
+    private func disconnectLocation(from mapView: MapView) {
+        guard locationConnected != false else { return }
+        locationConnected = false
+        appliedHeading = nil
+        mapView.location.options.puckBearingEnabled = false
+        mapView.location.dataModel = LocationDataModel(
+            location: Empty<[Location], Never>(completeImmediately: false)
+                .eraseToAnyPublisher()
+        )
+    }
+
+    /// Read before `RideWatch.received`, which deliberately discards a coarse
+    /// point. A stale cached point must not restart high-accuracy tracking when
+    /// a scene reconnects, hence the separate sample-age bound.
+    private func noticeRawMotion(_ location: Location) {
+        guard model.rides.enabled,
+              let speed = location.speed, speed >= RideMatching.movingAt
+        else { return }
+        let age = Date().timeIntervalSince(location.timestamp)
+        guard age >= -1, age <= Self.rawMotionSampleAge else { return }
+        rawMotionUntil = max(rawMotionUntil, CACurrentMediaTime() + Self.rawMotionGrace)
+        schedulePrecisionPolicyCheck()
+    }
+
+    /// Whether a stationary-place answer is still visible. Keep its evidence
+    /// stream precise while it is being shown, then notice a dismissal within
+    /// one short policy poll and step back down.
+    private var nearbyOfferVisible: Bool {
+        guard case .some(.nearby(_)) = model.rides.offering else { return false }
+        return true
+    }
+
+    /// Wake at the end of a temporary high-accuracy reason even if Core
+    /// Location is silent. While a nearby offer is visible the same lightweight
+    /// timer also notices its dismissal, which otherwise has no map callback.
+    private func schedulePrecisionPolicyCheck() {
+        precisionPolicyTask?.cancel()
+        precisionPolicyTask = nil
+        guard locationActive else { return }
+
+        let now = CACurrentMediaTime()
+        let deadline = max(rawMotionUntil, nearTransitUntil)
+        let delay: CFTimeInterval
+        if deadline > now {
+            delay = max(0.1, deadline - now)
+        } else if nearbyOfferVisible {
+            delay = Self.precisionPolicyPoll
+        } else {
+            return
+        }
+
+        precisionPolicyTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self, self.locationActive else { return }
+            self.applyLocationPolicy()
+            self.schedulePrecisionPolicyCheck()
+        }
+    }
+
+    /// A coarse fix near the transit network earns one bounded precise burst.
+    /// This restores stationary platform/station offers without returning to
+    /// the old policy of running full-accuracy GNSS for every open-map minute.
+    private func probeForNearbyTransit(_ location: Location) {
+        let now = CACurrentMediaTime()
+        let rides = model.rides
+        guard locationActive, rides.enabled,
+              model.clock.isLive || rides.ignoresClock,
+              rides.ride == nil, !rides.moving, !rides.holding,
+              !nearbyOfferVisible,
+              now >= stationProbeAfter,
+              now >= max(rawMotionUntil, nearTransitUntil),
+              stationProbeTask == nil
+        else { return }
+
+        let age = Date().timeIntervalSince(location.timestamp)
+        guard age >= -1, age <= Self.rawMotionSampleAge else { return }
+        let accuracy = max(0, location.horizontalAccuracy ?? 150)
+        guard accuracy <= 1_000 else { return }
+
+        stationProbeAfter = now + Self.stationProbeInterval
+        let lon = location.coordinate.longitude
+        let lat = location.coordinate.latitude
+        let radius = min(500, max(250, accuracy + 200))
+        let fleet = model.fleet
+        stationProbeGeneration &+= 1
+        let generation = stationProbeGeneration
+        stationProbeTask = Task { @MainActor [weak self] in
+            let nearby = await fleet.hasStopPlace(near: lon, lat: lat, within: radius)
+            guard let self, self.stationProbeGeneration == generation else { return }
+            self.stationProbeTask = nil
+            guard !Task.isCancelled, self.locationActive, self.model.rides.enabled,
+                  nearby else { return }
+            self.nearTransitUntil = max(
+                self.nearTransitUntil,
+                CACurrentMediaTime() + Self.nearTransitGrace
+            )
+            self.applyLocationPolicy()
+            self.schedulePrecisionPolicyCheck()
+        }
+    }
+
+    /// Invalidate both the task and its identity. A cancelled actor call may
+    /// still return, but it can no longer clear a replacement probe's handle.
+    private func cancelStationProbe(resetThrottle: Bool) {
+        stationProbeGeneration &+= 1
+        stationProbeTask?.cancel()
+        stationProbeTask = nil
+        if resetThrottle { stationProbeAfter = 0 }
     }
 
     /// Whether the cone is somewhere it could be seen.
@@ -443,8 +662,9 @@ final class MapCoordinator: NSObject {
             && point.latitude >= box.south - latRoom && point.latitude <= box.north + latRoom
     }
 
-    func attach(to mapView: MapView) {
+    func attach(to mapView: MapView, locationActive: Bool) {
         self.mapView = mapView
+        self.locationActive = locationActive
         // Before anything subscribes to a location, so the provider that starts
         // is ours rather than the SDK's default one at full accuracy.
         applyLocationPolicy()
@@ -503,6 +723,11 @@ final class MapCoordinator: NSObject {
             // — so the sentinels are turned into absences on the way through
             // and `RideWatch` never has to know about them.
             guard let last = locations.last else { return }
+            // This must precede RideWatch's accuracy filter. A hundred-metre
+            // acquisition fix is not fit evidence, but its speed is enough to
+            // ask the provider for the evidence-quality stream.
+            self?.noticeRawMotion(last)
+            self?.probeForNearbyTransit(last)
             self?.model.rides.received(RideFix(
                 coord: Coord(
                     lon: last.coordinate.longitude, lat: last.coordinate.latitude
@@ -599,6 +824,49 @@ final class MapCoordinator: NSObject {
         mapView.addGestureRecognizer(tap)
     }
 
+    /// Scene activity is supplied by SwiftUI so there is exactly one lifecycle
+    /// authority. Going inactive disconnects the provider immediately; coming
+    /// back reconnects it with whichever accuracy policy is current.
+    func setLocationActive(_ active: Bool) {
+        guard active != locationActive else { return }
+        locationActive = active
+        if active {
+            // A probe interrupted by scene suspension did not answer the
+            // question its 45-second throttle represents. Let the cached recent
+            // fix ask it again immediately; a stale fix is rejected by the age
+            // gate in `probeForNearbyTransit` and the provider's next fix retries.
+            stationProbeAfter = 0
+            schedulePrecisionPolicyCheck()
+            if model.isFollowingVehicle { wakeFollowLink() }
+        } else {
+            precisionPolicyTask?.cancel()
+            precisionPolicyTask = nil
+            cancelStationProbe(resetThrottle: true)
+            pauseFollowLink()
+        }
+        applyLocationPolicy()
+        if active, let location = mapView?.location.latestLocation {
+            probeForNearbyTransit(location)
+        }
+        setRenderRate()
+    }
+
+    /// `UIViewRepresentable` can dismantle without waiting for ARC to collect
+    /// Mapbox. Drop signal subscriptions and the display link explicitly so no
+    /// sensor or refresh producer survives an off-screen map.
+    func detach(from view: MapView) {
+        guard mapView === view else { return }
+        locationActive = false
+        precisionPolicyTask?.cancel()
+        precisionPolicyTask = nil
+        cancelStationProbe(resetThrottle: true)
+        disconnectLocation(from: view)
+        cancellables.removeAll()
+        followLink?.invalidate()
+        followLink = nil
+        mapView = nil
+    }
+
     // MARK: - Following a vehicle
 
     /// Where the followed vehicle was at the last model tick, and how fast it
@@ -613,6 +881,36 @@ final class MapCoordinator: NSObject {
     /// bearing and the label are wanted every refresh and change once a tick.
     private var followWatched: VehicleSnapshot?
     private var followLink: CADisplayLink?
+    /// The inputs that can alter either feature written by the follow lane.
+    /// Kept separately from its output so a stationary model tick can leave a
+    /// paused display link asleep instead of waking the screen to rediscover
+    /// that the camera and both sources are already exact.
+    private struct FollowRenderContext: Equatable {
+        var id: String?
+        var vehicle: VehicleSnapshot
+        var shape: VehicleFootprint?
+        var velocityLon: Double
+        var velocityLat: Double
+        var emergence: Double?
+        var labelOpenId: String?
+        var cablewayLabel: Bool
+        var bakedModels: Bool
+        var showingSolids: Bool
+        var lampsLit: Bool
+        var solidVehicles: Bool
+        var terrain: Bool
+        var ghostTunnels: Bool
+        var hitboxes: Bool
+        var tunnelRevision: Int
+        var clockPlaying: Bool
+        var clockSpeed: Double
+    }
+    private var followRenderContext: FollowRenderContext?
+    /// What was last handed to each source. Feature equality includes geometry
+    /// and properties, so this catches a true no-op without guessing which of
+    /// the renderer's several fades or model-placement properties mattered.
+    private var drawnFollowShapeFeatures: [Feature]?
+    private var drawnFollowPointFeature: Feature?
     /// The footprint as the model last built it, in its own coordinates. It is
     /// translated rather than rebuilt — see `followFrame`.
     private var followShape: VehicleFootprint?
@@ -678,6 +976,7 @@ final class MapCoordinator: NSObject {
         let coord = Coord(lon: vehicle.lon, lat: vehicle.lat)
         let elapsed = stamp - followStamp
         let same = followId == vehicle.id && followId != nil
+        let previousId = followId
         // Ignore a stale gap — a backgrounded app, a stalled tick, the clock
         // scrubbed — rather than extrapolating a vehicle across the canton from
         // it. And ignore a step so large it cannot be travel: a journey re-timed
@@ -709,8 +1008,39 @@ final class MapCoordinator: NSObject {
         followWatched = vehicle
         followId = followedVehicleId
         followShape = followId.flatMap { model.shapesByID[$0] }
-        startFollowLink()
-        followFrame()
+        let context = FollowRenderContext(
+            id: followId,
+            vehicle: vehicle,
+            shape: followShape,
+            velocityLon: followVelocity.lon,
+            velocityLat: followVelocity.lat,
+            emergence: displayedVehicleEmergence[vehicle.id] ?? followShape?.emergence,
+            labelOpenId: labelOpenId,
+            cablewayLabel: cablewayLabelIDs.contains(vehicle.id),
+            bakedModels: model.bakedModels,
+            showingSolids: showingSolids,
+            lampsLit: lampsLit,
+            solidVehicles: model.solidVehicles,
+            terrain: model.terrain3D,
+            ghostTunnels: model.ghostTunnels,
+            hitboxes: model.showWagonHitboxes,
+            tunnelRevision: model.tunnelRevision,
+            clockPlaying: model.clock.isPlaying,
+            clockSpeed: model.clock.speed
+        )
+        let changed = context != followRenderContext
+        followRenderContext = context
+
+        let created = startFollowLink()
+        if created || previousId != followId {
+            // The first selected frame should not wait for the next vsync. After
+            // this hand-off the display link is the sole frame producer.
+            drawnFollowShapeFeatures = nil
+            drawnFollowPointFeature = nil
+            followFrame(at: CACurrentMediaTime())
+        } else if changed {
+            wakeFollowLink()
+        }
     }
 
     /// Faster than anything on these rails, in metres per second. A step that
@@ -757,29 +1087,62 @@ final class MapCoordinator: NSObject {
     /// few metres on rather than inventing a journey for it.
     private static let followPredictAtMost = 0.12
 
-    private func startFollowLink() {
-        guard followLink == nil else { return }
+    @discardableResult
+    private func startFollowLink() -> Bool {
+        guard followLink == nil else { return false }
         // Through a weak proxy: `CADisplayLink` retains its target, and a link
         // that is still running holds the coordinator — and through it the
         // model — alive after the map has gone.
         let link = CADisplayLink(
-            target: DisplayLinkProxy { [weak self] in self?.followFrame() },
-            selector: #selector(DisplayLinkProxy.fire)
+            target: DisplayLinkProxy { [weak self] link in
+                self?.followFrame(at: link.targetTimestamp)
+            },
+            selector: #selector(DisplayLinkProxy.fire(_:))
         )
         // At the rate the map itself is being held to, rather than at the
         // panel's maximum. See `setRenderRate`.
         link.preferredFrameRateRange = renderRange
         link.add(to: .main, forMode: .common)
         followLink = link
+        // A newly-created link starts while the renderer is still carrying the
+        // ordinary model range. Promote both immediately; relying on the first
+        // camera-change callback misses the case where that first camera write
+        // is correctly elided as a no-op.
+        setRenderRate()
+        return true
+    }
+
+    private func wakeFollowLink() {
+        guard locationActive, let followLink, followLink.isPaused else { return }
+        followLink.isPaused = false
+        // Restore the interpolating range after the stationary link had let the
+        // renderer fall back to the model's own rate.
+        setRenderRate()
+    }
+
+    private func pauseFollowLink() {
+        guard let followLink, !followLink.isPaused else { return }
+        followLink.isPaused = true
+        // Other vehicles still move behind a stationary selection, so the map
+        // renderer keeps the model's rate. Only the extra interpolation link is
+        // put to sleep.
+        setRenderRate()
     }
 
     /// Stop predicting, and put the followed vehicle back with the others.
     private func endFollowing() {
         followLink?.invalidate()
         followLink = nil
+        // `CADisplayLink.invalidate()` stops our callback, not Mapbox's. Put
+        // the renderer back on the ordinary model budget even if clearing the
+        // follow padding below turns out to be a camera no-op.
+        setRenderRate()
         followAnchor = nil
         followVelocity = (0, 0)
         followWatched = nil
+        followRenderContext = nil
+        drawnFollowShapeFeatures = nil
+        drawnFollowPointFeature = nil
         clearCatchup()
         // Whether *this* call is the one that ended a follow, as against one of
         // the several that tidy up after it. It decides the camera reset below
@@ -788,6 +1151,7 @@ final class MapCoordinator: NSObject {
         followId = nil
         followShape = nil
         followedStandingVehicle = nil
+        clearFollowFadeState()
         followBearing = nil
         followBearingRate = 0
         guard let mapView, styleReady else { drewFollowShape = false; return }
@@ -839,9 +1203,21 @@ final class MapCoordinator: NSObject {
     /// The catch-up offset is in here too, for the same reason: a re-timed
     /// vehicle has to be drawn where the camera is still looking, not where
     /// the timetable now says, or the body snaps while the camera eases.
-    private func followShift() -> (lon: Double, lat: Double) {
+    private func followMapTime(at displayTime: CFTimeInterval? = nil) -> Double {
+        let now = model.clock.now()
+        guard let displayTime, model.clock.isPlaying else { return now }
+        let realLead = max(0, displayTime - CACurrentMediaTime())
+        return now + realLead * model.clock.speed
+    }
+
+    private func followShift(at displayTime: CFTimeInterval? = nil) -> (lon: Double, lat: Double) {
         guard followAnchor != nil else { return (0, 0) }
-        let ahead = min(max(0, model.clock.now() - followStamp), Self.followPredictAtMost)
+        // A display link names the frame it is preparing, not merely the instant
+        // its callback happened. Carry the map clock through that last fraction
+        // of a frame at the selected playback speed. Non-display callers keep
+        // using the clock's current instant.
+        let target = followMapTime(at: displayTime)
+        let ahead = min(max(0, target - followStamp), Self.followPredictAtMost)
         return (
             followVelocity.lon * ahead + catchupLon,
             followVelocity.lat * ahead + catchupLat
@@ -882,13 +1258,12 @@ final class MapCoordinator: NSObject {
     /// Stepped here, and only here, because `followShift` is also read from
     /// `draw` on the model tick: putting the integration in the shift itself
     /// would advance it twice on the ticks that both fire.
-    private func stepCatchup() {
+    private func stepCatchup(at displayTime: CFTimeInterval) {
         guard catchupEast != 0 || catchupNorth != 0
                 || catchupEastRate != 0 || catchupNorthRate != 0
         else { return }
-        let now = CACurrentMediaTime()
-        let elapsed = catchupStamp == 0 ? 0 : now - catchupStamp
-        catchupStamp = now
+        let elapsed = catchupStamp == 0 ? 0 : displayTime - catchupStamp
+        catchupStamp = displayTime
         let step = elapsed > 0 && elapsed < 0.25 ? elapsed : 1.0 / 60
         catchupEast = Self.linearSpring(
             catchupEast, towards: 0, rate: &catchupEastRate,
@@ -935,16 +1310,22 @@ final class MapCoordinator: NSObject {
     /// does, the vehicle cannot drift against the camera holding it: both are
     /// wrong by the same amount or neither is. Recomputing them separately is
     /// what made the vehicle "constantly go a bit back and forth".
-    @objc private func followFrame() {
-        guard model.isFollowingVehicle, let anchor = followAnchor,
-              let mapView, styleReady
-        else {
+    private func followFrame(at displayTime: CFTimeInterval) {
+        guard model.isFollowingVehicle, let anchor = followAnchor, let mapView else {
             endFollowing()
             return
         }
+        // A basemap reload temporarily has no sources to update. Keep the
+        // follow state, but put its link to sleep until `installLayers` has
+        // recreated them; ending here caused a visible body/camera hitch on
+        // every style switch.
+        guard styleReady else {
+            pauseFollowLink()
+            return
+        }
 
-        stepCatchup()
-        let shift = followShift()
+        stepCatchup(at: displayTime)
+        let shift = followShift(at: displayTime)
         let lon = anchor.lon + shift.lon
         let lat = anchor.lat + shift.lat
 
@@ -954,12 +1335,22 @@ final class MapCoordinator: NSObject {
         // on the main thread that buys a value which changes thirty.
         let watched = followWatched
 
-        var camera = CameraOptions(
-            center: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-            padding: Self.followInset(in: mapView.bounds.height)
-        )
-        camera.bearing = cameraBearing(towards: watched?.bearing)
-        mapView.mapboxMap.setCamera(to: camera)
+        let inset = Self.followInset(in: mapView.bounds.height)
+        let bearing = cameraBearing(towards: watched?.bearing, at: displayTime)
+        let current = mapView.mapboxMap.cameraState
+        let centreChanged = abs(current.center.longitude - lon) > Self.followCoordinateEpsilon
+            || abs(current.center.latitude - lat) > Self.followCoordinateEpsilon
+        let bearingChanged = bearing.map {
+            Self.bearingDistance(current.bearing, $0) > Self.followBearingEpsilon
+        } ?? false
+        if centreChanged || current.padding != inset || bearingChanged {
+            var camera = CameraOptions(
+                center: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                padding: inset
+            )
+            camera.bearing = bearing
+            mapView.mapboxMap.setCamera(to: camera)
+        }
 
         let style: MapboxMap = mapView.mapboxMap
         if let shape = followShape {
@@ -968,14 +1359,16 @@ final class MapCoordinator: NSObject {
             // place where three separate writes would have been most visible.
             drewFollowShape = true
             let moved = shape.shifted(byLon: shift.lon, lat: shift.lat)
-            style.updateGeoJSONSource(
-                withId: VehicleShapes.followSource,
-                geoJSON: .featureCollection(FeatureCollection(
-                    features: vehicleDrawing(
-                        [moved], excluding: nil, flatness: 1, follow: true
-                    )
-                ))
+            let features = vehicleDrawing(
+                [moved], excluding: nil, flatness: 1, follow: true
             )
+            if features != drawnFollowShapeFeatures {
+                drawnFollowShapeFeatures = features
+                style.updateGeoJSONSource(
+                    withId: VehicleShapes.followSource,
+                    geoJSON: .featureCollection(FeatureCollection(features: features))
+                )
+            }
         } else if drewFollowShape {
             // **The vehicle has stopped being drawn as a vehicle, and what was
             // left behind was the last frame of it.**
@@ -994,13 +1387,17 @@ final class MapCoordinator: NSObject {
             // display's rate and re-emptying an empty source sixty times a
             // second is sixty parses of nothing.
             followedStandingVehicle = nil
+            clearFollowFadeState(in: style)
             drewFollowShape = false
+            drawnFollowShapeFeatures = []
             style.updateGeoJSONSource(
                 withId: VehicleShapes.followSource,
                 geoJSON: .featureCollection(FeatureCollection(features: []))
             )
         } else {
             followedStandingVehicle = nil
+            clearFollowFadeState(in: style)
+            drawnFollowShapeFeatures = []
         }
         // The dot and its line label hang off the point source, and they have to
         // travel with the body or the label swims beside the train it names.
@@ -1009,43 +1406,86 @@ final class MapCoordinator: NSObject {
         // *replaces* the feature it matches, so anything left out of it is left
         // out of the source — see `vehicleFeature`.
         if let vehicle = watched {
-            style.updateGeoJSONSourceFeatures(forSourceId: ID.vehicles, features: [
-                Self.vehicleFeature(
-                    vehicle,
-                    at: Coord(lon: vehicle.lon + shift.lon, lat: vehicle.lat + shift.lat),
-                    selected: true,
-                    emerged: Cableway.hangs(vehicle)
-                            && followedStandingVehicle == vehicle.id
-                        ? followShape?.emergence ?? 1
-                        : displayedVehicleEmergence[vehicle.id]
-                            ?? followShape?.emergence ?? 0,
-                    tunnel: tunnelIndex.fade(
-                        at: Coord(lon: vehicle.lon + shift.lon, lat: vehicle.lat + shift.lat),
-                        heading: vehicle.bearing
-                    ),
-                    // **The open flag, and leaving it to default was the whole
-                    // of why the line number would not go away.**
-                    //
-                    // This lane rewrites the followed vehicle's own feature at
-                    // the display's rate — sixty times a second against the
-                    // model's thirty — so whatever it puts here is what the
-                    // label layers actually see. Built without this the feature
-                    // came back every frame saying it was not the open vehicle,
-                    // which put its number straight back into the layer that
-                    // never fades. The main lane was setting the flag correctly
-                    // and being overwritten before it could be drawn.
-                    // Read off `labelOpenId` rather than asserted: this lane
-                    // rewrites the feature sixty times a second, so it decides
-                    // what the label layers see, and it must say the same thing
-                    // the other lane is saying or the two fight. During the tick
-                    // a selection is handed over they differ, which is exactly
-                    // when getting it wrong would fade the wrong vehicle.
-                    open: vehicle.id == labelOpenId,
-                    label: Cableway.hangs(vehicle) && !cablewayLabelIDs.contains(vehicle.id)
-                        ? "" : vehicle.line
+            let position = Coord(
+                lon: vehicle.lon + shift.lon, lat: vehicle.lat + shift.lat
+            )
+            let feature = Self.vehicleFeature(
+                vehicle,
+                at: position,
+                selected: true,
+                emerged: Cableway.hangs(vehicle)
+                        && followedStandingVehicle == vehicle.id
+                    ? followShape?.emergence ?? 1
+                    : displayedVehicleEmergence[vehicle.id]
+                        ?? followShape?.emergence ?? 0,
+                tunnel: tunnelIndex.fade(at: position, heading: vehicle.bearing),
+                // **The open flag, and leaving it to default was the whole
+                // of why the line number would not go away.**
+                //
+                // This lane rewrites the followed vehicle's own feature at
+                // the display's rate — sixty times a second against the
+                // model's thirty — so whatever it puts here is what the
+                // label layers actually see. Built without this the feature
+                // came back every frame saying it was not the open vehicle,
+                // which put its number straight back into the layer that
+                // never fades. The main lane was setting the flag correctly
+                // and being overwritten before it could be drawn.
+                // Read off `labelOpenId` rather than asserted: this lane
+                // rewrites the feature sixty times a second, so it decides
+                // what the label layers see, and it must say the same thing
+                // the other lane is saying or the two fight. During the tick
+                // a selection is handed over they differ, which is exactly
+                // when getting it wrong would fade the wrong vehicle.
+                open: vehicle.id == labelOpenId,
+                label: Cableway.hangs(vehicle) && !cablewayLabelIDs.contains(vehicle.id)
+                    ? "" : vehicle.line
+            )
+            if feature != drawnFollowPointFeature {
+                drawnFollowPointFeature = feature
+                style.updateGeoJSONSourceFeatures(
+                    forSourceId: ID.vehicles, features: [feature]
                 )
-            ])
+            }
+        } else {
+            drawnFollowPointFeature = nil
         }
+
+        // A flat, stationary vehicle has no reason to keep its own display link
+        // alive. The model tick will wake it if any render input changes. Solid
+        // model placement remains live because meshes and tunnel fades can land
+        // asynchronously without changing the model snapshot that asked for
+        // them; feature equality above still prevents redundant source writes.
+        if !followNeedsAnotherFrame(at: displayTime, heading: watched?.bearing) {
+            pauseFollowLink()
+        }
+    }
+
+    private static let followCoordinateEpsilon = 1e-10
+    private static let followBearingEpsilon = 0.001
+
+    private static func bearingDistance(_ a: Double, _ b: Double) -> Double {
+        let distance = abs((a - b).truncatingRemainder(dividingBy: 360))
+        return min(distance, 360 - distance)
+    }
+
+    private func followNeedsAnotherFrame(
+        at displayTime: CFTimeInterval, heading: Double?
+    ) -> Bool {
+        let predicting = model.clock.isPlaying
+            && (abs(followVelocity.lon) > 1e-15 || abs(followVelocity.lat) > 1e-15)
+            && followMapTime(at: displayTime) - followStamp < Self.followPredictAtMost
+        let catching = catchupEast != 0 || catchupNorth != 0
+            || catchupEastRate != 0 || catchupNorthRate != 0
+        let turning: Bool
+        if model.vehicleFollow == .bearing, let heading, let followBearing {
+            turning = Self.bearingDistance(followBearing, heading) > 0.01
+                || abs(followBearingRate) > 0.05
+        } else {
+            turning = false
+        }
+        let awaitingSolidWork = showingSolids && model.solidVehicles
+            && modelStore.hasPendingWork
+        return predicting || catching || turning || awaitingSolidWork || followFadeInProgress
     }
 
     /// Which way is up while a vehicle is being followed, or nil to leave the
@@ -1075,19 +1515,20 @@ final class MapCoordinator: NSObject {
     /// back would be a second unasked-for movement, and the compass in the
     /// corner is already both the notice that it is turned and the button that
     /// straightens it.
-    private func cameraBearing(towards heading: Double?) -> CLLocationDirection? {
+    private func cameraBearing(
+        towards heading: Double?, at displayTime: CFTimeInterval
+    ) -> CLLocationDirection? {
         guard model.vehicleFollow == .bearing, let heading else {
             followBearing = nil
             followBearingRate = 0
             return nil
         }
 
-        let now = CACurrentMediaTime()
         // A first frame has no elapsed time to integrate over, and a frame after
         // a stall — a backgrounded app, a jammed main thread — has far too much.
         // Both are treated as one frame at the display's nominal rate.
-        let elapsed = followBearing == nil ? 0 : now - followBearingStamp
-        followBearingStamp = now
+        let elapsed = followBearing == nil ? 0 : displayTime - followBearingStamp
+        followBearingStamp = displayTime
         let step = elapsed > 0 && elapsed < 0.25 ? elapsed : 1.0 / 60
 
         guard let from = followBearing else {
@@ -1342,6 +1783,7 @@ final class MapCoordinator: NSObject {
         // own default preset, whatever this one had.
         currentPreset = nil
         styleReady = false
+        pauseFollowLink()
         mapView.mapboxMap.loadStyle(basemap.styleURI)
     }
 
@@ -1363,7 +1805,9 @@ final class MapCoordinator: NSObject {
     private func applyLightPreset(_ style: MapboxMap) {
         guard theme == .standard, model.lightPreset != currentPreset else { return }
         currentPreset = model.lightPreset
-        Terrain3D.applyStandardConfig(style, preset: model.lightPreset)
+        Terrain3D.applyStandardConfig(
+            style, preset: model.lightPreset, buildings: model.buildings3D
+        )
         // Whether it is dark out is now a different question than it was a
         // moment ago, and the lamps are the one layer that asks it. Forced
         // through `applySolidity` rather than set here, because dark is only
@@ -1401,7 +1845,9 @@ final class MapCoordinator: NSObject {
             // is asked for is whatever the setting says right now; keeping it
             // there afterwards is `applyLightPreset`'s job.
             currentPreset = model.lightPreset
-            Terrain3D.applyStandardConfig(style, preset: model.lightPreset)
+            Terrain3D.applyStandardConfig(
+                style, preset: model.lightPreset, buildings: wanted.buildings
+            )
         } else if theme.showsExtrudedBuildings {
             Terrain3D.setBuildings(style, visible: wanted.buildings)
         }
@@ -1416,6 +1862,7 @@ final class MapCoordinator: NSObject {
     /// interface for every degree of a two-finger tilt.
     private var appliedSolidity = -1.0
     private var appliedBaked: Bool?
+    private var appliedOccluders: Bool?
 
     /// Whether the solids are the drawing on screen right now. See
     /// `applySolidity`, which switches rather than fades.
@@ -1515,10 +1962,16 @@ final class MapCoordinator: NSObject {
         // changeover cannot buzz between the two drawings.
         let solids = wanted >= (showingSolids ? 0.4 : 0.6)
         let baked = model.bakedModels
-        guard solids != showingSolids || baked != appliedBaked else { return }
+        // The second translucent footprint only has a job when terrain or a 3D
+        // building can actually stand between the camera and the vehicle.
+        let occluders = model.terrain3D
+            || (model.buildings3D && (theme.hasOwnBuildings || theme.showsExtrudedBuildings))
+        guard solids != showingSolids || baked != appliedBaked
+                || occluders != appliedOccluders else { return }
         showingSolids = solids
         appliedSolidity = wanted
         appliedBaked = baked
+        appliedOccluders = occluders
         // The flat drawing is about to be what the reader is reading again, so
         // it has to be drawn whole from the very next tick rather than from the
         // one after it. See `AppModel.standingVehicles`.
@@ -1527,7 +1980,9 @@ final class MapCoordinator: NSObject {
         VehicleModels.setModelSolidity(mapView.mapboxMap, baked && solids)
         // And which of the two ways of showing a vehicle through a building is
         // in use. See `VehicleShapes.setXray`.
-        VehicleShapes.setXray(mapView.mapboxMap, solids: baked && solids)
+        VehicleShapes.setXray(
+            mapView.mapboxMap, solids: baked && solids, occluders: occluders
+        )
     }
 
     /// Tilt the camera, for the control that does it by hand.
@@ -1612,6 +2067,9 @@ final class MapCoordinator: NSObject {
         guard let mapView, let view = recogniser.view else { return }
         switch recogniser.state {
         case .began:
+            customTiltActive = true
+            cameraSettled = false
+            setRenderRate()
             // The second finger can still land on a drag already under way —
             // the one case a two-touch minimum cannot catch, because by then
             // the pan has begun. Switching the pan off cancels it where it
@@ -1639,6 +2097,10 @@ final class MapCoordinator: NSObject {
             guard tiltStart != nil else { return }
             tiltStart = nil
             mapView.mapboxMap.endGesture()
+            customTiltActive = false
+            reportViewport()
+            cameraSettled = model.isFollowingVehicle
+            setRenderRate()
         default:
             break
         }
@@ -2657,6 +3119,7 @@ final class MapCoordinator: NSObject {
             // relief would stay off until something else happened to change.
             apply3D(style)
             styleReady = true
+            wakeFollowLink()
             draw()
         } catch {
             // A style that refused a layer draws nothing at all, silently — the
@@ -2667,6 +3130,7 @@ final class MapCoordinator: NSObject {
             Diagnostics.note("map layers rejected: \(error)")
             if style.sourceExists(withId: ID.vehicles) {
                 styleReady = true
+                wakeFollowLink()
                 draw()
             } else {
                 assertionFailure("map layers rejected: \(error)")
@@ -2765,6 +3229,7 @@ final class MapCoordinator: NSObject {
         drawn3D = nil
         appliedSolidity = -1
         appliedBaked = nil
+        appliedOccluders = nil
         lampsLit = false
         // The meshes belong to the style, and this one has never heard of them.
         modelStore.styleChanged()
@@ -2776,6 +3241,10 @@ final class MapCoordinator: NSObject {
         drawnPlateRevision = -1
         drawnShapesVisible = nil
         drewVehicleShapes = false
+        drewFollowShape = false
+        drawnFollowShapeFeatures = nil
+        drawnFollowPointFeature = nil
+        followRenderContext = nil
         drawnCableways = nil
         ropes = []
         cablewaysPending = false
@@ -2786,6 +3255,9 @@ final class MapCoordinator: NSObject {
         labelOpenId = nil
         openLabelOpacity = 1
         openLabelSettleAt = 0
+        fadingMainLane = false
+        fadingFollowLane = false
+        followFadeInProgress = false
         drawnTunnelFades = nil
         // A new style has the layers' own filters back, so nothing is hidden.
         mergedAway = []
@@ -3067,6 +3539,13 @@ final class MapCoordinator: NSObject {
 
     func draw() {
         guard styleReady, let mapView else { return }
+        // A stationary follow link may be asleep, so it cannot be relied on to
+        // notice that selection or follow mode ended. The model frame is the
+        // authoritative transition and cleans the private source immediately.
+        if followId != nil, !model.isFollowingVehicle {
+            endFollowing()
+            return
+        }
         // Here rather than at style load: the model reads its launch arguments
         // in a task that may not have run when the style finished, so asking
         // once at load lost the race about half the time.
@@ -3125,7 +3604,28 @@ final class MapCoordinator: NSObject {
     /// style was last told about it. See `VehicleModels.setTunnelFades`.
     private var fadingMainLane = false
     private var fadingFollowLane = false
+    /// The lower-opacity render bands only become necessary below 0.8, whereas
+    /// animation begins as soon as a wagon leaves 1. This separately records the
+    /// whole transition and is the one that may keep the high-rate follow
+    /// display link awake.
+    private var followFadeInProgress = false
     private var drawnTunnelFades: Bool?
+
+    /// A followed vehicle that loses its footprint (or stops being followed)
+    /// has no private source left whose tunnel fade can still be in flight.
+    /// Clear both the animation reason and the lane's contribution to the shared
+    /// fade-band visibility immediately rather than waiting for another shape.
+    private func clearFollowFadeState(in style: MapboxMap? = nil) {
+        followFadeInProgress = false
+        guard fadingFollowLane else { return }
+        fadingFollowLane = false
+        let anyFading = fadingMainLane
+        guard anyFading != drawnTunnelFades else { return }
+        drawnTunnelFades = anyFading
+        if let style = style ?? mapView?.mapboxMap {
+            VehicleModels.setTunnelFades(style, anyFading)
+        }
+    }
 
     /// Whether the wagon hitbox layers are currently shown. Nil for a style
     /// that has just been built and has never been told.
@@ -3611,6 +4111,15 @@ final class MapCoordinator: NSObject {
         _ shapes: [VehicleFootprint], excluding excluded: String?, flatness: Double,
         follow: Bool
     ) -> [Feature] {
+        // Re-stated by every lane rebuild. Without the reset, switching solids
+        // off while a tunnel fade was in flight left the follow link believing
+        // that animation was still pending forever.
+        if follow {
+            fadingFollowLane = false
+            followFadeInProgress = false
+        } else {
+            fadingMainLane = false
+        }
         // Only when it has changed. This is a debug switch that moves about
         // once a session, and `setHitboxes` is six `layerExists` and six
         // `setLayerProperty` calls — twelve hops into the renderer, each one
@@ -3679,13 +4188,21 @@ final class MapCoordinator: NSObject {
             // either one alone would turn the bands off for the other. See
             // `VehicleModels.setTunnelFades`, which explains what they cost.
             let fading = wagonOpacities.values.contains { wagon in
-                wagon.contains { $0 < 0.8 }
+                // Zero has settled fully underground and every optional band is
+                // invisible there. Keep the extra model layers enabled only for
+                // an opacity which can actually draw in one of them.
+                wagon.contains { $0 > 0 && $0 < 0.8 }
             }
-            if follow { fadingFollowLane = fading } else { fadingMainLane = fading }
-            let anyFading = fadingMainLane || fadingFollowLane
-            if anyFading != drawnTunnelFades {
-                drawnTunnelFades = anyFading
-                VehicleModels.setTunnelFades(style, anyFading)
+            if follow {
+                fadingFollowLane = fading
+                // `ease` snaps exactly to either endpoint. Values strictly
+                // between them are therefore precisely the wagons which need
+                // another frame; zero is settled underground, not an animation.
+                followFadeInProgress = wagonOpacities.values.contains { wagon in
+                    wagon.contains { $0 > 0 && $0 < 1 }
+                }
+            } else {
+                fadingMainLane = fading
             }
             // Only where the solid is actually being painted. The models are
             // built a little before the camera has tilted far enough to show
@@ -3697,6 +4214,11 @@ final class MapCoordinator: NSObject {
                 model.bakedModels = working
                 applySolidity()
             }
+        }
+        let anyFading = fadingMainLane || fadingFollowLane
+        if anyFading != drawnTunnelFades, let style = mapView?.mapboxMap {
+            drawnTunnelFades = anyFading
+            VehicleModels.setTunnelFades(style, anyFading)
         }
         // Told back to the model, so the next tick does not build the trim of a
         // vehicle standing up as a mesh — every polygon of it is dropped just
@@ -4394,9 +4916,9 @@ final class MapCoordinator: NSObject {
 ///
 /// A display-link target that does not keep its owner alive.
 private final class DisplayLinkProxy {
-    private let handler: () -> Void
-    init(_ handler: @escaping () -> Void) { self.handler = handler }
-    @objc func fire() { handler() }
+    private let handler: (CADisplayLink) -> Void
+    init(_ handler: @escaping (CADisplayLink) -> Void) { self.handler = handler }
+    @objc func fire(_ link: CADisplayLink) { handler(link) }
 }
 
 /// Never from the button — no press means "stop following". Letting go of the
@@ -4404,6 +4926,9 @@ private final class DisplayLinkProxy {
 /// choosing, and both of those reach the button through here.
 extension MapCoordinator: GestureManagerDelegate {
     func gestureManager(_ gestureManager: GestureManager, didBegin gestureType: GestureType) {
+        gestureCameraCount += 1
+        cameraSettled = false
+        setRenderRate()
         // Letting go of a vehicle means going *somewhere else*, and only a pan
         // says that. Everything else is a change of view onto the same place.
         //
@@ -4425,8 +4950,27 @@ extension MapCoordinator: GestureManagerDelegate {
         model.mapWasDragged()
     }
 
-    func gestureManager(_ gestureManager: GestureManager, didEnd gestureType: GestureType, willAnimate: Bool) {}
-    func gestureManager(_ gestureManager: GestureManager, didEndAnimatingFor gestureType: GestureType) {}
+    func gestureManager(
+        _ gestureManager: GestureManager, didEnd gestureType: GestureType, willAnimate: Bool
+    ) {
+        guard !willAnimate else { return }
+        finishGestureCamera()
+    }
+
+    func gestureManager(
+        _ gestureManager: GestureManager, didEndAnimatingFor gestureType: GestureType
+    ) {
+        finishGestureCamera()
+    }
+
+    private func finishGestureCamera() {
+        gestureCameraCount = max(0, gestureCameraCount - 1)
+        if !gestureCameraActive {
+            reportViewport()
+            cameraSettled = model.isFollowingVehicle
+            setRenderRate()
+        }
+    }
 }
 
 /// The two questions the app's own tilt gesture is judged by — and the single

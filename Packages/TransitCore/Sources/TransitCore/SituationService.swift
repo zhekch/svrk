@@ -186,6 +186,7 @@ public actor SituationService {
 
     private func load(_ api: OTDClient.API, planned: Bool, now: Date) async -> [Situation]? {
         guard let client else { return nil }
+        guard !Task.isCancelled else { return nil }
         let parser = SituationParser(planned: planned, now: Timestamp(now.timeIntervalSince1970))
         let collector = SituationCollector()
 
@@ -193,10 +194,16 @@ public actor SituationService {
             try await client.stream(api, maxWait: 30) { chunk in
                 collector.consume(chunk, parser: parser)
             }
+        } catch is CancellationError {
+            // Leaving the scene is not a failed refresh. `ChunkedDownload`
+            // has already cancelled the transfer and drained/skipped parser
+            // work before returning this cancellation.
+            return nil
         } catch {
             lastError = String(describing: error)
             return nil
         }
+        guard !Task.isCancelled else { return nil }
         collector.finish(parser: parser)
         lastError = nil
         return collector.take()

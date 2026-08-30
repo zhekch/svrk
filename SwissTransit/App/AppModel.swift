@@ -391,6 +391,18 @@ final class AppModel {
     /// times a second asks the network once.
     private var loadKey: LoadService.Key?
     private let loads = LoadService(token: Secrets.ojpToken)
+    /// Foreground requests belonging to the selected panel. These used to be
+    /// fire-and-forget tasks, so changing selection or leaving the app did not
+    /// cancel their sockets and stale answers could still mutate the new card.
+    private var selectionTask: Task<Void, Never>?
+    private var occupancyTask: Task<Void, Never>?
+    private var occupancyVehicleID: String?
+    private var occupancyRequestGeneration: UInt64 = 0
+    private var formationTask: Task<Void, Never>?
+    private var formationRequestGeneration: UInt64 = 0
+    private var branchTask: Task<Void, Never>?
+    private var branchRequestGeneration: UInt64 = 0
+    private var selectionGeneration: UInt64 = 0
 
     /// Disruption notices, from both halves of SIRI-SX. See `SituationService`.
     private let situations = SituationService(token: Secrets.sxToken)
@@ -471,8 +483,9 @@ final class AppModel {
             // is once a second. Waiting that long to acknowledge a tap reads as
             // a tap that did not land. Coalesced, so a sheet writing `.none`
             // back over its own dismissal still costs one.
+            cancelSelectionWork(clearPresentation: true)
             requestTick()
-            Task { await refreshSelection() }
+            scheduleSelectionRefresh()
         }
     }
 
@@ -1026,7 +1039,7 @@ final class AppModel {
             guard showRailwayShapes != oldValue else { return }
             Settings.set(showRailwayShapes, "showRailwayShapes")
             platesViewport = nil
-            Task { await tick() }
+            requestTick()
         }
     }
 
@@ -1043,7 +1056,7 @@ final class AppModel {
         guard arrived != railwayShapesDrawn else { return }
         railwayShapesDrawn = arrived
         platesViewport = nil
-        Task { await tick() }
+        requestTick()
     }
 
     // Five minutes rather than every minute. A live refresh is 7 MB each time,
@@ -1054,6 +1067,7 @@ final class AppModel {
         didSet {
             guard cadence != oldValue else { return }
             Settings.set(cadence, "cadence")
+            if !cadence.allowsFetching { cancelRefreshOperation() }
             restartRefreshLoop()
         }
     }
@@ -1448,10 +1462,29 @@ final class AppModel {
     var metresPerPoint = 1_000.0
 
     private var refreshTask: Task<Void, Never>?
+    /// The fetch itself, separately owned from the timer or button that asked
+    /// for it. A manual refresh used to belong to a discarded view task, so it
+    /// could keep downloading and decoding after the scene was suspended.
+    /// Keeping one operation here also makes simultaneous timer/button asks
+    /// join the same transfer instead of racing an `isRefreshing` check.
+    private var refreshOperationTask: Task<Void, Never>?
+    private var refreshOperationGeneration: UInt64 = 0
     private var situationTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
+    /// The one task allowed to query and publish a moving frame. Kept separate
+    /// from `tickTask`, which is only the clock that asks this pump for work.
+    private var tickPumpTask: Task<Void, Never>?
     private var pathMonitor: NWPathMonitor?
+    /// Serialises the Fleet-side half of scene transitions. CoreLocation and
+    /// main-actor loops stop immediately, while actor messages from a rapid
+    /// inactive → active → background sequence are applied in that same order.
+    private var geometryLifecycleTask: Task<Void, Never>?
+    /// True while the scene is not visible. Unlike `tickSchedulerSuspended`,
+    /// this covers the utility/network producers that do not draw frames.
+    /// Keeping the state explicit also handles a scene that resigns active
+    /// while `start()` is suspended in one of its disk reads.
+    private var backgroundWorkSuspended = false
     /// Whether there is a route to the network at all. Read by the background
     /// formation sweep, which otherwise spends a request every second and a
     /// half discovering the same thing.
@@ -1504,30 +1537,55 @@ final class AppModel {
     /// anyway, so racing them would only interleave them badly.
     private func finishOpening(at moment: Date) {
         openingTask?.cancel()
+        guard !backgroundWorkSuspended else {
+            openingFinished = false
+            openingTask = nil
+            return
+        }
         openingTask = Task { [weak self] in
             guard let self else { return }
             let started = Date()
             let grew = await self.fleet.completeTimetable()
-            if Task.isCancelled { return }
+            if Task.isCancelled || self.backgroundWorkSuspended { return }
             if grew {
-                self.status = await self.fleet.currentStatus()
+                let status = await self.fleet.currentStatus()
+                guard !Task.isCancelled, !self.backgroundWorkSuspended else { return }
+                self.status = status
                 self.requestTick()
             }
             let expanded = Date().timeIntervalSince(started)
 
-            await self.fleet.warmTrainGeometry(inBackground: Timestamp(moment.timeIntervalSince1970))
-            if Task.isCancelled { return }
+            // Opening is complete once the timetable exists. The national
+            // geometry pass below is only a speculative cache warm, so a
+            // Low-Power transition may cancel it without making resume repeat
+            // the timetable expansion or pretending launch is unfinished.
+            self.openingFinished = true
+
+            // National geometry is a speculative warm: a cold viewport now
+            // queues the same work off the frame. Keep the complete timetable
+            // in Low Power/thermal states, but do not precompute rails the
+            // reader may never pan to while the phone is asking us to back off.
+            if self.powerFactor == 1 {
+                await self.fleet.warmTrainGeometry(
+                    inBackground: Timestamp(moment.timeIntervalSince1970)
+                )
+            }
+            if Task.isCancelled || self.backgroundWorkSuspended { return }
             // Last, because these are the only ones that never finish, and
             // the two that do should not be queued behind them.
-            self.keepRefining()
-            self.keepTimingsLive()
+            if self.powerFactor == 1 {
+                self.keepRefining()
+                self.keepTimingsLive()
+            }
             Self.log.notice(
                 "opened: country in \(expanded * 1000, format: .fixed(precision: 0))ms, rails in \(Date().timeIntervalSince(started) * 1000 - expanded * 1000, format: .fixed(precision: 0))ms"
             )
+            self.openingTask = nil
         }
     }
 
     private var openingTask: Task<Void, Never>?
+    private var openingFinished = false
 
     /// Keep the vehicles in view standing on their real paths, ahead of a tap.
     ///
@@ -1544,9 +1602,14 @@ final class AppModel {
     /// is the ordinary case — a settled map costs a check every quarter second.
     private func keepRefining() {
         refineTask?.cancel()
+        guard !backgroundWorkSuspended else { refineTask = nil; return }
         refineTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                guard !self.backgroundWorkSuspended, self.powerFactor == 1 else {
+                    try? await Task.sleep(for: .seconds(2))
+                    continue
+                }
                 let more = await self.fleet.refineDrawn(
                     in: self.viewport, at: Timestamp(self.clock.now())
                 )
@@ -1594,9 +1657,14 @@ final class AppModel {
     /// makes the rare one survivable.
     private func keepTimingsLive() {
         liveTimingTask?.cancel()
+        guard !backgroundWorkSuspended else { liveTimingTask = nil; return }
         liveTimingTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                guard !self.backgroundWorkSuspended, self.powerFactor == 1 else {
+                    try? await Task.sleep(for: .seconds(6))
+                    continue
+                }
                 let asked = await self.sweepLiveTimings()
                 // A pass that found nothing costs one check a second. A pass
                 // that worked has already paced itself, so it goes straight
@@ -1629,14 +1697,15 @@ final class AppModel {
 
     /// One pass of that sweep. Returns how many runs it actually asked about.
     private func sweepLiveTimings() async -> Int {
-        guard await loads.isConfigured else { return 0 }
+        guard !backgroundWorkSuspended, powerFactor == 1,
+              await loads.isConfigured else { return 0 }
         let now = Timestamp(clock.nowSeconds())
         let candidates = await fleet.awaitingLiveTiming(in: viewport, at: now)
         guard !candidates.isEmpty else { return 0 }
 
         var asked = 0
         for candidate in candidates {
-            if Task.isCancelled { return asked }
+            if Task.isCancelled || backgroundWorkSuspended || powerFactor > 1 { return asked }
             let key = LoadService.Key(journeyID: candidate.ref, day: candidate.day)
             if let at = sweptTimings[key],
                Date().timeIntervalSince(at) < Self.liveTimingHold { continue }
@@ -1763,7 +1832,7 @@ final class AppModel {
         // The stop register has just been read off disk, so whatever an
         // earlier tick cached for this box was cached against an empty store.
         stopsViewport = nil
-        await tick()
+        await requestTickAndWait()
         finishOpening(at: moment)
 
         // A development affordance: `-startOffsetMinutes 180` launches the map
@@ -1861,13 +1930,18 @@ final class AppModel {
             }
         }
 
-        watchNetwork()
         watchPower()
-        startTicking()
-        startLearning()
-        restartRefreshLoop()
-        restartSituationLoop()
         started = true
+        // `start()` can outlive a trip to the background because its disk and
+        // actor work is intentionally asynchronous. Do not resurrect loops for
+        // a scene that became inactive while that work was in flight.
+        if !backgroundWorkSuspended {
+            watchNetwork()
+            startTicking()
+            if powerFactor == 1 { startLearning() }
+            restartRefreshLoop()
+            restartSituationLoop()
+        }
     }
 
     /// Whether `start` has finished. Read by `resume`, which must not bring the
@@ -1878,6 +1952,7 @@ final class AppModel {
     private var started = false
 
     private func watchNetwork() {
+        pathMonitor?.cancel()
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             Task { @MainActor in
@@ -1893,6 +1968,7 @@ final class AppModel {
 
     private func restartRefreshLoop() {
         refreshTask?.cancel()
+        guard !backgroundWorkSuspended else { refreshTask = nil; return }
         guard let interval = cadence.seconds else { return }
         refreshTask = Task { [weak self] in
             // The stored snapshot has just been replayed, so the first fetch can
@@ -1932,6 +2008,7 @@ final class AppModel {
     /// this only has to knock often enough for the shorter of them.
     private func restartSituationLoop() {
         situationTask?.cancel()
+        guard !backgroundWorkSuspended else { situationTask = nil; return }
         situationTask = Task { [weak self] in
             var next = ContinuousClock.now
             while !Task.isCancelled {
@@ -1949,26 +2026,81 @@ final class AppModel {
     func refreshNow() async {
         // `.off` means off, including the button. A setting that the manual
         // control quietly overrides is not a setting.
-        guard cadence.allowsFetching else { return }
-        guard !isRefreshing else { return }
+        guard cadence.allowsFetching, !backgroundWorkSuspended else { return }
+        if let running = refreshOperationTask {
+            await running.value
+            return
+        }
+
+        refreshOperationGeneration &+= 1
+        let generation = refreshOperationGeneration
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performRefresh(generation: generation)
+        }
+        refreshOperationTask = operation
+        await operation.value
+        if refreshOperationGeneration == generation {
+            refreshOperationTask = nil
+        }
+    }
+
+    private func performRefresh(generation: UInt64) async {
+        guard generation == refreshOperationGeneration,
+              !backgroundWorkSuspended, !Task.isCancelled
+        else { return }
         isRefreshing = true
         startWatchingProgress()
+        defer {
+            if generation == refreshOperationGeneration {
+                stopWatchingProgress()
+                isRefreshing = false
+            }
+        }
+
         _ = await fleet.refresh()
-        stopWatchingProgress()
-        status = await fleet.currentStatus()
-        limits = await fleet.limits()
-        await updateScrubRange()
-        isRefreshing = false
+        guard generation == refreshOperationGeneration,
+              !Task.isCancelled, !backgroundWorkSuspended
+        else { return }
+        let refreshedStatus = await fleet.currentStatus()
+        guard generation == refreshOperationGeneration,
+              !Task.isCancelled, !backgroundWorkSuspended
+        else { return }
+        status = refreshedStatus
+        let refreshedLimits = await fleet.limits()
+        guard generation == refreshOperationGeneration,
+              !Task.isCancelled, !backgroundWorkSuspended
+        else { return }
+        limits = refreshedLimits
+        let refreshedSpan = await drawableTimeSpan()
+        guard generation == refreshOperationGeneration,
+              !Task.isCancelled, !backgroundWorkSuspended
+        else { return }
+        if let refreshedSpan { timeSpan = refreshedSpan }
         stopsViewport = nil
         // Disruptions are not refreshed here any more — they have their own
         // loop, because they cost 30 KB and this costs 7 MB. See
         // `restartSituationLoop`.
-        await tick()
+        await requestTickAndWait()
+        guard generation == refreshOperationGeneration,
+              !Task.isCancelled, !backgroundWorkSuspended
+        else { return }
         // Written after the draw rather than before it: whatever this refresh
         // made the map route is already in memory and costs nothing to lose,
         // and the file write is not worth putting in front of a frame.
         await fleet.saveLegCache()
+        guard generation == refreshOperationGeneration,
+              !Task.isCancelled, !backgroundWorkSuspended
+        else { return }
         layouts.save()
+    }
+
+    private func cancelRefreshOperation() {
+        refreshOperationGeneration &+= 1
+        refreshOperationTask?.cancel()
+        refreshOperationTask = nil
+        stopWatchingProgress()
+        isRefreshing = false
     }
 
     /// Copy the fleet's progress onto the model while a refresh is running.
@@ -2024,10 +2156,32 @@ final class AppModel {
     /// thing it does is the one frame it was careful never to do — catch up.
     /// Cancelled and restarted, the deadline is simply taken again from now.
     func suspend() {
+        // SwiftUI reports `.inactive` and then `.background` for one departure.
+        // The second report is the same transition, not another cancellation
+        // to enqueue behind a possible resume.
+        guard !backgroundWorkSuspended else { return }
+        backgroundWorkSuspended = true
         tickTask?.cancel(); tickTask = nil
+        tickSchedulerSuspended = true
+        invalidateTickWork(requestingFreshFrame: false)
+        let previousGeometryTransition = geometryLifecycleTask
+        geometryLifecycleTask = Task { [fleet] in
+            _ = await previousGeometryTransition?.value
+            await fleet.cancelBackgroundGeometry()
+        }
+        openingTask?.cancel(); openingTask = nil
+        refineTask?.cancel(); refineTask = nil
+        liveTimingTask?.cancel(); liveTimingTask = nil
+        learningTask?.cancel(); learningTask = nil
+        settleGeneration &+= 1
+        settleTask?.cancel(); settleTask = nil
+        settling = false
+        cancelSelectionWork(clearPresentation: false)
         refreshTask?.cancel(); refreshTask = nil
+        cancelRefreshOperation()
         situationTask?.cancel(); situationTask = nil
-        progressTask?.cancel(); progressTask = nil
+        searchTask?.cancel(); searchTask = nil
+        pathMonitor?.cancel(); pathMonitor = nil
         // So the map is told the rate again on the way back, whatever it was
         // holding its display link at when the app went away.
         announcedInterval = nil
@@ -2037,14 +2191,43 @@ final class AppModel {
     /// Back on screen. The loops pick up from now rather than from whenever
     /// they were interrupted.
     func resume() {
-        guard started, tickTask == nil else { return }
-        // What the phone thinks of us may well have changed while we were away
-        // — a background app does not get the notification it was not running
-        // to hear.
-        readPower()
-        startTicking()
-        restartRefreshLoop()
-        restartSituationLoop()
+        guard backgroundWorkSuspended else { return }
+        backgroundWorkSuspended = false
+        tickSchedulerSuspended = false
+        let previousGeometryTransition = geometryLifecycleTask
+        geometryLifecycleTask = Task { @MainActor [weak self, fleet] in
+            _ = await previousGeometryTransition?.value
+            await fleet.resumeBackgroundGeometry()
+            guard let self, !self.backgroundWorkSuspended, self.started else { return }
+            // What the phone thinks of us may well have changed while we were
+            // away — a background app does not get the notification it was not
+            // running to hear.
+            self.readPower()
+            self.watchNetwork()
+            self.startTicking()
+            self.restartRefreshLoop()
+            self.restartSituationLoop()
+            if self.selection != .none {
+                self.scheduleSelectionRefresh()
+            }
+            // Suspension cancels the debounced lookup. The text field keeps
+            // its value, so arrange the answer again instead of leaving an
+            // eligible query showing whichever results happened to land
+            // before the app went away.
+            if self.searchQuery.trimmingCharacters(in: .whitespaces).count >= 2 {
+                self.scheduleSearch()
+            }
+            if self.powerFactor == 1 {
+                self.startLearning()
+                if self.openingFinished {
+                    self.keepRefining()
+                    self.keepTimingsLive()
+                }
+            }
+            if !self.openingFinished {
+                self.finishOpening(at: Date(timeIntervalSince1970: self.clock.now()))
+            }
+        }
     }
 
     /// What the app can draw, which with a timetable in the bundle is the whole
@@ -2053,10 +2236,15 @@ final class AppModel {
     /// Re-read after a redraw all the same: without a timetable the span is the
     /// edges of the snapshot in hand, and that does change when one lands.
     private func updateScrubRange() async {
-        guard let span = await fleet.drawableSpan() else { return }
+        guard let span = await drawableTimeSpan() else { return }
+        timeSpan = span
+    }
+
+    private func drawableTimeSpan() async -> ClosedRange<Date>? {
+        guard let span = await fleet.drawableSpan() else { return nil }
         let low = Date(timeIntervalSince1970: TimeInterval(span.lowerBound))
         let high = Date(timeIntervalSince1970: TimeInterval(span.upperBound))
-        timeSpan = low...high
+        return low...high
     }
 
     // MARK: - The frame loop
@@ -2069,6 +2257,7 @@ final class AppModel {
     /// the work is a bbox query over several hundred journeys plus a source
     /// update. Sixty would spend four times the energy to move nothing visible.
     private func startTicking() {
+        guard !tickSchedulerSuspended else { return }
         tickTask?.cancel()
         tickTask = Task { [weak self] in
             // A deadline rather than a delay. Sleeping for the frame interval
@@ -2079,7 +2268,7 @@ final class AppModel {
             var next = ContinuousClock.now
             while !Task.isCancelled {
                 guard let self else { return }
-                await self.tick()
+                self.requestCadenceTick()
                 let interval = self.frameInterval
                 self.pacedInterval = interval
                 self.announce(interval)
@@ -2135,6 +2324,12 @@ final class AppModel {
         // produces queue one restart between them instead of one apiece; the
         // loop writes it again as soon as it is ticking at the new rate.
         self.pacedInterval = nil
+        // A rate change is also a presentation-boundary change. In particular,
+        // zoom can cross the point where geometry or full vehicle shapes are
+        // requested while a Fleet query is suspended. Do not let that old frame
+        // land after the new camera; the replacement is queued now and the pump
+        // remains globally serial while the cancelled query unwinds.
+        invalidateTickWork(requestingFreshFrame: true)
         Task { @MainActor [weak self] in self?.startTicking() }
     }
 
@@ -2298,8 +2493,36 @@ final class AppModel {
         }
         let factor = max(thermal, info.isLowPowerModeEnabled ? 2 : 1)
         guard factor != powerFactor else { return }
+        let previous = powerFactor
         powerFactor = factor
         repaceIfNeeded()
+
+        // These three are speculative improvements, not foreground answers.
+        // Stop their timers and propagate cancellation into their coalesced
+        // network requests while the reader or the hardware is asking for less
+        // work; resume them from a fresh deadline once that pressure clears.
+        if factor > 1 {
+            refineTask?.cancel(); refineTask = nil
+            liveTimingTask?.cancel(); liveTimingTask = nil
+            learningTask?.cancel(); learningTask = nil
+            // Once the timetable is usable, the rest of opening is only the
+            // national geometry warm. Stop its producer first, then discard
+            // queued speculative jobs; urgent viewport/selection geometry and
+            // the build already executing are deliberately preserved.
+            if openingFinished {
+                openingTask?.cancel()
+                openingTask = nil
+            }
+            Task { [fleet] in await fleet.cancelSpeculativeGeometry() }
+        } else if previous > 1, started, !backgroundWorkSuspended {
+            startLearning()
+            if openingFinished {
+                keepRefining()
+                keepTimingsLive()
+            } else if openingTask == nil {
+                finishOpening(at: Date(timeIntervalSince1970: clock.now()))
+            }
+        }
     }
 
     /// How often the map has to be redrawn for the fastest thing on it to move
@@ -2394,16 +2617,34 @@ final class AppModel {
     /// the zoom below that rather than switched off at it, so the dots it was
     /// holding back arrive across a pinch instead of all in the one frame that
     /// crosses zoom 11.
-    private var dotSpacing: Double {
+    private static func dotSpacing(at zoom: Double, metresPerPoint: Double) -> Double {
         let room = min(1, max(0, VehicleDot.labelMinZoom - zoom))
         guard room > 0 else { return 0 }
         return VehicleDot.radius(atZoom: zoom) * metresPerPoint * room
     }
 
-    /// Whether a coalesced tick is running, and whether another was asked for
-    /// while it was.
-    private var tickRunning = false
-    private var tickPending = false
+    /// Whether the one frame pump is running, and whether another frame was
+    /// requested while it was suspended in Fleet.
+    @ObservationIgnored private var tickRunning = false
+    @ObservationIgnored private var tickPending = false
+
+    /// Monotonic identities for requests and for the lifetime they belong to.
+    ///
+    /// Request identities let an awaited caller wait for *its frame or a newer
+    /// one*, while the epoch invalidates an in-flight frame across suspension or
+    /// a pace change. The pump remains single-file even while an invalidated
+    /// Fleet call is unwinding; a replacement is pending, never run beside it.
+    @ObservationIgnored private var tickRequestedGeneration: UInt64 = 0
+    @ObservationIgnored private var tickFinishedGeneration: UInt64 = 0
+    @ObservationIgnored private var tickEpoch: UInt64 = 0
+    @ObservationIgnored private var tickSchedulerSuspended = false
+
+    private struct TickWaiter {
+        let generation: UInt64
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    @ObservationIgnored private var tickWaiters: [TickWaiter] = []
 
     /// Ask for a redraw because a setting changed.
     ///
@@ -2420,16 +2661,112 @@ final class AppModel {
     /// buys exactly one more — so the last value of a drag is always the one
     /// that ends up drawn, and the queue cannot grow past two.
     func requestTick() {
-        tickPending = true
-        guard !tickRunning else { return }
-        tickRunning = true
-        Task { [weak self] in
-            guard let self else { return }
-            while tickPending {
-                tickPending = false
-                await tick()
+        _ = enqueueTick()
+    }
+
+    /// The frame clock is only a producer. It must go through the same pump as
+    /// settings, refreshes and selection changes or its direct `tick()` can
+    /// overtake one of theirs at an `await`.
+    private func requestCadenceTick() {
+        _ = enqueueTick()
+    }
+
+    /// Ask for a frame and wait until that request, or a newer coalesced request,
+    /// has been presented. Startup and a selected vehicle's live retiming need
+    /// this ordering; ordinary callers deliberately remain fire-and-forget.
+    private func requestTickAndWait() async {
+        let generation = enqueueTick()
+        guard tickFinishedGeneration < generation else { return }
+        await withCheckedContinuation { continuation in
+            // The pump can complete only by returning to this actor, but keep the
+            // second check beside registration so the barrier stays correct if
+            // its implementation ever stops inheriting MainActor isolation.
+            if tickFinishedGeneration >= generation {
+                continuation.resume()
+            } else {
+                tickWaiters.append(TickWaiter(
+                    generation: generation, continuation: continuation
+                ))
             }
+        }
+    }
+
+    @discardableResult
+    private func enqueueTick() -> UInt64 {
+        tickRequestedGeneration &+= 1
+        let generation = tickRequestedGeneration
+        guard !tickSchedulerSuspended else {
+            // An awaited refresh may finish after the scene resigned active. It
+            // must not hang waiting for a renderer that is deliberately asleep.
+            finishTickRequests(through: generation)
+            return generation
+        }
+        tickPending = true
+        startTickPumpIfNeeded()
+        return generation
+    }
+
+    private func startTickPumpIfNeeded() {
+        guard !tickSchedulerSuspended, !tickRunning, tickPending else { return }
+        tickRunning = true
+        tickPumpTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.drainTickRequests()
+        }
+    }
+
+    /// The sole caller of `performTick`. A request made while it is running only
+    /// replaces the pending identity; there is no second task to publish first.
+    private func drainTickRequests() async {
+        defer {
             tickRunning = false
+            tickPumpTask = nil
+            // Cancellation is used to invalidate the frame already in Fleet.
+            // Start its replacement only after that call has returned, keeping
+            // the expensive actor work globally serial as well as publication.
+            if !tickSchedulerSuspended, tickPending {
+                startTickPumpIfNeeded()
+            }
+        }
+
+        while !Task.isCancelled, !tickSchedulerSuspended, tickPending {
+            tickPending = false
+            let generation = tickRequestedGeneration
+            let epoch = tickEpoch
+            if await performTick(generation: generation, epoch: epoch) {
+                finishTickRequests(through: generation)
+            }
+        }
+    }
+
+    private func finishTickRequests(through generation: UInt64) {
+        if generation > tickFinishedGeneration {
+            tickFinishedGeneration = generation
+        }
+        guard !tickWaiters.isEmpty else { return }
+        var waiting: [TickWaiter] = []
+        waiting.reserveCapacity(tickWaiters.count)
+        for waiter in tickWaiters {
+            if waiter.generation <= generation {
+                waiter.continuation.resume()
+            } else {
+                waiting.append(waiter)
+            }
+        }
+        tickWaiters = waiting
+    }
+
+    /// Make work sampled for an old presentation lifetime unable to publish.
+    /// A fresh request stays pending behind it for re-pacing; suspension instead
+    /// finishes barriers because no renderer will run until `resume`.
+    private func invalidateTickWork(requestingFreshFrame: Bool) {
+        tickEpoch &+= 1
+        tickPending = false
+        tickPumpTask?.cancel()
+        if requestingFreshFrame, !tickSchedulerSuspended {
+            _ = enqueueTick()
+        } else {
+            finishTickRequests(through: tickRequestedGeneration)
         }
     }
 
@@ -2491,77 +2828,144 @@ final class AppModel {
     /// under anything that would show as vehicles running ahead of themselves.
     private static let maxPresentationLead = 1.0 / 6
 
-    func tick() async {
+    /// Everything a moving frame is allowed to read after its first suspension.
+    ///
+    /// Fleet is another actor. While it answers, the main actor can accept a new
+    /// viewport, zoom, selection or renderer capability. Reading any of those
+    /// again below would make a frame whose positions were queried for one camera
+    /// and whose footprints were built for another. A snapshot keeps an old frame
+    /// coherent; the coalesced request behind it then draws the newest state.
+    private struct TickFrame {
+        let generation: UInt64
+        let epoch: UInt64
+        let askedAt: ContinuousClock.Instant
+        let sampled: Double
+        let precise: Double
+        let now: Timestamp
+        let fraction: Double
+        let viewport: BBox
+        let zoom: Double
+        let metresPerPoint: Double
+        let detailed: Bool
+        let query: BBox
+        let selectedID: String?
+        let followedID: String?
+        let hiddenModes: Set<Mode>
+        let dotSpacing: Double
+        let shapesPossible: Bool
+        let solidShapes: Bool
+        let bakedModels: Bool
+        let standingVehicles: Set<String>
+        let spreadVehicles: Bool
+        let pixelsPerPoint: Double
+    }
+
+    private func captureTickFrame(generation: UInt64, epoch: UInt64) -> TickFrame {
+        let askedAt = ContinuousClock.now
+        let sampled = clock.now()
+        let precise = sampled + presentationLead
+        let now = Timestamp(precise.rounded(.down))
+        let box = viewport
+        let frameZoom = zoom
+        let frameMetresPerPoint = metresPerPoint
+        let canDrawShapes = showVehicleShapes && frameZoom >= VehicleShape.minZoom
+        let selectedID: String? = {
+            if case let .vehicle(id) = selection { return id }
+            return nil
+        }()
+        let followedID = isFollowingVehicle ? selectedID : nil
+        let spacing = Self.dotSpacing(
+            at: frameZoom, metresPerPoint: frameMetresPerPoint
+        )
+
+        return TickFrame(
+            generation: generation,
+            epoch: epoch,
+            askedAt: askedAt,
+            sampled: sampled,
+            precise: precise,
+            now: now,
+            fraction: precise - Double(now),
+            viewport: box,
+            zoom: frameZoom,
+            metresPerPoint: frameMetresPerPoint,
+            detailed: frameZoom >= 10,
+            query: canDrawShapes
+                ? box.padded(byMetres: VehicleShape.longestVehicleMetres)
+                : box,
+            selectedID: selectedID,
+            followedID: followedID,
+            hiddenModes: hiddenModes,
+            dotSpacing: spacing,
+            shapesPossible: canDrawShapes,
+            solidShapes: solidVehicles
+                && VehicleShape.solidity(pitch: pitch, zoom: frameZoom) > 0,
+            bakedModels: bakedModels,
+            standingVehicles: standingVehicles,
+            spreadVehicles: spreadVehicles,
+            pixelsPerPoint: UIScreen.main.nativeScale
+        )
+    }
+
+    private func frameIsCurrent(_ frame: TickFrame) -> Bool {
+        !tickSchedulerSuspended
+            && frame.epoch == tickEpoch
+            && frame.generation > tickFinishedGeneration
+            && !Task.isCancelled
+    }
+
+    /// Query and publish one immutable frame. Called only by
+    /// `drainTickRequests`, which is what makes the awaits below globally serial.
+    private func performTick(generation: UInt64, epoch: UInt64) async -> Bool {
+        let frame = captureTickFrame(generation: generation, epoch: epoch)
         // Four marks, so the readout can say which of the tick's four parts
         // the loop is actually behind on. The first covers everything up to
         // the fleet answering — the window check as well as the query — because
         // both are the same thing from the frame's point of view: the tick
         // suspended on an actor it does not own. See `FrameStats.TickCost`.
-        let askedAt = ContinuousClock.now
-
-        // Whole seconds for everything that reads a timetable, and the part of
-        // a second they throw away kept beside it for the one thing that needs
-        // it — see `Positioning.position(of:at:)` in its `Double` form.
-        let sampled = clock.now()
-
         // The timetable is expanded around a moment, not for all time, so the
         // window has to follow the clock. Checked here because this is the one
         // place that sees every way the clock can move — the second hand, the
         // scrubber, and the jump the time picker makes — but rate-limited to a
         // wall-clock second, because the check itself is an actor hop and this
         // runs fifteen times of those a second.
-        if sampled - lastWindowCheck > 1 || abs(sampled - lastWindowCheck) > 60 {
-            lastWindowCheck = sampled
-            if await fleet.redrawTimetableIfNeeded(at: Date(timeIntervalSince1970: sampled)) {
+        if frame.sampled - lastWindowCheck > 1
+            || abs(frame.sampled - lastWindowCheck) > 60 {
+            let redrawn = await fleet.redrawTimetableIfNeeded(
+                at: Date(timeIntervalSince1970: frame.sampled)
+            )
+            guard frameIsCurrent(frame) else { return false }
+            lastWindowCheck = frame.sampled
+            if redrawn {
                 status = await fleet.currentStatus()
                 await updateScrubRange()
+                guard frameIsCurrent(frame) else { return false }
             }
         }
-        let precise = sampled + presentationLead
-        let now = Timestamp(precise.rounded(.down))
-        let fraction = precise - Double(now)
-        let box = viewport
-        // Whether the *line* comes back with each vehicle, which is only worth
-        // carrying when the map is close enough to draw it. Not whether the
-        // path is built: where the vehicle sits on its track is decided by the
-        // fleet, which aligns trains at any zoom and everything else wherever
-        // the viewport is showing few enough vehicles to afford it. See
-        // `Fleet.alignToTrack`.
-        let detailed = zoom >= 10
-
-        // A vehicle is anchored at its head, and the query keeps whatever falls
-        // inside the box. That is right for a dot and wrong for a train: zoom
-        // in on the fourth coach of an intercity, or pan a little sideways, and
-        // the head leaves the box while most of the train is still on the
-        // screen — so the whole train is dropped and vanishes at exactly the
-        // zoom somebody went in to look at it. The box is therefore grown by
-        // more than the longest thing that can be drawn.
-        let query = shapesPossible
-            ? box.padded(byMetres: VehicleShape.longestVehicleMetres)
-            : box
-
-        let selectedId: String? = {
-            if case let .vehicle(id) = selection { return id }
-            return nil
-        }()
         var found = await fleet.vehicles(
-            in: query, at: now, fraction: fraction, withGeometry: detailed,
-            including: selectedId, hiding: hiddenModes, noCloserThan: dotSpacing
+            in: frame.query, at: frame.now, fraction: frame.fraction,
+            withGeometry: frame.detailed, including: frame.selectedID,
+            hiding: frame.hiddenModes, noCloserThan: frame.dotSpacing
         )
+        guard frameIsCurrent(frame) else { return false }
         let answeredAt = ContinuousClock.now
-        found.sort { $0.mode.drawOrder < $1.mode.drawOrder }
+        found.sort {
+            $0.mode.drawOrder == $1.mode.drawOrder
+                ? $0.id < $1.id
+                : $0.mode.drawOrder < $1.mode.drawOrder
+        }
         // What the next interval is paced off. See `pace`.
         var fastest = 0.0
         for vehicle in found where vehicle.speed > fastest { fastest = vehicle.speed }
         fastestDrawn = fastest
         vehicles = found
-        rebuildShapes()
+        rebuildShapes(found, for: frame)
         frameVersion &+= 1
         let shapedAt = ContinuousClock.now
 
         #if DEBUG
         Diagnostics.sample(
-            now: now, zoom: zoom, viewport: box,
+            now: frame.now, zoom: frame.zoom, viewport: frame.viewport,
             drawn: found.count, onTrack: found.count { $0.onTrack },
             fleet: status.vehicles
         )
@@ -2606,14 +3010,17 @@ final class AppModel {
         // has a position the follower can ease toward. Without that it was
         // simply gone: the camera stayed put and the thing the reader tapped
         // vanished.
-        if isFollowingVehicle, case let .vehicle(id) = selection,
-           let watched = vehicles.first(where: { $0.id == id }) {
+        if let followedID = frame.followedID,
+           isFollowingVehicle,
+           case let .vehicle(currentID) = selection,
+           currentID == followedID,
+           let watched = found.first(where: { $0.id == followedID }) {
             // The whole snapshot, and `precise` rather than the wall clock:
             // the follower needs the vehicle's bearing and its label every
             // refresh, and finding them by walking `vehicles` sixty or a
             // hundred and twenty times a second is a linear scan of the
             // viewport on the main thread for a value that changes once a tick.
-            onRecentre?(watched, precise)
+            onRecentre?(watched, frame.precise)
         }
 
         // What that just cost, measured at the only place that can measure it:
@@ -2621,7 +3028,7 @@ final class AppModel {
         // Heavily smoothed, because the lead has to be steadier than the thing
         // it is correcting for — a lead that chased every slow tick would be a
         // second source of the jitter rather than the cure for it.
-        let served = clock.now() - sampled
+        let served = clock.now() - frame.sampled
         if served > 0, served < 1 {
             presentationLead = min(
                 Self.maxPresentationLead, max(0, presentationLead * 0.9 + served * 0.1)
@@ -2637,7 +3044,7 @@ final class AppModel {
         if showDiagnostics {
             let endedAt = ContinuousClock.now
             tickCost.blend(
-                fleet: (answeredAt - askedAt).seconds * 1000,
+                fleet: (answeredAt - frame.askedAt).seconds * 1000,
                 shapes: (shapedAt - answeredAt).seconds * 1000,
                 push: (pushedAt - shapedAt).seconds * 1000,
                 rest: (endedAt - pushedAt).seconds * 1000
@@ -2649,11 +3056,14 @@ final class AppModel {
         // each of those wants the fixed geometry brought up with it. Asking is
         // free and coalesced; it is the *waiting* that was expensive.
         settleSoon()
+        return true
     }
 
     /// Whether a settling pass is already running, so the frame loop asking for
     /// one on every tick queues at most one at a time.
     private var settling = false
+    private var settleTask: Task<Void, Never>?
+    private var settleGeneration: UInt64 = 0
 
     /// Ask for the fixed geometry to be brought up to date, without waiting.
     ///
@@ -2679,12 +3089,16 @@ final class AppModel {
     /// guarded on its own revision, which is what makes skipping a request
     /// harmless: the next tick asks again.
     private func settleSoon() {
-        guard !settling else { return }
+        guard !backgroundWorkSuspended, !settling else { return }
         settling = true
-        Task { @MainActor [weak self] in
+        settleGeneration &+= 1
+        let generation = settleGeneration
+        settleTask = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.settleWhatDoesNotMove()
+            guard self.settleGeneration == generation else { return }
             self.settling = false
+            self.settleTask = nil
         }
     }
 
@@ -2693,6 +3107,7 @@ final class AppModel {
     /// Split out of `tick` so that none of it is on the frame's clock. See
     /// `settleSoon`, which explains why that matters more than it looks.
     private func settleWhatDoesNotMove() async {
+        guard !backgroundWorkSuspended, !Task.isCancelled else { return }
         let box = viewport
         let now = Timestamp(clock.now().rounded(.down))
         let plateMark = plateRevision
@@ -2701,8 +3116,11 @@ final class AppModel {
         let cablewayMark = cablewaysRevision
 
         await refreshTracksIfNeeded()
+        guard !backgroundWorkSuspended, !Task.isCancelled else { return }
         await refreshTunnelsIfNeeded()
+        guard !backgroundWorkSuspended, !Task.isCancelled else { return }
         await refreshCablewaysIfNeeded(at: now)
+        guard !backgroundWorkSuspended, !Task.isCancelled else { return }
 
         // Fed generously and filtered by the layers themselves: the three stop
         // bands each carry their own zoom range, so the source only has to hold
@@ -2762,9 +3180,16 @@ final class AppModel {
         }
 
         await refreshPlatesIfNeeded()
+        guard !backgroundWorkSuspended, !Task.isCancelled else { return }
 
-        if case let .vehicle(id) = selection {
-            await loadVehicle(id: id, at: now)
+        let panelSelection = selection
+        let panelGeneration = selectionGeneration
+        if case let .vehicle(id) = panelSelection {
+            await loadVehicle(
+                id: id, at: now,
+                expected: panelSelection, generation: panelGeneration
+            )
+            guard !backgroundWorkSuspended, !Task.isCancelled else { return }
         }
 
         // A second frame only if one of them actually produced something. Each
@@ -2882,8 +3307,8 @@ final class AppModel {
     /// in frames. A dropped frame must not slow the change down.
     private var lastEmergeStep: TimeInterval?
 
-    private func rebuildShapes() {
-        guard shapesPossible else {
+    private func rebuildShapes(_ candidates: [VehicleSnapshot], for frame: TickFrame) {
+        guard frame.shapesPossible else {
             if !vehicleShapes.isEmpty { vehicleShapes = []; shapesByID = [:] }
             // `emerging` is deliberately kept. Zoom 12.5 is where shapes are
             // allowed at all, and it is also where a long train crosses its own
@@ -2892,6 +3317,11 @@ final class AppModel {
             // Only the clock is reset, so the first frame back steps by nothing
             // and the change starts from where it was left.
             lastEmergeStep = nil
+            // No body is visible to carry a lateral transition across this
+            // boundary. Re-entering shape range should establish the vehicles
+            // now in view, not resume offsets belonging to an old viewport.
+            lateralOffsets = [:]
+            spreadVehicleIDs = []
             return
         }
         // Clamped, because the gap across a backgrounded app is minutes and a
@@ -2901,31 +3331,34 @@ final class AppModel {
         let dt = min(0.25, max(0, now - (lastEmergeStep ?? now)))
         lastEmergeStep = now
         let step = VehicleShape.emergeSeconds > 0 ? dt / VehicleShape.emergeSeconds : 1
-        let selectedID: String? = {
-            if case let .vehicle(id) = selection { return id }
-            return nil
-        }()
+        let selectedID = frame.selectedID
 
-        let sideways = spread(vehicles)
+        let sideways = spread(
+            candidates, enabled: frame.spreadVehicles, elapsed: dt
+        )
         let ringedID = selectedID.flatMap { id -> String? in
-            ringSelection(of: vehicles.first { $0.id == id }) ? id : nil
+            ringSelection(
+                of: candidates.first { $0.id == id },
+                following: frame.followedID == id,
+                at: frame.precise
+            ) ? id : nil
         }
         // Slicing a vehicle into slabs costs about as much again as drawing it
         // flat, and on a map looking straight down nothing would ever look at
         // the result. Asked once for the whole rebuild rather than per vehicle:
         // it is a fact about the camera, and the camera does not move between
         // two vehicles of the same tick.
-        let solid = solidity > 0
+        let solid = frame.solidShapes
 
         var built: [VehicleFootprint] = []
-        built.reserveCapacity(min(vehicles.count, Self.shapeLimit))
+        built.reserveCapacity(min(candidates.count, Self.shapeLimit))
         var byID: [String: VehicleFootprint] = [:]
         // Rebuilt rather than pruned: a vehicle that has left the feed has to
         // leave this too, and rebuilding is one pass over the same list the
         // loop below already walks.
         var stillEmerging: [String: Double] = [:]
         stillEmerging.reserveCapacity(emerging.count)
-        for vehicle in vehicles {
+        for vehicle in candidates {
             if built.count >= Self.shapeLimit { break }
             let layout = layouts.layout(for: vehicle, modeColour: vehicle.mode.hex)
             // The decision, taken on the same two numbers the footprint takes
@@ -2935,7 +3368,7 @@ final class AppModel {
                 bodies: layout.units.count, hanging: Cableway.hangs(vehicle)
             )
             let floor = vehicle.id == selectedID ? threshold * 0.6 : threshold
-            let target: Double = layout.length / metresPerPoint >= floor ? 1 : 0
+            let target: Double = layout.length / frame.metresPerPoint >= floor ? 1 : 0
             // A vehicle seen for the first time snaps. Panning onto a station
             // full of trains is not fifty vehicles arriving; they were already
             // there, and animating them in is the map inventing an event.
@@ -2953,17 +3386,17 @@ final class AppModel {
             stillEmerging[vehicle.id] = shown
             guard shown > 0 else { continue }
             guard let shape = VehicleShape.footprint(
-                of: vehicle, layout: layout, metresPerPoint: metresPerPoint,
-                pixelsPerPoint: UIScreen.main.nativeScale,
+                of: vehicle, layout: layout, metresPerPoint: frame.metresPerPoint,
+                pixelsPerPoint: frame.pixelsPerPoint,
                 selected: vehicle.id == selectedID,
                 ringed: vehicle.id == ringedID,
                 lateralOffset: sideways[vehicle.id] ?? 0,
-                solid: solid, extruded: !bakedModels,
+                solid: solid, extruded: !frame.bakedModels,
                 emerged: shown,
                 // Nothing but bodies for a vehicle the renderer is drawing as
                 // a mesh: the rest of its flat drawing cannot be painted by
                 // anything. See `standingVehicles`.
-                bodiesOnly: standingVehicles.contains(vehicle.id)
+                bodiesOnly: frame.standingVehicles.contains(vehicle.id)
             ) else { continue }
             built.append(shape)
             byID[vehicle.id] = shape
@@ -2989,12 +3422,13 @@ final class AppModel {
     /// again: the train stopping, since a train standing among others at a
     /// platform is exactly the case where which one is not obvious, and the
     /// camera letting go, since then nothing else is saying which train this is.
-    private func ringSelection(of vehicle: VehicleSnapshot?) -> Bool {
-        guard let vehicle, vehicle.moving, isFollowingVehicle else {
+    private func ringSelection(
+        of vehicle: VehicleSnapshot?, following: Bool, at now: Double
+    ) -> Bool {
+        guard let vehicle, vehicle.moving, following else {
             ringHeldFrom = nil
             return true
         }
-        let now = clock.now()
         guard let since = ringHeldFrom else {
             ringHeldFrom = now
             return true
@@ -3047,9 +3481,12 @@ final class AppModel {
     /// changes everyone's rank, and without the easing the whole fan would jump
     /// sideways when it did. The easing is also what walks an already-placed
     /// vehicle back to zero rather than snapping it there.
-    private func spread(_ candidates: [VehicleSnapshot]) -> [String: Double] {
-        guard spreadVehicles else {
+    private func spread(
+        _ candidates: [VehicleSnapshot], enabled: Bool, elapsed: TimeInterval
+    ) -> [String: Double] {
+        guard enabled else {
             if !lateralOffsets.isEmpty { lateralOffsets = [:] }
+            if !spreadVehicleIDs.isEmpty { spreadVehicleIDs = [] }
             return [:]
         }
 
@@ -3085,24 +3522,38 @@ final class AppModel {
             }
         }
 
-        // Ease toward it, and forget vehicles that have gone.
+        // Match the old twelve-percent step at thirty frames a second, but make
+        // it a function of elapsed time. Thermal throttling or one slow Fleet
+        // query must not make the fan take several times longer to settle.
+        let easedFraction = elapsed > 0
+            ? 1 - pow(1 - Self.spreadEasingPerFrame, elapsed * 30)
+            : 0
+
+        // Ease toward it, and forget vehicles that have gone. A vehicle newly
+        // panned into view appears at its established place, as before; one that
+        // was already visible at zero and has just acquired a neighbour starts
+        // at zero rather than snapping a whole track sideways.
         var next: [String: Double] = [:]
         next.reserveCapacity(candidates.count)
         for vehicle in candidates {
             let target = wanted[vehicle.id] ?? 0
-            let current = lateralOffsets[vehicle.id] ?? target
+            let current = lateralOffsets[vehicle.id]
+                ?? (spreadVehicleIDs.contains(vehicle.id) ? 0 : target)
             let eased = abs(target - current) < 0.05
                 ? target
-                : current + (target - current) * Self.spreadEasing
+                : current + (target - current) * easedFraction
             if eased != 0 { next[vehicle.id] = eased }
         }
         lateralOffsets = next
+        spreadVehicleIDs = Set(candidates.lazy.map(\.id))
         return next
     }
 
-    /// How far a vehicle moves toward its place in the fan each tick.
-    private static let spreadEasing = 0.12
+    /// The old easing at its reference rate. Converted to elapsed time above.
+    private static let spreadEasingPerFrame = 0.12
     private var lateralOffsets: [String: Double] = [:]
+    /// Includes vehicles currently at zero, which `lateralOffsets` omits.
+    private var spreadVehicleIDs: Set<String> = []
 
     /// What orders one vehicle against another across the tracks.
     ///
@@ -3129,21 +3580,31 @@ final class AppModel {
     /// themselves are re-read, rather than cached against the selection.
     private func refreshDisruptions() async {
         let now = clock.nowSeconds()
+        let expected = selection
+        let generation = selectionGeneration
+        guard selectionIsCurrent(expected, generation: generation),
+              !Task.isCancelled else { return }
 
-        switch selection {
+        switch expected {
         case let .station(board):
+            let found = await situations.forStop(ref: board.id, at: now)
+            guard selectionIsCurrent(expected, generation: generation),
+                  !Task.isCancelled else { return }
             vehicleDisruptions = []
-            stopDisruptions = await situations.forStop(ref: board.id, at: now)
+            stopDisruptions = found
         case let .platform(board):
+            let found = await situations.forStop(ref: board.id, at: now)
+            guard selectionIsCurrent(expected, generation: generation),
+                  !Task.isCancelled else { return }
             vehicleDisruptions = []
-            stopDisruptions = await situations.forStop(ref: board.id, at: now)
+            stopDisruptions = found
         case .vehicle:
-            stopDisruptions = []
             guard let vehicle = departingVehicle ?? selectedVehicle else {
                 vehicleDisruptions = []
+                stopDisruptions = []
                 return
             }
-            vehicleDisruptions = await situations.forVehicle(
+            let found = await situations.forVehicle(
                 id: vehicle.id,
                 parts: (vehicle.parts ?? []).map(\.id),
                 line: vehicle.line,
@@ -3153,6 +3614,10 @@ final class AppModel {
                 stopRefs: vehicle.stops.compactMap(\.ref),
                 at: now
             )
+            guard selectionIsCurrent(expected, generation: generation),
+                  !Task.isCancelled else { return }
+            stopDisruptions = []
+            vehicleDisruptions = found
         case .none, .track, .line, .choices:
             // A line's notices are not asked for. The situations index answers
             // for a stop or for a working, and a relation is neither: it is the
@@ -3163,9 +3628,88 @@ final class AppModel {
         }
     }
 
-    private func refreshSelection() async {
-        defer { Task { await refreshDisruptions() } }
-        switch selection {
+    private func scheduleSelectionRefresh() {
+        guard !backgroundWorkSuspended else { return }
+        selectionTask?.cancel()
+        let expected = selection
+        let generation = selectionGeneration
+        selectionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.refreshSelection(expected, generation: generation)
+            if self.selectionIsCurrent(expected, generation: generation) {
+                self.selectionTask = nil
+            }
+        }
+    }
+
+    private func cancelSelectionWork(clearPresentation: Bool) {
+        selectionGeneration &+= 1
+        selectionTask?.cancel(); selectionTask = nil
+        occupancyTask?.cancel(); occupancyTask = nil
+        occupancyRequestGeneration &+= 1
+        occupancyVehicleID = nil
+        formationTask?.cancel(); formationTask = nil
+        formationRequestGeneration &+= 1
+        branchTask?.cancel(); branchTask = nil
+        branchRequestGeneration &+= 1
+
+        // Reset request identities even when presentation is retained across a
+        // brief suspension. Resume then retries anything whose waiter was
+        // cancelled instead of mistaking the old key for a completed answer.
+        loadKey = nil
+        formationKey = nil
+        panelReadAt = .distantPast
+        guard clearPresentation else { return }
+        selectedVehicle = nil
+        selectedVehicleMissing = false
+        departingVehicle = nil
+        vehicleLoad = nil
+        liveTiming = nil
+        formation = nil
+        formationState = .notApplicable
+        vehicleDisruptions = []
+        stopDisruptions = []
+        setSelectedGeometry(nil)
+        setSelectedBranches([])
+    }
+
+    private func selectionIsCurrent(_ expected: Selection, generation: UInt64) -> Bool {
+        generation == selectionGeneration
+            && selection == expected
+            && !backgroundWorkSuspended
+    }
+
+    private func occupancyRequestIsCurrent(
+        _ request: UInt64, vehicleID: String,
+        expected: Selection, generation: UInt64
+    ) -> Bool {
+        selectionIsCurrent(expected, generation: generation)
+            && request == occupancyRequestGeneration
+            && vehicleID == occupancyVehicleID
+    }
+
+    private func formationRequestIsCurrent(
+        _ request: UInt64, key: FormationKey,
+        expected: Selection, generation: UInt64
+    ) -> Bool {
+        selectionIsCurrent(expected, generation: generation)
+            && request == formationRequestGeneration
+            && key == formationKey
+    }
+
+    private func branchRequestIsCurrent(
+        _ request: UInt64, key: FormationKey,
+        expected: Selection, generation: UInt64
+    ) -> Bool {
+        selectionIsCurrent(expected, generation: generation)
+            && request == branchRequestGeneration
+            && key == formationKey
+    }
+
+    private func refreshSelection(_ expected: Selection, generation: UInt64) async {
+        guard selectionIsCurrent(expected, generation: generation),
+              !Task.isCancelled else { return }
+        switch expected {
         case .none, .station, .platform, .track, .choices:
             selectedVehicle = nil
             selectedVehicleMissing = false
@@ -3178,7 +3722,7 @@ final class AppModel {
             // whichever vehicle was looked at last; `.none` is the sheet on its
             // way out, and resizing a sheet as it leaves is what froze it. See
             // `ContentView.resting`.
-            if selection != .none { panelFold = 0 }
+            if expected != .none { panelFold = 0 }
         case let .line(line):
             // The one selection that is *not* a vehicle and still draws a line.
             // The route layer was built for a journey, but nothing in it is
@@ -3192,8 +3736,14 @@ final class AppModel {
             setSelectedGeometry(line.geometry)
             panelFold = 0
         case let .vehicle(id):
-            await loadVehicle(id: id, at: clock.nowSeconds())
+            await loadVehicle(
+                id: id, at: clock.nowSeconds(),
+                expected: expected, generation: generation
+            )
         }
+        guard selectionIsCurrent(expected, generation: generation),
+              !Task.isCancelled else { return }
+        await refreshDisruptions()
     }
 
     /// How often the vehicle panel may re-read while nothing in it has changed.
@@ -3204,9 +3754,15 @@ final class AppModel {
     private static let panelCadence: TimeInterval = 1
     private var panelReadAt = Date.distantPast
 
-    private func loadVehicle(id: String, at now: Timestamp) async {
+    private func loadVehicle(
+        id: String, at now: Timestamp, expected: Selection, generation: UInt64
+    ) async {
         let found = await fleet.journey(id: id, at: now)
+        guard selectionIsCurrent(expected, generation: generation),
+              !Task.isCancelled else { return }
         let departing = await outgoing(of: found, at: now)
+        guard selectionIsCurrent(expected, generation: generation),
+              !Task.isCancelled else { return }
         // Only where nothing was found *and* nothing is already on the panel: a
         // vehicle that has finished its run while being watched should keep the
         // card it had rather than replace it with an error.
@@ -3239,8 +3795,11 @@ final class AppModel {
         panelReadAt = Date()
         selectedVehicle = found
         departingVehicle = departing
-        loadFormation(of: departing ?? found)
-        loadOccupancy(of: departing ?? found)
+        loadFormation(
+            of: departing ?? found, arriving: found,
+            expected: expected, generation: generation
+        )
+        loadOccupancy(of: departing ?? found, expected: expected, generation: generation)
     }
 
     /// Ask how full the vehicle on the panel is.
@@ -3248,10 +3807,16 @@ final class AppModel {
     /// Keyed on the journey and its service day rather than on the read, for
     /// the same reason the formation is: this runs as often as the card can
     /// change, and a load forecast does not move between frames.
-    private func loadOccupancy(of vehicle: VehicleSnapshot?) {
+    private func loadOccupancy(
+        of vehicle: VehicleSnapshot?, expected: Selection, generation: UInt64
+    ) {
         guard let vehicle, !vehicle.stops.isEmpty else {
+            occupancyTask?.cancel(); occupancyTask = nil
+            occupancyRequestGeneration &+= 1
+            occupancyVehicleID = nil
             loadKey = nil
             vehicleLoad = nil
+            liveTiming = nil
             return
         }
         // The reference OJP knows this run by, which is not the same thing as
@@ -3260,43 +3825,87 @@ final class AppModel {
         // separately — and 20.7% of a weekday's trips carry none at all, which
         // is a run nothing can be asked about rather than a run that is on time.
         let id = vehicle.id
-        Task { [fleet, loads] in
+        guard occupancyVehicleID != id else { return }
+        occupancyTask?.cancel()
+        occupancyRequestGeneration &+= 1
+        let request = occupancyRequestGeneration
+        occupancyVehicleID = id
+        occupancyTask = Task { @MainActor [weak self, fleet, loads] in
+            guard let self else { return }
+            defer {
+                if self.occupancyRequestIsCurrent(
+                    request, vehicleID: id, expected: expected, generation: generation
+                ) {
+                    self.occupancyTask = nil
+                }
+            }
             guard let handle = await fleet.journeyRef(for: id) else {
-                if selectedVehicle?.id == id { vehicleLoad = nil; liveTiming = nil }
+                guard self.occupancyRequestIsCurrent(
+                    request, vehicleID: id, expected: expected, generation: generation
+                ),
+                      !Task.isCancelled else { return }
+                self.vehicleLoad = nil
+                self.liveTiming = nil
                 return
             }
+            guard self.occupancyRequestIsCurrent(
+                request, vehicleID: id, expected: expected, generation: generation
+            ), !Task.isCancelled
+            else { return }
             let key = LoadService.Key(journeyID: handle.ref, day: handle.day)
-            guard key != loadKey else { return }
-            loadKey = key
-            vehicleLoad = nil
+            guard key != self.loadKey else { return }
+            self.loadKey = key
+            self.vehicleLoad = nil
 
             let answer = await loads.load(for: key)
             // The panel may have moved on while this was in flight, and
             // answering the old question over the new one is worse than not
             // answering at all.
-            guard loadKey == key else { return }
-            if case let .load(found) = answer { vehicleLoad = found }
+            guard self.occupancyRequestIsCurrent(
+                request, vehicleID: id, expected: expected, generation: generation
+            ), !Task.isCancelled, self.loadKey == key
+            else { return }
+            if case let .load(found) = answer { self.vehicleLoad = found }
 
             // The same response carries the delays. Folding them onto the
             // stored journey is what turns a timetabled line on the map into a
             // live one — and it is the whole of the network cost of doing so:
             // about five kilobytes, for the one train being looked at.
             if let timing = await loads.timing(for: key) {
-                let before = vehicles.first(where: { $0.id == id })
+                guard self.occupancyRequestIsCurrent(
+                    request, vehicleID: id, expected: expected, generation: generation
+                ), !Task.isCancelled, self.loadKey == key
+                else { return }
+                let before = self.vehicles.first(where: { $0.id == id })
                 let touched = await fleet.applyTiming(timing, to: id, at: Date())
-                guard loadKey == key else { return }
-                liveTiming = touched > 0 ? timing : nil
+                guard self.occupancyRequestIsCurrent(
+                    request, vehicleID: id, expected: expected, generation: generation
+                ), !Task.isCancelled, self.loadKey == key
+                else { return }
+                self.liveTiming = touched > 0 ? timing : nil
                 if touched > 0 {
-                    await tick()
+                    await self.requestTickAndWait()
+                    guard self.occupancyRequestIsCurrent(
+                        request, vehicleID: id, expected: expected, generation: generation
+                    ), !Task.isCancelled, self.loadKey == key
+                    else { return }
                     // Where the fold has put it, not where the glide has got to
                     // — see `Fleet.settledPosition`.
                     let settled = await fleet.settledPosition(
-                        of: id, at: Timestamp(clock.nowSeconds())
+                        of: id, at: Timestamp(self.clock.nowSeconds())
                     )
-                    catchCameraUp(to: id, from: before, settlingAt: settled)
+                    guard self.occupancyRequestIsCurrent(
+                        request, vehicleID: id, expected: expected, generation: generation
+                    ), !Task.isCancelled, self.loadKey == key
+                    else { return }
+                    self.catchCameraUp(to: id, from: before, settlingAt: settled)
                 }
             } else {
-                liveTiming = nil
+                guard self.occupancyRequestIsCurrent(
+                    request, vehicleID: id, expected: expected, generation: generation
+                ), !Task.isCancelled, self.loadKey == key
+                else { return }
+                self.liveTiming = nil
             }
         }
     }
@@ -3339,7 +3948,10 @@ final class AppModel {
     /// Keyed on the train rather than on the read, because `loadVehicle` runs
     /// as often as the card can change and the formation cannot: a train is
     /// re-marshalled between workings, not between frames.
-    private func loadFormation(of vehicle: VehicleSnapshot?) {
+    private func loadFormation(
+        of vehicle: VehicleSnapshot?, arriving: VehicleSnapshot?,
+        expected: Selection, generation: UInt64
+    ) {
         guard let vehicle, vehicle.mode == .train, !vehicle.stops.isEmpty else {
             clearFormation()
             return
@@ -3361,6 +3973,11 @@ final class AppModel {
             operationDate: FormationKey.operationDate(of: origin.dep)
         )
         guard key != formationKey else { return }
+        formationTask?.cancel(); formationTask = nil
+        formationRequestGeneration &+= 1
+        let request = formationRequestGeneration
+        branchTask?.cancel(); branchTask = nil
+        branchRequestGeneration &+= 1
         formationKey = key
         formation = nil
         // A train whose id carries no train number, or whose operator is not one
@@ -3378,12 +3995,23 @@ final class AppModel {
         var mine = Set([vehicle.id])
         for part in vehicle.parts ?? [] { mine.insert(part.id) }
 
-        Task { [formations, fleet] in
+        formationTask = Task { @MainActor [weak self, formations, fleet] in
+            guard let self else { return }
+            defer {
+                if self.formationRequestIsCurrent(
+                    request, key: key, expected: expected, generation: generation
+                ) {
+                    self.formationTask = nil
+                }
+            }
             let answer = await formations.formation(for: key)
             // The panel may have moved on to another train while this was in
             // flight, and answering the old question over the new one is worse
             // than not answering at all.
-            guard formationKey == key else { return }
+            guard self.formationRequestIsCurrent(
+                request, key: key, expected: expected, generation: generation
+            ), !Task.isCancelled
+            else { return }
             switch answer {
             case let .formation(raw):
                 // The portions a splitting train is drawn from name their
@@ -3394,9 +4022,13 @@ final class AppModel {
                     $0.destination == nil ? $0.destinationUIC : nil
                 })
                 let names = wanted.isEmpty ? [:] : await fleet.stopNames(uic: wanted)
+                guard self.formationRequestIsCurrent(
+                    request, key: key, expected: expected, generation: generation
+                ), !Task.isCancelled
+                else { return }
                 let found = raw.naming { names[$0] }
-                formation = found
-                formationState = .ready(found)
+                self.formation = found
+                self.formationState = .ready(found)
 
                 // Write it down. This is the half of the layout database that
                 // is not shipped: what the line usually runs is a guess good
@@ -3405,11 +4037,11 @@ final class AppModel {
                 // this panel and this day — and the map is redrawn from it at
                 // once, because the vehicle whose formation was just fetched is
                 // on screen and is at this moment drawn from the guess.
-                let learned = layouts.learn(
+                let learned = self.layouts.learn(
                     found, key: LayoutKey(key), at: Date(),
                     mode: vehicle.mode, category: vehicle.category, line: vehicle.line,
                     operatorName: vehicle.operatorName, modeColour: vehicle.mode.hex,
-                    slot: layouts.slot(for: vehicle)
+                    slot: self.layouts.slot(for: vehicle)
                 )
                 // At a terminus the panel describes the working the train
                 // *becomes*, and that is the number the formation was fetched
@@ -3417,9 +4049,9 @@ final class AppModel {
                 // brought it in. Filed under only one of them, the map goes on
                 // drawing the guess for the very train whose formation is on
                 // screen beside it. It is one physical train; file it as both.
-                if let arriving = selectedVehicle, arriving.id != vehicle.id,
-                   let alsoKnownAs = layouts.key(for: arriving) {
-                    layouts.learn(
+                if let arriving, arriving.id != vehicle.id,
+                   let alsoKnownAs = self.layouts.key(for: arriving) {
+                    self.layouts.learn(
                         found, key: alsoKnownAs, at: Date(),
                         mode: arriving.mode, category: arriving.category, line: arriving.line,
                         operatorName: arriving.operatorName, modeColour: arriving.mode.hex,
@@ -3428,16 +4060,19 @@ final class AppModel {
                         // the whole point of a slot is that those are filed
                         // apart — a set that comes in at 09:58 and goes out at
                         // 10:04 belongs to both hours, once each.
-                        slot: layouts.slot(for: arriving)
+                        slot: self.layouts.slot(for: arriving)
                     )
                 }
-                if learned { requestTick() }
+                if learned { self.requestTick() }
 
-                loadBranches(of: found, for: key, of: vehicle, excluding: mine)
+                self.loadBranches(
+                    of: found, for: key, of: vehicle, excluding: mine,
+                    expected: expected, generation: generation
+                )
             case .none, .failed:
-                formation = nil
-                formationState = .unavailable
-                setSelectedBranches([])
+                self.formation = nil
+                self.formationState = .unavailable
+                self.setSelectedBranches([])
             }
         }
     }
@@ -3481,16 +4116,23 @@ final class AppModel {
     /// guess until the answer arrives and redrawn when it does.
     private func startLearning() {
         learningTask?.cancel()
+        guard !backgroundWorkSuspended else { learningTask = nil; return }
         learningTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                guard !self.backgroundWorkSuspended, self.powerFactor == 1 else {
+                    try? await Task.sleep(for: Self.sweepIdle)
+                    continue
+                }
                 let batch = self.formationsWorthLearning(limit: Self.sweepSize)
                 guard !batch.isEmpty else {
                     try? await Task.sleep(for: Self.sweepIdle)
                     continue
                 }
                 for vehicle in batch {
-                    if Task.isCancelled { return }
+                    if Task.isCancelled || self.backgroundWorkSuspended || self.powerFactor > 1 {
+                        break
+                    }
                     await self.learnFormation(of: vehicle)
                     try? await Task.sleep(for: Self.sweepSpacing)
                 }
@@ -3580,9 +4222,11 @@ final class AppModel {
     /// working that carries it. See `Fleet.onward(from:notBefore:to:mode:at:)`.
     private func loadBranches(
         of formation: TrainFormation, for key: FormationKey, of vehicle: VehicleSnapshot,
-        excluding mine: Set<String>
+        excluding mine: Set<String>, expected: Selection, generation: UInt64
     ) {
         guard let split = formation.split else {
+            branchTask?.cancel(); branchTask = nil
+            branchRequestGeneration &+= 1
             setSelectedBranches([])
             return
         }
@@ -3597,9 +4241,24 @@ final class AppModel {
         let moment = split.moment.map { Timestamp($0.timeIntervalSince1970) }
             ?? vehicle.stops.last?.arr ?? clock.nowSeconds()
 
-        Task { [fleet, clock] in
+        branchTask?.cancel()
+        branchRequestGeneration &+= 1
+        let request = branchRequestGeneration
+        branchTask = Task { @MainActor [weak self, fleet, clock] in
+            guard let self else { return }
+            defer {
+                if self.branchRequestIsCurrent(
+                    request, key: key, expected: expected, generation: generation
+                ) {
+                    self.branchTask = nil
+                }
+            }
             var found: [RouteBranch] = []
             for portion in split.portions {
+                guard self.branchRequestIsCurrent(
+                    request, key: key, expected: expected, generation: generation
+                ), !Task.isCancelled
+                else { return }
                 guard let destination = portion.destination else { continue }
                 // A portion this vehicle is itself carrying on as is already
                 // the line on the map and the stops in the list.
@@ -3609,6 +4268,9 @@ final class AppModel {
                 var other: VehicleSnapshot?
                 for id in named where !mine.contains(id) {
                     let candidate = await fleet.journey(id: id, at: clock.nowSeconds())
+                    guard self.branchRequestIsCurrent(
+                        request, key: key, expected: expected, generation: generation
+                    ), !Task.isCancelled else { return }
                     if let candidate, let to = candidate.to, Self.sameStop(to, destination) {
                         other = candidate
                         break
@@ -3619,6 +4281,9 @@ final class AppModel {
                         from: split.stopName, notBefore: moment, to: destination,
                         mode: vehicle.mode, at: clock.nowSeconds()
                     )
+                    guard self.branchRequestIsCurrent(
+                        request, key: key, expected: expected, generation: generation
+                    ), !Task.isCancelled else { return }
                 }
                 guard let other, !mine.contains(other.id) else { continue }
 
@@ -3638,8 +4303,11 @@ final class AppModel {
                 ))
             }
             // The panel may have moved on while this was in flight.
-            guard formationKey == key else { return }
-            setSelectedBranches(found)
+            guard self.branchRequestIsCurrent(
+                request, key: key, expected: expected, generation: generation
+            ), !Task.isCancelled
+            else { return }
+            self.setSelectedBranches(found)
         }
     }
 
@@ -3691,6 +4359,10 @@ final class AppModel {
     }
 
     private func clearFormation() {
+        formationTask?.cancel(); formationTask = nil
+        formationRequestGeneration &+= 1
+        branchTask?.cancel(); branchTask = nil
+        branchRequestGeneration &+= 1
         formationKey = nil
         formation = nil
         formationState = .notApplicable

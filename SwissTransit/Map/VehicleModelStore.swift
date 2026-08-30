@@ -114,12 +114,22 @@ final class VehicleModelStore {
         var file: URL?
     }
 
-    /// Keys whose mesh is being built on a background thread right now.
+    /// Keys whose mesh is being built on a background thread right now, and the
+    /// identity of that physical build.
     ///
     /// Held so a wagon on screen for thirty frames is not baked thirty times.
-    /// Once the bake finishes the key moves to `registered` or to `refused`
-    /// and stops being wanted.
-    private var baking: Set<VehicleModelKey> = []
+    /// The identity makes a late completion incapable of clearing a newer
+    /// request for the same key. More importantly, this table is not cleared by
+    /// a style reload: it is the real concurrency count, so rapid reloads cannot
+    /// launch another six utility jobs while the previous six are still running.
+    private var baking: [VehicleModelKey: UInt64] = [:]
+    private var nextBakeID: UInt64 = 0
+
+    /// Which style lifetime may accept a completed bake. Mesh construction is
+    /// independent of the style, but registration is not; after a reload the
+    /// new style deliberately requests fresh names and an old completion is
+    /// discarded rather than allowed to disturb that request's bookkeeping.
+    private var styleGeneration: UInt64 = 0
 
     /// Meshes that finished baking since the last rebuild.
     ///
@@ -129,6 +139,14 @@ final class VehicleModelStore {
     /// says so here, and the next rebuild — which already has the style in its
     /// hand — does the one part that has to happen on the main actor.
     private var ready: [Baked] = []
+
+    /// Whether the follow lane still has model work to collect.
+    ///
+    /// A visible solid is not itself pending work: once its meshes have been
+    /// registered, a stopped vehicle can put its display link to sleep. The
+    /// link only has to stay awake while a bake is running or a completed bake
+    /// is waiting to be handed to the style.
+    var hasPendingWork: Bool { !baking.isEmpty || !ready.isEmpty }
 
     /// Register whatever is needed for these placements, and say what to call
     /// each one.
@@ -148,7 +166,7 @@ final class VehicleModelStore {
         var wanted: [VehicleModelKey: Int] = [:]
         for placement in placements where registered[placement.model] == nil {
             guard !refused.contains(placement.model),
-                  !baking.contains(placement.model) else { continue }
+                  baking[placement.model] == nil else { continue }
             wanted[placement.model, default: 0] += 1
         }
         if registered.count + wanted.count > Self.keep {
@@ -169,7 +187,6 @@ final class VehicleModelStore {
         let finished = ready
         ready.removeAll(keepingCapacity: true)
         for baked in finished {
-            baking.remove(baked.key)
             // No file means the mesh had nothing in it. Rare and not an error
             // — a unit so short that every level rakes past its own body — but
             // there is nothing to register and no point asking again.
@@ -213,7 +230,10 @@ final class VehicleModelStore {
         let name = "transit-wagon-\(nextId)"
         nextId += 1
         let file = directory.appendingPathComponent("\(name).glb")
-        baking.insert(key)
+        nextBakeID &+= 1
+        let bakeID = nextBakeID
+        let generation = styleGeneration
+        baking[key] = bakeID
         Task.detached(priority: .utility) {
             // The three expensive steps, none of which needs the map: build the
             // shape, encode it, put it on disk. A nil file at the end means one
@@ -225,9 +245,17 @@ final class VehicleModelStore {
                 written = file
             }
             let result = written
-            await MainActor.run { [weak self] in
-                self?.ready.append(Baked(key: key, name: name, file: result))
+            let accepted = await MainActor.run { [weak self] in
+                guard let self, self.baking[key] == bakeID else { return false }
+                self.baking[key] = nil
+                guard self.styleGeneration == generation else { return false }
+                self.ready.append(Baked(key: key, name: name, file: result))
+                return true
             }
+            // A style changed while this utility job was in flight. Its name can
+            // no longer be registered, and leaving every abandoned GLB behind
+            // turns repeated theme changes into a cache leak.
+            if !accepted, result != nil { try? FileManager.default.removeItem(at: file) }
         }
     }
 
@@ -238,15 +266,20 @@ final class VehicleModelStore {
     /// the renderer cannot find — which draws nothing, silently, for as long as
     /// the app is open.
     func styleChanged() {
+        styleGeneration &+= 1
         registered.removeAll(keepingCapacity: true)
         refused.removeAll(keepingCapacity: true)
-        // Anything half-baked belonged to the old style and must not be
-        // registered against the new one under a name it never had. The task
-        // itself is left to finish and drop its result on the floor — it is a
-        // millisecond of arithmetic and cancelling it costs more bookkeeping
-        // than letting it land.
-        baking.removeAll(keepingCapacity: true)
+        // Completed-but-undrained models belonged to the old generation. Tasks
+        // still running remain in `baking` until their physical work finishes,
+        // preserving the concurrency ceiling; their generation check then drops
+        // the result and releases the slot without touching a newer request.
+        let abandonedFiles = ready.compactMap(\.file)
         ready.removeAll(keepingCapacity: true)
+        if !abandonedFiles.isEmpty {
+            Task.detached(priority: .utility) {
+                for file in abandonedFiles { try? FileManager.default.removeItem(at: file) }
+            }
+        }
         working = nil
     }
 }

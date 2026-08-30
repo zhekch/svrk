@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import TransitCore
 
@@ -35,6 +36,7 @@ import TransitCore
 /// closing the panel left bare map and no way back to the train underneath the
 /// phone — the app throwing away the one thing it had worked out.
 struct RidePill: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let offer: RideWatch.Offer
     /// Take the offer. A tap does what the pull does, for anyone who does not
     /// read the handle as an invitation.
@@ -45,6 +47,7 @@ struct RidePill: View {
     /// The dot's own pulse. Starts lit, so the first frame of the badge is the
     /// bright one rather than the faded one.
     @State private var lit = true
+    @State private var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
 
     /// The height the sheet stands at while it has only the offer to make.
     ///
@@ -66,10 +69,6 @@ struct RidePill: View {
                 .fill(Color.red)
                 .frame(width: 10, height: 10)
                 .opacity(lit ? 1 : 0.42)
-                .animation(
-                    .easeInOut(duration: 1.05).repeatForever(autoreverses: true),
-                    value: lit
-                )
             offerText
         }
         .font(.title3)
@@ -85,13 +84,35 @@ struct RidePill: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .contentShape(Rectangle())
         .onTapGesture { open() }
-        .onAppear { lit = false }
+        // Enough motion to announce a new offer, then a static compositor for
+        // the rest of a ride. The task is cancelled with the view and restarted
+        // if the offer or either power preference changes.
+        .task(id: pulseTaskID) { await pulse() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: Notification.Name.NSProcessInfoPowerStateDidChange
+        )) { _ in
+            lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        }
         .accessibilityElement(children: .ignore)
         .accessibilityAddTraits(.isButton)
         .accessibilityLabel(spoken)
         .accessibilityHint(accessibilityHint)
         .accessibilityAction { open() }
         .accessibilityAction(named: dismissName) { dismiss() }
+    }
+
+    private var shouldPulse: Bool { !reduceMotion && !lowPower }
+    private var pulseTaskID: String { "\(offer.id):\(shouldPulse)" }
+
+    @MainActor private func pulse() async {
+        lit = true
+        guard shouldPulse else { return }
+        for _ in 0..<3 {
+            withAnimation(.easeInOut(duration: 0.45)) { lit = false }
+            do { try await Task.sleep(for: .milliseconds(450)) } catch { return }
+            withAnimation(.easeInOut(duration: 0.45)) { lit = true }
+            do { try await Task.sleep(for: .milliseconds(450)) } catch { return }
+        }
     }
 
     @ViewBuilder private var offerText: some View {

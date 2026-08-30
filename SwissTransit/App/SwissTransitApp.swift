@@ -29,9 +29,21 @@ struct SwissTransitApp: App {
         // in its own time, and everything drawn between leaving the screen and
         // being frozen is drawn for nobody. See `AppModel.suspend`.
         .onChange(of: scenePhase) { _, phase in
-            guard phase != .active else { model.resume(); return }
-            model.suspend()
-            Task { await model.persist() }
+            switch phase {
+            case .active:
+                model.resume()
+            case .inactive:
+                // Stop producers immediately for Control Center, app switching
+                // and the first half of a background transition. Persistence
+                // waits for `.background`, so that ordinary active → inactive
+                // → background sequence does not write the same caches twice.
+                model.suspend()
+            case .background:
+                model.suspend()
+                Task { await model.persist() }
+            @unknown default:
+                model.suspend()
+            }
         }
     }
 }

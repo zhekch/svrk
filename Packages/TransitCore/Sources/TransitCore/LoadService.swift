@@ -41,7 +41,45 @@ public actor LoadService {
     private let client: OTDClient
     private let configured: Bool
     private var cache: [Key: (answer: Answer, at: Date)] = [:]
-    private var inFlight: [Key: Task<Answer, Never>] = [:]
+    /// The underlying OJP call plus every caller still interested in it.
+    /// Coalescing saves quota; waiter ownership also prevents a cancelled
+    /// background sweep from leaving an orphaned radio request behind.
+    private final class Waiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Answer, Never>?
+        private var result: Answer?
+
+        func value() async -> Answer {
+            await withCheckedContinuation { continuation in
+                let immediate = lock.withLock { () -> Answer? in
+                    if let result { return result }
+                    self.continuation = continuation
+                    return nil
+                }
+                if let immediate { continuation.resume(returning: immediate) }
+            }
+        }
+
+        func resolve(_ answer: Answer) {
+            let continuation = lock.withLock { () -> CheckedContinuation<Answer, Never>? in
+                guard result == nil else { return nil }
+                result = answer
+                let continuation = self.continuation
+                self.continuation = nil
+                return continuation
+            }
+            continuation?.resume(returning: answer)
+        }
+    }
+
+    private struct InFlight: Sendable {
+        var id: Int
+        var task: Task<Both, Never>
+        var waiters: [Int: Waiter]
+    }
+    private var inFlight: [Key: InFlight] = [:]
+    private var nextFlightID = 0
+    private var nextWaiterID = 0
 
     /// The timings from the same response, kept beside the occupancy.
     ///
@@ -83,6 +121,12 @@ public actor LoadService {
         configured = token?.isEmpty == false
     }
 
+    /// Internal transport seam for deterministic cancellation tests.
+    init(client: OTDClient, configured: Bool = true) {
+        self.client = client
+        self.configured = configured
+    }
+
     public var isConfigured: Bool { configured }
 
     /// What this journey's load is, from the cache where possible.
@@ -95,7 +139,15 @@ public actor LoadService {
             return held.answer
         }
         // A panel re-read while its first request is still open is one request.
-        if let running = inFlight[key] { return await running.value }
+        if var running = inFlight[key] {
+            let waiterID = makeWaiterID()
+            let waiter = Waiter()
+            running.waiters[waiterID] = waiter
+            inFlight[key] = running
+            return await wait(
+                for: key, flightID: running.id, waiterID: waiterID, waiter: waiter
+            )
+        }
 
         if background, await client.headroom(OTDClient.ojp) <= Self.foregroundReserve {
             return .failed("leaving room for the foreground")
@@ -107,11 +159,35 @@ public actor LoadService {
         // it is open still coalesces onto this one call rather than starting a
         // second.
         let running = Task<Both, Never> { [client] in await Self.fetch(key: key, client: client) }
-        inFlight[key] = Task { await running.value.answer }
-        let both = await running.value
+        let flightID = makeFlightID()
+        let waiterID = makeWaiterID()
+        let waiter = Waiter()
+        inFlight[key] = InFlight(id: flightID, task: running, waiters: [waiterID: waiter])
+        Task { [weak self] in
+            let result = await running.value
+            await self?.complete(key: key, flightID: flightID, result: result)
+        }
+        return await wait(for: key, flightID: flightID, waiterID: waiterID, waiter: waiter)
+    }
+
+    private func wait(
+        for key: Key, flightID: Int, waiterID: Int, waiter: Waiter
+    ) async -> Answer {
+        await withTaskCancellationHandler(operation: {
+            await waiter.value()
+        }, onCancel: {
+            Task { await self.cancelWaiter(for: key, flightID: flightID, waiterID: waiterID) }
+        })
+    }
+
+    private func complete(key: Key, flightID: Int, result both: Both) {
+        // The last cancellation removes its flight before cancelling the task.
+        // Ignore that task's eventual result so it cannot overwrite a new call
+        // for the same key or turn cancellation into a cached answer.
+        guard let running = inFlight[key], running.id == flightID else { return }
+        inFlight[key] = nil
         let answer = both.answer
         timings[key] = both.timing
-        inFlight[key] = nil
         asked += 1
 
         // A silence is cached and a failure is not, for the same reason as the
@@ -119,8 +195,34 @@ public actor LoadService {
         // in the seconds a panel stays open, while being throttled says nothing
         // about the run at all.
         if case .failed = answer {} else { cache[key] = (answer, Date()) }
-        return answer
+        for waiter in running.waiters.values { waiter.resolve(answer) }
     }
+
+    private func cancelWaiter(for key: Key, flightID: Int, waiterID: Int) {
+        guard var running = inFlight[key], running.id == flightID,
+              let waiter = running.waiters.removeValue(forKey: waiterID)
+        else { return }
+        if running.waiters.isEmpty {
+            inFlight[key] = nil
+            running.task.cancel()
+        } else {
+            inFlight[key] = running
+        }
+        waiter.resolve(.failed(CancellationError().localizedDescription))
+    }
+
+    private func makeFlightID() -> Int {
+        nextFlightID &+= 1
+        return nextFlightID
+    }
+
+    private func makeWaiterID() -> Int {
+        nextWaiterID &+= 1
+        return nextWaiterID
+    }
+
+    /// Internal observation used by deterministic coalescing tests.
+    func activeWaiters(for key: Key) -> Int { inFlight[key]?.waiters.count ?? 0 }
 
     /// Drop everything, for a caller that knows the day has turned.
     public func forget() {
@@ -149,6 +251,11 @@ public actor LoadService {
                 timing: timing.isEmpty ? nil : timing
             )
         } catch {
+            if Task.isCancelled {
+                return Both(
+                    answer: .failed(CancellationError().localizedDescription), timing: nil
+                )
+            }
             return Both(answer: .failed(String(describing: error)), timing: nil)
         }
     }

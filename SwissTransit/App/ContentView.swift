@@ -314,9 +314,12 @@ struct ContentView: View {
     /// not. The map settings sheet is 470 points precisely so the map stays
     /// visible while a slider is changing it — slowing *that* map down would be
     /// slowing down the one thing the sheet exists to let you watch. The other
-    /// two cover it, and a covered map does not need thirty frames a second.
+    /// two cover it, as does the detail sheet at its large detent, and a covered
+    /// map does not need thirty frames a second.
     /// See `AppModel.mapObscured`.
-    private var mapCovered: Bool { showSettings || showOffline }
+    private var mapCovered: Bool {
+        showSettings || showOffline || (detailSheetPresented && stand == .large)
+    }
 
     /// Put the offer up, if there is one and there is room for it.
     private func presentOffer() {

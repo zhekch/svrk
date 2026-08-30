@@ -889,7 +889,15 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     @discardableResult
     public func save() -> Bool {
         guard let url else { return false }
+        let fileExists = FileManager.default.fileExists(atPath: url.path)
         lock.lock()
+        // The common lifecycle save is a no-op. Check that before copying,
+        // sorting and mapping every learned record; on a mature store those
+        // allocations cost far more than the eventual file-existence check.
+        guard dirty || !fileExists else {
+            lock.unlock()
+            return true
+        }
         let entries = records
             .sorted { ($0.key.operatorCode, $0.key.trainNumber) < ($1.key.operatorCode, $1.key.trainNumber) }
             .map { Entry(key: $0.key, record: $0.value) }
@@ -910,11 +918,8 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         let stock = classes
             .sorted { $0.key < $1.key }
             .map { Stock(family: $0.key, facts: $0.value) }
-        let hadChanges = dirty
         dirty = false
         lock.unlock()
-
-        guard hadChanges || !FileManager.default.fileExists(atPath: url.path) else { return true }
 
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true

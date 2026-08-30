@@ -324,6 +324,23 @@ public actor Fleet {
     private var chainedRevision = -1
     private var chained: [String: Journey] = [:]
 
+    /// A broad one-minute time index for the draw/refinement queries.
+    ///
+    /// The final lifetime check remains second-precise. This only avoids asking
+    /// all eight thousand national vehicles the same two cheap questions on
+    /// every frame when three quarters of them cannot exist in this minute.
+    private var activeMinute: Int64 = .min
+    private var activeMinuteFleetRevision = -1
+    private var activeMinuteTimingRevision = -1
+    private var timingRevision = 0
+    private var activeMinuteJourneys: [Journey] = []
+    private var activeMinuteIDs: Set<String> = []
+
+    private struct ActiveLifetime: Equatable {
+        var appears: Timestamp
+        var stands: Timestamp
+    }
+
     /// Geometry already built, kept by journey id across refreshes.
     ///
     /// Every `Journey` in the store is a new object after a refresh — the
@@ -352,6 +369,72 @@ public actor Fleet {
         var fromGraph: Int
         var usedAt: Int
     }
+
+    /// Geometry the presentation path discovered it is missing.
+    ///
+    /// Route matching and graph search are synchronous operations. Keeping them
+    /// on the Fleet actor made their *tail* the frame time: an otherwise cheap
+    /// vehicle query could sit behind one rural bus relation for two hundred
+    /// milliseconds. The actor now owns only this small queue and installs the
+    /// immutable result; a single utility worker owns the expensive builder.
+    private struct GeometryBuildKey: Hashable, Sendable {
+        var id: String
+        var fingerprint: Int
+        var refined: Bool
+    }
+
+    private struct GeometryBuildRequest: Sendable {
+        var key: GeometryBuildKey
+        var draft: Journey
+        var token: UInt64
+        var urgent: Bool
+    }
+
+    private enum GeometryEnqueueResult {
+        case enqueued(UInt64)
+        case pending(UInt64)
+        case full
+        case suspended
+        case invalid
+
+        var newlyEnqueued: Bool {
+            if case .enqueued = self { return true }
+            return false
+        }
+
+        var token: UInt64? {
+            switch self {
+            case .enqueued(let token), .pending(let token): return token
+            default: return nil
+            }
+        }
+    }
+
+    private var geometryBuildQueue: [GeometryBuildRequest] = []
+    /// Includes the request currently inside the synchronous builder as well as
+    /// the ones waiting in `geometryBuildQueue`. The token distinguishes an old
+    /// cancelled request from a later request for the same journey and path.
+    private var queuedGeometryBuilds: [GeometryBuildKey: UInt64] = [:]
+    private var geometryBuildToken: UInt64 = 0
+    private var geometryWorker: Task<Void, Never>?
+    private var geometryWorkerGeneration = 0
+    private var geometryBackgroundSuspended = false
+    private var consecutiveUrgentGeometryBuilds = 0
+
+    /// Queue-space and request-completion waits share one edge-triggered signal.
+    /// Waiters always re-check their own predicate, so an urgent displacement
+    /// can wake a warm pass without making that pass wait on the urgent work.
+    private var geometryChangeRevision: UInt64 = 0
+    private var geometryChangeWaiterID: UInt64 = 0
+    private var geometryChangeWaiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+
+    /// Bound speculative work when a pinch exposes hundreds of uncached runs.
+    /// The next frame can add more after the worker makes room, while a pan does
+    /// not leave minutes of now-invisible routes queued ahead of its new view.
+    private static let geometryQueueLimit = 12
+    /// User-visible work wins promptly, but a settled viewport still lets the
+    /// speculative queue advance rather than starving it behind a steady tick.
+    private static let geometryUrgentBurst = 4
 
     /// How many calls the loaded feed has at each stop place, which is what the
     /// search box means by "the busiest one". Rebuilt with the snapshot rather
@@ -488,6 +571,7 @@ public actor Fleet {
     /// stale sighting. One call describes the entire country.
     @discardableResult
     public func refresh() async -> Bool {
+        guard !Task.isCancelled else { return false }
         // Said out loud rather than returned as a bare `false`. Each of these
         // leaves the map without corrections for the rest of the session, and
         // each used to look from the outside exactly like a refresh that had
@@ -504,12 +588,20 @@ public actor Fleet {
         do {
             payload = try await client.fetch(OTDClient.gtfsRT, query: "", maxWait: 65)
         } catch {
+            if error is CancellationError || Task.isCancelled {
+                monitor.settle(.idle)
+                return false
+            }
             status.failures += 1
             status.lastError = String(describing: error)
             monitor.settle(.failed(String(describing: error)))
             return false
         }
 
+        guard !Task.isCancelled else {
+            monitor.settle(.idle)
+            return false
+        }
         monitor.phase(.indexing)
         // Decoded off the actor, because every frame is queued behind it.
         //
@@ -533,6 +625,13 @@ public actor Fleet {
         let feed = await Task.detached(priority: .userInitiated) {
             Protobuf.feed(payload)
         }.value
+        // A suspended app may cancel while the pure decoder is running. Its
+        // result is harmless, but folding it would mutate the fleet after the
+        // lifecycle boundary and make that intentional cancellation a refresh.
+        guard !Task.isCancelled else {
+            monitor.settle(.idle)
+            return false
+        }
         guard !feed.updates.isEmpty else {
             // A truncated or empty response must not wipe a good fleet.
             status.failures += 1
@@ -578,6 +677,12 @@ public actor Fleet {
         // magnitude apart. See the fold at the end.
         var arrived = false
         var moved: [Journey] = []
+        // If the chained fleet is already current, remember only the visible
+        // lifetime of vehicles actually touched. A cancellation, a platform
+        // change or a middle-stop correction must not make the next frame
+        // rebuild the national minute index when neither edge moved.
+        let trackingActiveLifetime = chainedRevision == revision
+        var activeLifetimeBefore: [String: ActiveLifetime] = [:]
 
         for update in feed.updates {
             guard let journey = journeys[update.tripID] else {
@@ -599,6 +704,14 @@ public actor Fleet {
             }
             report.matchedByRef += 1
 
+            let lifetimeBefore: (id: String, lifetime: ActiveLifetime)?
+            if trackingActiveLifetime {
+                let vehicle = currentVehicle(containing: journey)
+                lifetimeBefore = (vehicle.id, Self.activeLifetime(of: vehicle))
+            } else {
+                lifetimeBefore = nil
+            }
+
             var changed = false
             switch update.relationship {
             case .canceled, .deleted:
@@ -611,7 +724,12 @@ public actor Fleet {
             }
 
             if apply(update, to: journey, at: now) { changed = true }
-            if changed { moved.append(journey) }
+            if changed {
+                moved.append(journey)
+                if let lifetimeBefore, activeLifetimeBefore[lifetimeBefore.id] == nil {
+                    activeLifetimeBefore[lifetimeBefore.id] = lifetimeBefore.lifetime
+                }
+            }
         }
 
         // **A national refresh must not re-chain the country.**
@@ -644,6 +762,11 @@ public actor Fleet {
             revision += 1
         } else {
             for journey in moved { refold(journey, repathed: false) }
+            let lifetimeMoved = activeLifetimeBefore.contains { id, before in
+                guard let vehicle = chained[id] ?? journeys[id] else { return true }
+                return Self.activeLifetime(of: vehicle) != before
+            }
+            if lifetimeMoved { timingRevision &+= 1 }
         }
         lastRealtime = report
         return report
@@ -1023,6 +1146,13 @@ public actor Fleet {
     @discardableResult
     public func applyTiming(_ timing: JourneyTiming, to id: String, at moment: Date = Date()) -> Int {
         guard let journey = journeys[id] else { return 0 }
+        let lifetimeBefore: (id: String, lifetime: ActiveLifetime)?
+        if chainedRevision == revision {
+            let vehicle = currentVehicle(containing: journey)
+            lifetimeBefore = (vehicle.id, Self.activeLifetime(of: vehicle))
+        } else {
+            lifetimeBefore = nil
+        }
         let hadPath = journey.geometry != nil
         let quays = journey.stops.map(\.platform)
         let touched = journey.apply(timing, at: Timestamp(moment.timeIntervalSince1970))
@@ -1033,6 +1163,12 @@ public actor Fleet {
             || quays != journey.stops.map(\.platform)
         if repathed { builtGeometry[id] = nil }
         refold(journey, repathed: repathed)
+        if let lifetimeBefore {
+            let vehicle = chained[lifetimeBefore.id] ?? journeys[lifetimeBefore.id]
+            if vehicle.map(Self.activeLifetime(of:)) != lifetimeBefore.lifetime {
+                timingRevision &+= 1
+            }
+        }
         return touched
     }
 
@@ -1339,6 +1475,53 @@ public actor Fleet {
         return chained
     }
 
+    /// The physical vehicle carrying a raw leg in the current chained fleet.
+    /// Called only while `chainedRevision == revision`; otherwise the pending
+    /// rebuild is already sufficient to invalidate every derived index.
+    private func currentVehicle(containing journey: Journey) -> Journey {
+        if let id = chainOf[journey.id], let vehicle = chained[id] { return vehicle }
+        return chained[journey.id] ?? journey
+    }
+
+    private static func activeLifetime(of journey: Journey) -> ActiveLifetime {
+        ActiveLifetime(
+            appears: Positioning.appearsAt(journey),
+            stands: Positioning.standsUntil(journey)
+        )
+    }
+
+    /// Journeys whose visible lifetime intersects the minute containing
+    /// `moment`. The callers still apply their original exact time tests; this
+    /// is an index, never a change in inclusion semantics.
+    private func activeJourneys(
+        in fleet: [String: Journey], at moment: Double
+    ) -> [Journey] {
+        let minute = Int64(floor(moment / 60))
+        guard minute != activeMinute
+                || activeMinuteFleetRevision != chainedRevision
+                || activeMinuteTimingRevision != timingRevision
+        else { return activeMinuteJourneys }
+
+        let lower = Double(minute) * 60
+        let upper = lower + 60
+        activeMinuteJourneys.removeAll(keepingCapacity: true)
+        activeMinuteJourneys.reserveCapacity(fleet.count / 3)
+        activeMinuteIDs.removeAll(keepingCapacity: true)
+        activeMinuteIDs.reserveCapacity(fleet.count / 3)
+        for journey in fleet.values where journey.stops.count >= 2 {
+            guard Double(Positioning.appearsAt(journey)) <= upper,
+                  Double(Positioning.standsUntil(journey)) >= lower
+            else { continue }
+            activeMinuteJourneys.append(journey)
+            activeMinuteIDs.insert(journey.id)
+        }
+
+        activeMinute = minute
+        activeMinuteFleetRevision = chainedRevision
+        activeMinuteTimingRevision = timingRevision
+        return activeMinuteJourneys
+    }
+
     /// Which chained vehicle each raw journey was flattened into.
     ///
     /// Only the joined ones are in here. An unjoined journey *is* its own
@@ -1372,6 +1555,13 @@ public actor Fleet {
     /// The chained fleet as a plain array, for the queries that live in another
     /// file of this module.
     func fleetVehicles() -> [Journey] { Array(fleetByID().values) }
+
+    /// The time-indexed subset for live module-level queries. Callers retain
+    /// their exact second-level lifetime and position checks.
+    func activeFleetVehicles(at moment: Double) -> [Journey] {
+        let fleet = fleetByID()
+        return activeJourneys(in: fleet, at: moment)
+    }
 
     // MARK: - Which of the four things a cable service is
 
@@ -1735,7 +1925,15 @@ public actor Fleet {
         // frame rather than the next.
         var drawn: [(journey: Journey, position: VehiclePosition)] = []
         let hidden = !hiding.isEmpty
-        for journey in fleetByID().values {
+        let fleet = fleetByID()
+        var candidates = activeJourneys(in: fleet, at: moment)
+        // Selection is an explicit exception to both the viewport and lifetime
+        // indexes: a live-time correction may have just moved the open vehicle
+        // beyond either one, and the camera still needs a final anchor for it.
+        if let extraId, !activeMinuteIDs.contains(extraId), let extra = fleet[extraId] {
+            candidates.append(extra)
+        }
+        for journey in candidates {
             // Rejected on what the journey *is* before it is asked where it
             // is, because asking is the expensive half and the answer is
             // thrown away for all but a screenful of them.
@@ -2071,8 +2269,8 @@ public actor Fleet {
     /// this is the half that covers everything it cannot reach. Measured over a viewport of Bern, attaching geometry
     /// moves a vehicle a median of 10 m and a bus's ninetieth percentile 55 m,
     /// about half of it along the track and half across it. Even without the
-    /// zoom the eight-millisecond `geometryBudget` means they arrive a few per
-    /// frame, so they hop one after another for a second or two and then settle
+    /// zoom the background queue means they arrive a few per frame, so they
+    /// glide one after another for a second or two and then settle
     /// — which is exactly what a reader sees and describes as teleporting.
     ///
     /// `Journey.settle` already fixes the same complaint for live times, and
@@ -2191,40 +2389,11 @@ public actor Fleet {
         0.35 + min(0.45, metres / 500)
     }
 
-    /// Put as many of the vehicles about to be drawn onto their real track as
-    /// this frame can afford, and move them there before it draws.
-    ///
-    /// Two things used to leave a vehicle on the chord for far longer than the
-    /// budget claims:
-    ///
-    /// The budget was a deadline set *before* a loop that walks the whole
-    /// national fleet asking each journey where it is. That walk alone can cost
-    /// the eight milliseconds, so by the time the loop reached a vehicle that
-    /// needed building the deadline had usually passed and only the one the
-    /// loop guaranteed got built. A screenful took seconds, not a frame or two.
-    /// Timed over the attach calls themselves, the budget buys building.
-    ///
-    /// And building was gated on the zoom the *line* becomes worth drawing at.
-    /// But the line is not the only thing geometry decides: it is also where
-    /// the vehicle *is*, and a chord cuts corners at every zoom — across a lake
-    /// at ten, across a valley at eight. The gate here is the count instead, so
-    /// the position is right wherever the map is showing few enough vehicles
-    /// for it to be affordable, which includes every zoom a vehicle can be
-    /// picked out and tapped at.
-    ///
-    /// Trains are the exception, and they have to be. A bus on the chord is on
-    /// the road it is already on; a train on the chord is across the lake the
-    /// rails went around. The count gate used to skip *everyone* once the
-    /// viewport held more than a screenful — which is exactly the zoom a long
-    /// train is still visible as a thing in the wrong place, and the zoom-in
-    /// that then attached its path is the teleport onto the track.
-    ///
-    /// So trains are aligned in two passes. The first matches each to its OSM
-    /// relation — cheap, and enough to put the vehicle on the rails rather
-    /// than the chord — and it runs for every train in view, crowd or not.
-    /// The second bends onto platforms and fills gaps from the graph, and
-    /// that one still spends the budget. Everything else still waits for the
-    /// viewport to thin out.
+    /// Restore cached geometry immediately and queue at most one cold build for
+    /// this presentation query. Trains keep priority because a rail chord can
+    /// cross a lake; road vehicles are queued only while that error is visible.
+    /// The cold matcher never runs on this actor, so its long tail cannot become
+    /// the frame time.
     private func alignToTrack(
         _ drawn: inout [(journey: Journey, position: VehiclePosition)],
         across bbox: BBox, at now: Double
@@ -2258,9 +2427,8 @@ public actor Fleet {
         )
         let coarse = across > Self.alignEverywhereAcross
 
-        // One budget over both halves, spent in the order a reader would spend
-        // it: corridors before platform bends, trains before everything else
-        // within each.
+        // One new request per frame, in the order a reader would spend it:
+        // corridors before platform bends, trains before everything else.
         //
         // **The corridor half used to be charged to nothing at all**, on the
         // reasoning that it is not decoration but *where the vehicle is*, and a
@@ -2278,85 +2446,68 @@ public actor Fleet {
         // chord and picks it up on the next, and `keepContinuous` eases the
         // step when it lands. That is a much smaller thing to be wrong about
         // than the whole map stopping.
-        var spent: TimeInterval = 0
-
         // Trains walk past the width gate. A bus on the chord is on the road it
         // is already on; a train on the chord is across the lake the rails went
         // around, and a pixel-wide train in a lake is still in a lake.
         for i in drawn.indices where drawn[i].journey.mode == .train {
-            if !attachCorridor(&drawn, at: i, now: now, spent: &spent) { return }
+            if !attachCorridor(&drawn, at: i, now: now) { return }
         }
         if !coarse {
             for i in drawn.indices where drawn[i].journey.mode != .train {
-                if !attachCorridor(&drawn, at: i, now: now, spent: &spent) { return }
+                if !attachCorridor(&drawn, at: i, now: now) { return }
             }
         }
 
         // And the graph half — the platform bend and the run-up — which is
-        // worth a few metres rather than a few hundred, and so is the half that
-        // gives way first when the budget is short.
+        // worth a few metres rather than a few hundred, and so is queued after
+        // the corridor work that fixes the larger error.
         for i in drawn.indices where drawn[i].journey.mode == .train {
-            if !alignDrawn(&drawn, at: i, now: now, spent: &spent) { return }
+            if !alignDrawn(&drawn, at: i, now: now) { return }
         }
         guard !coarse else { return }
         for i in drawn.indices where drawn[i].journey.mode != .train {
-            if !alignDrawn(&drawn, at: i, now: now, spent: &spent) { return }
+            if !alignDrawn(&drawn, at: i, now: now) { return }
         }
     }
 
-    /// Put one vehicle on its OSM corridor, and say whether the frame has any
-    /// budget left. See `alignToTrack` for why this is charged at all.
+    /// Put one vehicle on its cached corridor, or queue its cold build.
     private func attachCorridor(
         _ drawn: inout [(journey: Journey, position: VehiclePosition)],
-        at i: Int, now: Double, spent: inout TimeInterval
+        at i: Int, now: Double
     ) -> Bool {
         if drawn[i].journey.geometry != nil { return true }
-        let started = Date()
-        _ = attachGeometry(to: drawn[i].journey, refined: false)
-        spent += Date().timeIntervalSince(started)
+        if !restoreGeometry(to: drawn[i].journey, refined: false) {
+            // One cold request per presentation query. Cached paths still land
+            // synchronously, but an unbounded relation match never owns the
+            // Fleet actor (and therefore never owns the frame) again.
+            if enqueueGeometryBuild(
+                for: drawn[i].journey, refined: false, urgent: true
+            ).newlyEnqueued {
+                return false
+            }
+            return true
+        }
         if let aligned = Positioning.position(of: drawn[i].journey, at: now) {
             drawn[i].position = aligned
         }
-        return spent < Self.geometryBudget
+        return true
     }
 
-    /// Attach this vehicle's path and move it onto it, if this frame can still
-    /// afford a build.
-    ///
-    /// Returns whether the caller should keep going. A memo hit is not charged:
-    /// it is the path a previous frame already paid for, and spending the
-    /// budget on remembering it is how a refresh put every train back on the
-    /// chord for one more zoom. A build is always finished before this returns
-    /// — the first vehicle of a frame makes progress however expensive it was,
-    /// and only the next one is refused.
-    /// Build one vehicle's refined path, and say whether the frame has any
-    /// budget left.
-    ///
-    /// **The budget applies on every pass, and that is the whole of "the tick
-    /// freezes for ten seconds when I zoom into a city".** It used to be
-    /// switched by a `capped` flag wired to whether the viewport was *wider*
-    /// than `alignEverywhereAcross` — so a frame spent as long as it liked
-    /// whenever the map was close in, which is precisely the zoom that puts
-    /// four hundred vehicles in view and gives every one of them a graph search
-    /// on the same frame. Measured cold on a pinch from the country to Bern,
-    /// the frame that crossed into the city took **14.3 seconds** on the actor
-    /// the draw loop is queued behind, and the whole map — every vehicle, the
-    /// clock, the panel — stopped with it.
-    ///
-    /// The flag read as a cost control and did the opposite: it bounded the
-    /// case where the work is invisible and let the visible case run
-    /// unbounded. There is nothing the width has to say about it. Eight
-    /// milliseconds of building per frame is what the frame can afford, at
-    /// every zoom, and a vehicle still waiting is drawn on the corridor the
-    /// cheap half already gave it rather than on nothing.
+    /// Restore a refined path or queue it, retaining the corridor until the
+    /// replacement is ready.
     private func alignDrawn(
         _ drawn: inout [(journey: Journey, position: VehiclePosition)],
-        at i: Int, now: Double, spent: inout TimeInterval
+        at i: Int, now: Double
     ) -> Bool {
         if let geometry = drawn[i].journey.geometry, geometry.refined { return true }
-        let started = Date()
-        let built = attachGeometry(to: drawn[i].journey, refined: true)
-        if built { spent += Date().timeIntervalSince(started) }
+        if !restoreGeometry(to: drawn[i].journey, refined: true) {
+            if enqueueGeometryBuild(
+                for: drawn[i].journey, refined: true, urgent: true
+            ).newlyEnqueued {
+                return false
+            }
+            return true
+        }
 
         // Read the position again rather than leaving the chord to be drawn
         // for one more frame. The jump onto the track is the thing being
@@ -2364,7 +2515,7 @@ public actor Fleet {
         if let aligned = Positioning.position(of: drawn[i].journey, at: now) {
             drawn[i].position = aligned
         }
-        return !built || spent < Self.geometryBudget
+        return true
     }
 
     /// Put every running train on its mapped corridor.
@@ -2407,17 +2558,46 @@ public actor Fleet {
     public func warmTrainGeometry(
         inBackground now: Timestamp, batch: Int = 64
     ) async {
+        guard !geometryBackgroundSuspended else { return }
         let moment = Double(now)
-        let trains = fleetByID().values.filter { $0.mode == .train }
+        let fleet = fleetByID()
+        let trains = activeJourneys(in: fleet, at: moment).filter { $0.mode == .train }
+        let yieldEvery = max(1, batch)
         var done = 0
+        var passTokens = Set<UInt64>()
         for journey in trains {
             if Task.isCancelled { return }
-            guard journey.geometry == nil else { continue }
+            guard !restoreGeometry(to: journey, refined: false) else { continue }
             guard Positioning.position(of: journey, at: moment) != nil else { continue }
-            attachGeometry(to: journey, refined: false)
+
+            enqueue: while true {
+                if Task.isCancelled || geometryBackgroundSuspended { return }
+                // A visible request may have completed this journey while the
+                // warm pass was waiting for capacity.
+                if restoreGeometry(to: journey, refined: false) { break enqueue }
+                let result = enqueueGeometryBuild(for: journey, refined: false, urgent: false)
+                if let token = result.token {
+                    passTokens.insert(token)
+                    break enqueue
+                }
+                switch result {
+                case .full:
+                    guard await waitForGeometryQueueCapacity() else { return }
+                case .suspended:
+                    return
+                case .invalid:
+                    break enqueue
+                case .enqueued, .pending:
+                    break enqueue // handled by `token` above
+                }
+            }
             done += 1
-            if done % batch == 0 { await Task.yield() }
+            if done % yieldEvery == 0 { await Task.yield() }
         }
+        // Wait only for the concrete requests this pass admitted or joined.
+        // Refined viewport work queued later has different tokens and cannot
+        // extend a national warm which has already done its share.
+        await waitForGeometryBuilds(passTokens)
     }
 
     /// Refine the paths of everything in view, a few at a time, off the frame.
@@ -2426,9 +2606,9 @@ public actor Fleet {
     ///
     /// A tap goes through `journey(id:at:)`, which attaches *refined* geometry
     /// — legs bent onto platform rails, gaps filled from the routing graph.
-    /// The draw loop mostly cannot: `alignToTrack` spends eight milliseconds a
-    /// frame on refining and a busy viewport holds more than a thousand
-    /// vehicles, so most of them are drawn on the corridor path instead. The
+    /// The draw loop queues only a little refining at a time and a busy viewport
+    /// holds more than a thousand vehicles, so most of them are drawn on the
+    /// corridor path first. The
     /// two paths are different lengths, a position is interpolated along the
     /// path, and so the tap moved the vehicle. Measured over a Zurich viewport:
     /// 77% of vehicles moved, 41 of them by more than 250 m, the worst by
@@ -2462,14 +2642,17 @@ public actor Fleet {
     public func refineDrawn(
         in bbox: BBox, at now: Timestamp, batch: Int = 8, cap: Int = 200
     ) async -> Bool {
-        guard bbox.east - bbox.west <= Self.refineWidestSpan else { return false }
+        guard !geometryBackgroundSuspended,
+              bbox.east - bbox.west <= Self.refineWidestSpan
+        else { return false }
         let moment = Double(now)
         let padded = bbox.padded(by: 0.15)
         let midLon = (bbox.west + bbox.east) / 2
         let midLat = (bbox.south + bbox.north) / 2
 
         var pending: [(journey: Journey, from: Double)] = []
-        for journey in fleetByID().values {
+        let fleet = fleetByID()
+        for journey in activeJourneys(in: fleet, at: moment) {
             if let geometry = journey.geometry, geometry.refined { continue }
             // The clock and the box before the position, in that order, for
             // exactly the reasons `vehicles(in:at:)` gives: asking a journey
@@ -2492,18 +2675,42 @@ public actor Fleet {
         guard !pending.isEmpty else { return false }
         if pending.count > cap { pending.sort { $0.from < $1.from } }
 
-        var done = 0
+        let limit = max(1, min(batch, cap))
+        var considered = 0
+        var passTokens = Set<UInt64>()
         for entry in pending {
             if Task.isCancelled { return true }
-            attachGeometry(to: entry.journey, refined: true)
-            done += 1
-            // Capped rather than run to the end, so a caller that re-reads the
-            // viewport between passes follows a pan instead of finishing the
-            // box the reader has already left.
-            if done >= cap { return true }
-            if done % batch == 0 { await Task.yield() }
+            if restoreGeometry(to: entry.journey, refined: true) {
+                considered += 1
+            } else {
+                let result = enqueueGeometryBuild(
+                    for: entry.journey, refined: true, urgent: false
+                )
+                if let token = result.token {
+                    passTokens.insert(token)
+                    considered += 1
+                } else if case .full = result {
+                    // A queue transition is the useful next event. Waiting for
+                    // it keeps the caller from spinning while still telling it
+                    // truthfully that this viewport has unfinished geometry.
+                    if passTokens.isEmpty {
+                        guard await waitForGeometryQueueCapacity() else { return false }
+                    }
+                    break
+                } else if case .suspended = result {
+                    return false
+                }
+            }
+            if considered >= limit { break }
         }
-        return false
+
+        // Returning before the admitted requests complete would make `true`
+        // drive a tight caller loop over work which had not changed yet. The
+        // token wait suspends without a timer and ignores unrelated requests.
+        await waitForGeometryBuilds(passTokens)
+        if Task.isCancelled { return true }
+        guard !geometryBackgroundSuspended else { return false }
+        return pending.contains { $0.journey.geometry?.refined != true }
     }
 
     /// How wide a viewport may be, in degrees of longitude, before refining what
@@ -2553,7 +2760,8 @@ public actor Fleet {
         let midLat = (bbox.south + bbox.north) / 2
 
         var pending: [(candidate: LiveTimingCandidate, from: Double)] = []
-        for journey in fleetByID().values {
+        let fleet = fleetByID()
+        for journey in activeJourneys(in: fleet, at: moment) {
             if journey.monitored { continue }
             // Gated before the position is asked for, for the reason
             // `vehicles(in:at:)` gives. This sweep idles on a settled map by
@@ -2605,32 +2813,22 @@ public actor Fleet {
     /// a train off the chord, and a later refined attach replaces it.
     ///
     /// Returns whether the path had to be built from scratch. A memo hit is
-    /// not a build: the draw loop must not spend its budget on remembering.
+    /// not a build: the draw loop restores it immediately.
     ///
     /// Reachable from the rest of the module rather than private to this file:
     /// `rideCandidates` needs the same paths for the same reason the draw loop
     /// does — a chord cuts corners, and a corner is where a fit is decided.
     @discardableResult
     func attachGeometry(to journey: Journey, refined: Bool = true) -> Bool {
-        if let geometry = journey.geometry {
-            if geometry.refined || !refined { return false }
-            journey.geometry = nil
-        }
+        if restoreGeometry(to: journey, refined: refined) { return false }
         guard journey.stops.count >= 2 else { return false }
 
-        geometryUse += 1
         let fingerprint = Self.callFingerprint(journey.stops)
-
-        if var held = builtGeometry[journey.id], held.fingerprint == fingerprint {
-            if held.geometry.refined || !refined {
-                journey.geometry = held.geometry
-                journey.legsFromRoute = held.fromRoute
-                journey.legsFromGraph = held.fromGraph
-                held.usedAt = geometryUse
-                builtGeometry[journey.id] = held
-                return false
-            }
-        }
+        // The synchronous builder treats any path as complete. Clear a coarse
+        // path only here, immediately before replacing it; the asynchronous
+        // presentation path keeps drawing that corridor until its refined
+        // replacement is ready.
+        if refined { journey.geometry = nil }
 
         builder.attach(to: journey, refined: refined)
         guard let built = journey.geometry else { return true }
@@ -2641,6 +2839,302 @@ public actor Fleet {
         )
         evictGeometryIfNeeded()
         return true
+    }
+
+    /// Make geometry available for a latency-sensitive module-level query
+    /// without letting a cache miss run synchronously on the Fleet actor.
+    @discardableResult
+    func prepareGeometryInBackground(for journey: Journey, refined: Bool = true) -> Bool {
+        if restoreGeometry(to: journey, refined: refined) { return true }
+        _ = enqueueGeometryBuild(for: journey, refined: refined, urgent: true)
+        return journey.geometry != nil
+    }
+
+    /// Install an already-built path, or restore one from the cross-refresh
+    /// memo, without starting a route match or graph search.
+    private func restoreGeometry(to journey: Journey, refined: Bool) -> Bool {
+        if let geometry = journey.geometry {
+            if geometry.refined || !refined { return true }
+            // Keep the corridor in place while an asynchronous refined build is
+            // pending. The synchronous caller clears it immediately before its
+            // replacement, so neither path ever exposes a chord in between.
+        }
+        guard journey.stops.count >= 2 else { return true }
+
+        geometryUse += 1
+        let fingerprint = Self.callFingerprint(journey.stops)
+        guard var held = builtGeometry[journey.id], held.fingerprint == fingerprint,
+              held.geometry.refined || !refined
+        else { return false }
+
+        journey.geometry = held.geometry
+        journey.legsFromRoute = held.fromRoute
+        journey.legsFromGraph = held.fromGraph
+        held.usedAt = geometryUse
+        builtGeometry[journey.id] = held
+        return true
+    }
+
+    /// Queue one cold build without letting it run on the Fleet actor.
+    @discardableResult
+    private func enqueueGeometryBuild(
+        for journey: Journey, refined: Bool, urgent: Bool
+    ) -> GeometryEnqueueResult {
+        guard !geometryBackgroundSuspended else { return .suspended }
+        guard journey.stops.count >= 2 else { return .invalid }
+        let fingerprint = Self.callFingerprint(journey.stops)
+        let key = GeometryBuildKey(id: journey.id, fingerprint: fingerprint, refined: refined)
+        let corridor = GeometryBuildKey(id: journey.id, fingerprint: fingerprint, refined: false)
+        if let token = queuedGeometryBuilds[key] {
+            if urgent { promoteGeometryRequest(token: token) }
+            return .pending(token)
+        }
+        // Let the cheap corridor land before asking the same worker for its
+        // refined replacement. The waiter follows this concrete token and can
+        // retry as soon as the corridor has completed.
+        if refined, let token = queuedGeometryBuilds[corridor] {
+            if urgent { promoteGeometryRequest(token: token) }
+            return .pending(token)
+        }
+
+        // Bound both admission and execution priority. Four visible requests
+        // are enough to keep the single worker busy; allowing the whole queue
+        // to become urgent would leave no slot through which a warm/refinement
+        // request could ever make the fairness rule below take effect.
+        if urgent,
+           geometryBuildQueue.lazy.filter({ $0.urgent }).count >= Self.geometryUrgentBurst {
+            return .full
+        }
+
+        if geometryBuildQueue.count >= Self.geometryQueueLimit {
+            // Presentation work may replace an old speculative request, never
+            // another visible one. Requests are tokens, so the displaced warm
+            // or refinement pass wakes without becoming coupled to this new job.
+            guard urgent,
+                  let stale = geometryBuildQueue.firstIndex(where: { !$0.urgent })
+            else { return .full }
+            let displaced = geometryBuildQueue.remove(at: stale)
+            _ = finishGeometryRequest(displaced)
+        }
+
+        geometryBuildToken &+= 1
+        let token = geometryBuildToken
+        let request = GeometryBuildRequest(
+            key: key, draft: Self.geometryDraft(from: journey),
+            token: token, urgent: urgent
+        )
+        queuedGeometryBuilds[key] = token
+        // FIFO within each priority. `nextGeometryBuild` supplies bounded
+        // priority rather than LIFO insertion starving an older visible path.
+        geometryBuildQueue.append(request)
+        startGeometryWorkerIfNeeded()
+        return .enqueued(token)
+    }
+
+    /// A speculative request already serving the visible frame is visible work
+    /// from this point on. Promotion also keeps a later power-state purge from
+    /// discarding the request the frame just adopted.
+    private func promoteGeometryRequest(token: UInt64) {
+        guard let index = geometryBuildQueue.firstIndex(where: { $0.token == token }) else { return }
+        geometryBuildQueue[index].urgent = true
+    }
+
+    /// A private journey the utility worker may mutate without racing the live
+    /// fleet. Only its immutable geometry result crosses back into the actor.
+    private static func geometryDraft(from journey: Journey) -> Journey {
+        Journey(
+            id: journey.id, mode: journey.mode, category: journey.category,
+            line: journey.line, number: journey.number,
+            operatorName: journey.operatorName, operatorFull: journey.operatorFull,
+            to: journey.to, from: journey.from, delay: journey.delay,
+            start: journey.start, end: journey.end, complete: journey.complete,
+            monitored: journey.monitored, cancelled: journey.cancelled,
+            source: journey.source, stops: journey.stops, parts: journey.parts,
+            extra: journey.extra, journeyRef: journey.journeyRef
+        )
+    }
+
+    private func startGeometryWorkerIfNeeded() {
+        guard !geometryBackgroundSuspended,
+              geometryWorker == nil, !geometryBuildQueue.isEmpty
+        else { return }
+        geometryWorkerGeneration &+= 1
+        let generation = geometryWorkerGeneration
+        // A separate builder keeps its switches and scratch state away from the
+        // actor's synchronous diagnostic paths. RelationStore and RailNet own
+        // their shared caches behind locks.
+        let workerBuilder = GeometryBuilder(relations: relations, railnet: railnet)
+        geometryWorker = Task.detached(priority: .utility) { [weak self, workerBuilder] in
+            while !Task.isCancelled {
+                guard let request = await self?.nextGeometryBuild(for: generation) else { break }
+                workerBuilder.attach(to: request.draft, refined: request.key.refined)
+                await self?.installGeometryBuild(request, generation: generation)
+            }
+            await self?.geometryWorkerFinished(generation: generation)
+        }
+    }
+
+    private func nextGeometryBuild(for generation: Int) -> GeometryBuildRequest? {
+        guard !Task.isCancelled, !geometryBackgroundSuspended,
+              generation == geometryWorkerGeneration
+        else { return nil }
+        guard !geometryBuildQueue.isEmpty else {
+            consecutiveUrgentGeometryBuilds = 0
+            return nil
+        }
+
+        let index: Int
+        if consecutiveUrgentGeometryBuilds >= Self.geometryUrgentBurst,
+           let speculative = geometryBuildQueue.firstIndex(where: { !$0.urgent }) {
+            index = speculative
+        } else if let urgent = geometryBuildQueue.firstIndex(where: { $0.urgent }) {
+            index = urgent
+        } else {
+            index = 0
+        }
+        let request = geometryBuildQueue.remove(at: index)
+        if request.urgent { consecutiveUrgentGeometryBuilds += 1 }
+        else { consecutiveUrgentGeometryBuilds = 0 }
+        // Capacity became available when the request left the waiting queue;
+        // its token remains active until the synchronous build finishes.
+        signalGeometryChange()
+        return request
+    }
+
+    private func installGeometryBuild(_ request: GeometryBuildRequest, generation: Int) {
+        let wasActive = finishGeometryRequest(request)
+        guard wasActive, !geometryBackgroundSuspended,
+              generation == geometryWorkerGeneration,
+              let built = request.draft.geometry,
+              let journey = fleetByID()[request.key.id],
+              Self.callFingerprint(journey.stops) == request.key.fingerprint
+        else { return }
+        // A slower corridor job must never replace a refined result that arrived
+        // while it was running.
+        if let current = journey.geometry, current.refined && !built.refined { return }
+
+        journey.geometry = built
+        journey.legsFromRoute = request.draft.legsFromRoute
+        journey.legsFromGraph = request.draft.legsFromGraph
+        geometryUse += 1
+        builtGeometry[journey.id] = BuiltGeometry(
+            fingerprint: request.key.fingerprint, geometry: built,
+            fromRoute: request.draft.legsFromRoute,
+            fromGraph: request.draft.legsFromGraph, usedAt: geometryUse
+        )
+        evictGeometryIfNeeded()
+    }
+
+    /// Remove exactly this incarnation of a request. A cancelled worker may
+    /// finish after a resumed pass has queued the same key with a new token.
+    @discardableResult
+    private func finishGeometryRequest(_ request: GeometryBuildRequest) -> Bool {
+        guard queuedGeometryBuilds[request.key] == request.token else { return false }
+        queuedGeometryBuilds.removeValue(forKey: request.key)
+        signalGeometryChange()
+        return true
+    }
+
+    private func geometryWorkerFinished(generation: Int) {
+        guard generation == geometryWorkerGeneration else { return }
+        // This is the only place the handle is cleared. Cancellation can leave
+        // a worker inside synchronous route matching, and retaining the handle
+        // until this acknowledgement is what prevents an overlapping worker.
+        geometryWorker = nil
+        signalGeometryChange()
+        startGeometryWorkerIfNeeded()
+    }
+
+    private func waitForGeometryQueueCapacity() async -> Bool {
+        while !Task.isCancelled {
+            guard !geometryBackgroundSuspended else { return false }
+            if geometryBuildQueue.count < Self.geometryQueueLimit { return true }
+            let revision = geometryChangeRevision
+            await waitForGeometryChange(after: revision)
+        }
+        return false
+    }
+
+    private func waitForGeometryBuilds(_ tokens: Set<UInt64>) async {
+        guard !tokens.isEmpty else { return }
+        while !Task.isCancelled, !geometryBackgroundSuspended {
+            let active = queuedGeometryBuilds.values.contains { tokens.contains($0) }
+            guard active else { return }
+            let revision = geometryChangeRevision
+            await waitForGeometryChange(after: revision)
+        }
+    }
+
+    private func waitForGeometryChange(after revision: UInt64) async {
+        guard !Task.isCancelled, revision == geometryChangeRevision else { return }
+        geometryChangeWaiterID &+= 1
+        let id = geometryChangeWaiterID
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, revision == geometryChangeRevision else {
+                    continuation.resume()
+                    return
+                }
+                geometryChangeWaiters[id] = continuation
+            }
+        } onCancel: { [weak self] in
+            Task { await self?.cancelGeometryChangeWaiter(id) }
+        }
+    }
+
+    private func cancelGeometryChangeWaiter(_ id: UInt64) {
+        geometryChangeWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    private func signalGeometryChange() {
+        geometryChangeRevision &+= 1
+        let waiters = Array(geometryChangeWaiters.values)
+        geometryChangeWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Drop work which exists only to warm or refine a future frame.
+    ///
+    /// Visible requests remain queued, and a speculative request already inside
+    /// the synchronous matcher is allowed to finish: it cannot be interrupted
+    /// safely, and retaining its token lets its useful result install normally.
+    /// Removing the waiting tokens wakes only the warm/refinement passes which
+    /// owned them; they observe their caller's cancellation or power state and
+    /// stop without holding the queue open.
+    public func cancelSpeculativeGeometry() {
+        let removed = geometryBuildQueue.filter { !$0.urgent }
+        guard !removed.isEmpty else { return }
+        geometryBuildQueue.removeAll { !$0.urgent }
+        for request in removed where queuedGeometryBuilds[request.key] == request.token {
+            queuedGeometryBuilds.removeValue(forKey: request.key)
+        }
+        signalGeometryChange()
+    }
+
+    /// Stop accepting background geometry and invalidate everything queued.
+    /// A build already inside the synchronous matcher finishes on its utility
+    /// thread, but its token is gone and the worker handle remains occupied, so
+    /// it can neither install nor overlap a replacement after resume.
+    public func cancelBackgroundGeometry() {
+        geometryBackgroundSuspended = true
+        geometryWorker?.cancel()
+        geometryBuildQueue.removeAll(keepingCapacity: true)
+        queuedGeometryBuilds.removeAll(keepingCapacity: true)
+        consecutiveUrgentGeometryBuilds = 0
+        signalGeometryChange()
+    }
+
+    /// Allow presentation and warm requests again after the app becomes active.
+    /// If a cancelled synchronous build is still draining, requests may queue
+    /// but the next worker starts only after that build acknowledges completion.
+    public func resumeBackgroundGeometry() {
+        guard geometryBackgroundSuspended else {
+            startGeometryWorkerIfNeeded()
+            return
+        }
+        geometryBackgroundSuspended = false
+        signalGeometryChange()
+        startGeometryWorkerIfNeeded()
     }
 
     /// Identifies the call list a path was built for.
@@ -2810,16 +3304,16 @@ public actor Fleet {
         //
         // This used to take the default and upgrade the path — bending legs
         // onto platform rails, filling gaps from the routing graph. The draw
-        // loop mostly cannot afford that (`alignToTrack` has eight milliseconds
-        // a frame for it and a busy viewport holds a thousand vehicles), so the
+        // loop supplies that asynchronously (`alignToTrack` queues a cold path
+        // and a busy viewport holds a thousand vehicles), so the
         // vehicle was on screen at its corridor position and this moved it to
         // its refined one the instant somebody touched it. Measured over a
         // Zurich viewport, 77% of vehicles moved, 41 of them by more than 250 m
         // and the worst by 3.5 km — and a second tap moved it no further,
         // because by then it was refined.
         //
-        // Refining is still right and still happens: the draw loop spends its
-        // budget on it and `refineDrawn` sweeps the viewport in the background.
+        // Refining is still right and still happens: the draw loop queues it and
+        // `refineDrawn` sweeps the viewport in the background.
         // What must not happen is a *reader's tap* being the thing that
         // triggers it, because a tap is the one moment the reader is looking
         // straight at the vehicle. Asking only that the journey have some path
@@ -3024,6 +3518,16 @@ public actor Fleet {
     public func stationBoard(placeId: String, at now: Timestamp, limit: Int = 60) -> StationBoard? {
         guard let place = stopPlaces.place(id: placeId) else { return nil }
         return board(name: place.name, id: place.id, lon: place.lon, lat: place.lat, at: now, limit: limit)
+    }
+
+    /// Whether the coordinate is close enough to transit to justify a more
+    /// precise location fix. This touches only the stop-place grid: it builds no
+    /// board, journeys or presentation models.
+    public func hasStopPlace(
+        near lon: Double, lat: Double, within metres: Double = 500
+    ) -> Bool {
+        guard metres > 0, stopPlaces.count > 0 else { return false }
+        return stopPlaces.nearest(lon: lon, lat: lat, within: metres) != nil
     }
 
     public func stationBoard(near lon: Double, lat: Double, at now: Timestamp, limit: Int = 60) -> StationBoard? {
@@ -3815,25 +4319,6 @@ public actor Fleet {
 
     /// How many legs are memoised, for the diagnostics panel.
     public var routedLegs: Int { railnet.cachedLegs }
-
-    /// The longest a single draw may spend building geometry it does not yet
-    /// have.
-    ///
-    /// The draw loop runs at 15 Hz, so a tick has 66 ms before it is late.
-    /// Eight of those is a budget the loop cannot feel — and it is eight
-    /// milliseconds of *building*, measured over the attach calls, not a
-    /// deadline the walk over the fleet can spend before the building starts.
-    /// See `alignToTrack`, which is where that distinction was worth several
-    /// seconds of chord-drawn vehicles.
-    ///
-    /// A vehicle still waiting on its path is drawn on the chord between its
-    /// stops, so the cost of deferring is a line that straightens a frame or
-    /// two later — and, since the memo survives a refresh, one it pays once.
-    ///
-    /// Without a budget the first draw over a city attached geometry for every
-    /// vehicle in the viewport in one pass, each one possibly a graph search,
-    /// and nothing else on this actor ran until it finished.
-    static let geometryBudget: TimeInterval = 0.008
 
     /// How wide a viewport still gets every vehicle in it put on its real
     /// track, in metres.

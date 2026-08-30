@@ -336,21 +336,23 @@ enum VehicleShapes {
     /// enough to be mistaken for a train in front of the building.
     static let xrayOpacity = 0.4
 
-    /// Which of the two ways through a building is in use.
+    /// Which of the two ways through an occluder is in use.
     ///
     /// The ghost fill while the map is flat, the occluded silhouette once the
     /// solids are up, and never both: the fill is drawn over everything and
     /// would paint a plan around the base of every standing train. See the note
     /// on the x-ray layer in `install`.
-    static func setXray(_ style: MapboxMap, solids: Bool) {
+    static func setXray(_ style: MapboxMap, solids: Bool, occluders: Bool) {
+        let ghostVisible = occluders && !solids
         for layer in [ghost, followGhost] where style.layerExists(withId: layer) {
             try? style.setLayerProperty(
-                for: layer, property: "visibility", value: solids ? "none" : "visible"
+                for: layer, property: "visibility", value: ghostVisible ? "visible" : "none"
             )
         }
+        let xrayVisible = occluders && solids
         for layer in [xray, followXray] where style.layerExists(withId: layer) {
             try? style.setLayerProperty(
-                for: layer, property: "visibility", value: solids ? "visible" : "none"
+                for: layer, property: "visibility", value: xrayVisible ? "visible" : "none"
             )
         }
     }

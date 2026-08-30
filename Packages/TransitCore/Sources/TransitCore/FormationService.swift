@@ -55,7 +55,45 @@ public actor FormationService {
 
     private let client: OTDClient
     private var cache: [FormationKey: (answer: Answer, at: Date)] = [:]
-    private var inFlight: [FormationKey: Task<Answer, Never>] = [:]
+    /// One transport with one entry per caller waiting for it. A caller's task
+    /// cancellation must not tear down a request another panel still needs,
+    /// while the last cancellation must stop otherwise orphaned radio work.
+    private final class Waiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Answer, Never>?
+        private var result: Answer?
+
+        func value() async -> Answer {
+            await withCheckedContinuation { continuation in
+                let immediate = lock.withLock { () -> Answer? in
+                    if let result { return result }
+                    self.continuation = continuation
+                    return nil
+                }
+                if let immediate { continuation.resume(returning: immediate) }
+            }
+        }
+
+        func resolve(_ answer: Answer) {
+            let continuation = lock.withLock { () -> CheckedContinuation<Answer, Never>? in
+                guard result == nil else { return nil }
+                result = answer
+                let continuation = self.continuation
+                self.continuation = nil
+                return continuation
+            }
+            continuation?.resume(returning: answer)
+        }
+    }
+
+    private struct InFlight: Sendable {
+        var id: Int
+        var task: Task<(Answer, Data?), Never>
+        var waiters: [Int: Waiter]
+    }
+    private var inFlight: [FormationKey: InFlight] = [:]
+    private var nextFlightID = 0
+    private var nextWaiterID = 0
     /// Where answers are kept between launches, once a caller names a place.
     private var store: URL?
 
@@ -136,6 +174,11 @@ public actor FormationService {
         client = OTDClient(token: token)
     }
 
+    /// Internal transport seam for deterministic cancellation tests.
+    init(client: OTDClient) {
+        self.client = client
+    }
+
     public var isConfigured: Bool {
         get async { await client.isConfigured }
     }
@@ -161,7 +204,15 @@ public actor FormationService {
         }
         // Two panels asking at once — which happens every time a vehicle is
         // re-read while the first request is still open — is one request.
-        if let running = inFlight[key] { return await running.value }
+        if var running = inFlight[key] {
+            let waiterID = makeWaiterID()
+            let waiter = Waiter()
+            running.waiters[waiterID] = waiter
+            inFlight[key] = running
+            return await wait(
+                for: key, flightID: running.id, waiterID: waiterID, waiter: waiter
+            )
+        }
 
         // Anything a previous run — or a previous sweep — already asked about.
         // Checked before the budget, so a train whose answer is on disk costs
@@ -178,9 +229,37 @@ public actor FormationService {
         let task = Task<(Answer, Data?), Never> { [client] in
             await Self.fetch(key: key, client: client)
         }
-        inFlight[key] = Task { await task.value.0 }
-        let (answer, body) = await task.value
+        let flightID = makeFlightID()
+        let waiterID = makeWaiterID()
+        let waiter = Waiter()
+        inFlight[key] = InFlight(id: flightID, task: task, waiters: [waiterID: waiter])
+        Task { [weak self] in
+            let result = await task.value
+            await self?.complete(key: key, flightID: flightID, result: result)
+        }
+        return await wait(for: key, flightID: flightID, waiterID: waiterID, waiter: waiter)
+    }
+
+    private func wait(
+        for key: FormationKey, flightID: Int, waiterID: Int,
+        waiter: Waiter
+    ) async -> Answer {
+        await withTaskCancellationHandler(operation: {
+            await waiter.value()
+        }, onCancel: {
+            Task { await self.cancelWaiter(for: key, flightID: flightID, waiterID: waiterID) }
+        })
+    }
+
+    private func complete(
+        key: FormationKey, flightID: Int, result: (Answer, Data?)
+    ) {
+        // A final waiter cancellation removes the flight before cancelling its
+        // task. Its late result must not populate the cache or overwrite a new
+        // flight for the same train.
+        guard let running = inFlight[key], running.id == flightID else { return }
         inFlight[key] = nil
+        let (answer, body) = result
 
         // Written for a silence too, as an empty file — see `held`.
         switch answer {
@@ -198,8 +277,34 @@ public actor FormationService {
         // remembering it for four minutes would turn one burst into four
         // minutes of blank panels for trains the service could have answered.
         if case .failed = answer {} else { cache[key] = (answer, Date()) }
-        return answer
+        for waiter in running.waiters.values { waiter.resolve(answer) }
     }
+
+    private func cancelWaiter(for key: FormationKey, flightID: Int, waiterID: Int) {
+        guard var running = inFlight[key], running.id == flightID,
+              let waiter = running.waiters.removeValue(forKey: waiterID)
+        else { return }
+        if running.waiters.isEmpty {
+            inFlight[key] = nil
+            running.task.cancel()
+        } else {
+            inFlight[key] = running
+        }
+        waiter.resolve(.failed(CancellationError().localizedDescription))
+    }
+
+    private func makeFlightID() -> Int {
+        nextFlightID &+= 1
+        return nextFlightID
+    }
+
+    private func makeWaiterID() -> Int {
+        nextWaiterID &+= 1
+        return nextWaiterID
+    }
+
+    /// Internal observation used by deterministic coalescing tests.
+    func activeWaiters(for key: FormationKey) -> Int { inFlight[key]?.waiters.count ?? 0 }
 
     private static func fetch(key: FormationKey, client: OTDClient) async -> (Answer, Data?) {
         var items = URLComponents()
@@ -213,6 +318,9 @@ public actor FormationService {
         do {
             return try await ask(full, query: query, client: client)
         } catch let failure as OTDClient.Failure {
+            guard !Task.isCancelled else {
+                return (.failed(CancellationError().localizedDescription), nil)
+            }
             switch failure {
             // A refusal to reconcile the two sources, which the realtime half
             // alone is not subject to. Worth the second call: it is the
@@ -231,6 +339,9 @@ public actor FormationService {
             default: return (.failed(failure.description), nil)
             }
         } catch {
+            guard !Task.isCancelled else {
+                return (.failed(CancellationError().localizedDescription), nil)
+            }
             return (.failed(error.localizedDescription), nil)
         }
     }

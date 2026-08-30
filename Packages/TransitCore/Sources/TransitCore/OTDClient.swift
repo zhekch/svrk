@@ -56,6 +56,10 @@ public actor OTDClient {
     static let userAgent = "swiss-live-transit-ios/1.0"
 
     private let token: String?
+    /// Kept injectable for deterministic transport and cancellation tests.
+    /// Production always uses the shared session and the platform base URL.
+    private let baseURL: URL
+    private let session: URLSession
     private var recent: [Date] = []
     private var day = Calendar(identifier: .gregorian).startOfDay(for: Date())
     private var today = 0
@@ -89,6 +93,24 @@ public actor OTDClient {
     ///   not the interface's.
     public init(token: String?, budget: String? = nil) {
         self.token = token
+        self.baseURL = Self.base
+        self.session = .shared
+        self.budgetKey = budget.map { "otd.window.\($0)" }
+        if let budgetKey,
+           let stored = UserDefaults.standard.array(forKey: budgetKey) as? [Double] {
+            let now = Date()
+            recent = stored.map(Date.init(timeIntervalSince1970:))
+                .filter { now.timeIntervalSince($0) < 60 }
+        }
+    }
+
+    /// A transport seam for tests. Kept internal so the app continues to have
+    /// one public construction path and cannot accidentally ship a different
+    /// endpoint or session policy.
+    init(token: String?, budget: String? = nil, baseURL: URL, session: URLSession) {
+        self.token = token
+        self.baseURL = baseURL
+        self.session = session
         self.budgetKey = budget.map { "otd.window.\($0)" }
         if let budgetKey,
            let stored = UserDefaults.standard.array(forKey: budgetKey) as? [Double] {
@@ -227,7 +249,7 @@ public actor OTDClient {
         try await reserve(api, maxWait: maxWait)
 
         var components = URLComponents(
-            url: Self.base.appendingPathComponent(api.path), resolvingAgainstBaseURL: false
+            url: baseURL.appendingPathComponent(api.path), resolvingAgainstBaseURL: false
         )
         components?.percentEncodedQuery = query.isEmpty ? nil : query
         guard let url = components?.url else { throw Failure.http(0) }
@@ -239,7 +261,7 @@ public actor OTDClient {
         request.timeoutInterval = 30
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             note(response)
             // What came back. `URLSession.data(for:)` will not say how many
             // bytes crossed the wire — only the streaming path can — so the
@@ -259,6 +281,7 @@ public actor OTDClient {
         } catch let failure as Failure {
             throw failure
         } catch {
+            if Task.isCancelled { throw CancellationError() }
             errors += 1
             lastError = error.localizedDescription
             throw error
@@ -278,7 +301,7 @@ public actor OTDClient {
     ) async throws -> Data {
         try await reserve(api, maxWait: maxWait)
 
-        var request = URLRequest(url: Self.base.appendingPathComponent(api.path))
+        var request = URLRequest(url: baseURL.appendingPathComponent(api.path))
         request.httpMethod = "POST"
         request.httpBody = body
         request.setValue("Bearer \(token ?? "")", forHTTPHeaderField: "Authorization")
@@ -288,7 +311,7 @@ public actor OTDClient {
         request.timeoutInterval = 30
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             note(response)
             // What came back. `URLSession.data(for:)` will not say how many
             // bytes crossed the wire — only the streaming path can — so the
@@ -308,6 +331,7 @@ public actor OTDClient {
         } catch let failure as Failure {
             throw failure
         } catch {
+            if Task.isCancelled { throw CancellationError() }
             errors += 1
             lastError = error.localizedDescription
             throw error
@@ -319,6 +343,7 @@ public actor OTDClient {
     private func reserve(
         _ api: API, maxWait: TimeInterval, monitor: RefreshMonitor? = nil
     ) async throws {
+        try Task.checkCancellation()
         guard let token, !token.isEmpty else { throw Failure.noToken }
 
         guard let wait = delayBefore(api) else {
@@ -337,6 +362,10 @@ public actor OTDClient {
             monitor?.phase(.connecting)
         }
 
+        // Cancellation can arrive after a zero-delay window check or just as a
+        // rate-limit sleep completes. Do not persist a call against the budget
+        // when no request will be allowed to leave this task.
+        try Task.checkCancellation()
         recent.append(Date())
         rememberWindow()
         today += 1
@@ -371,7 +400,7 @@ public actor OTDClient {
     ) async throws {
         try await reserve(api, maxWait: maxWait, monitor: monitor)
 
-        var request = URLRequest(url: Self.base.appendingPathComponent(api.path))
+        var request = URLRequest(url: baseURL.appendingPathComponent(api.path))
         request.setValue("Bearer \(token ?? "")", forHTTPHeaderField: "Authorization")
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue(api.accept, forHTTPHeaderField: "Accept")
@@ -398,6 +427,7 @@ public actor OTDClient {
         } catch let failure as Failure {
             throw failure
         } catch {
+            if Task.isCancelled { throw CancellationError() }
             errors += 1
             lastError = error.localizedDescription
             throw error
@@ -441,15 +471,21 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
     private final class Gate {
         private let condition = NSCondition()
         private var outstanding = 0
+        private var cancelled = false
         private let limit: Int
 
         init(limit: Int) { self.limit = limit }
 
-        func acquire(_ bytes: Int) {
+        func acquire(_ bytes: Int) -> Bool {
             condition.lock()
-            while outstanding >= limit { condition.wait() }
+            while outstanding >= limit && !cancelled { condition.wait() }
+            guard !cancelled else {
+                condition.unlock()
+                return false
+            }
             outstanding += bytes
             condition.unlock()
+            return true
         }
 
         func release(_ bytes: Int) {
@@ -458,9 +494,19 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
             condition.broadcast()
             condition.unlock()
         }
+
+        /// Wake a delegate callback blocked behind the parser. URLSession
+        /// cannot deliver its cancellation completion while that callback is
+        /// still waiting here.
+        func cancel() {
+            condition.lock()
+            cancelled = true
+            condition.broadcast()
+            condition.unlock()
+        }
     }
 
-    private let onChunk: (Data) -> Void
+    private let onChunk: @Sendable (Data) -> Void
     private let monitor: RefreshMonitor?
     private let gate = Gate(limit: ChunkedDownload.bufferLimit)
     /// Serial, so chunks reach the parser in the order the socket produced
@@ -480,7 +526,13 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
         var payload: Int = 0
     }
 
+    /// Cancellation may race continuation installation and URLSession's
+    /// completion callback. These fields are the single resume-once state.
+    private let stateLock = NSLock()
     private var continuation: CheckedContinuation<Answer, Error>?
+    private var dataTask: URLSessionDataTask?
+    private var cancelled = false
+    private var completed = false
     private var status = 0
     private var response: HTTPURLResponse?
     /// The wire count as the task last reported it. Kept rather than read at
@@ -490,26 +542,79 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
     /// that will not say how many went over the wire.
     private var parsedBytes = 0
 
-    private init(monitor: RefreshMonitor?, onChunk: @escaping (Data) -> Void) {
+    private init(monitor: RefreshMonitor?, onChunk: @Sendable @escaping (Data) -> Void) {
         self.monitor = monitor
         self.onChunk = onChunk
     }
 
     static func run(
         request: URLRequest, monitor: RefreshMonitor? = nil,
+        configuration suppliedConfiguration: URLSessionConfiguration? = nil,
         onChunk: @Sendable @escaping (Data) -> Void
     ) async throws -> Answer {
         let delegate = ChunkedDownload(monitor: monitor, onChunk: onChunk)
-        let configuration = URLSessionConfiguration.ephemeral
+        let configuration = suppliedConfiguration ?? .ephemeral
         configuration.timeoutIntervalForRequest = 180
         configuration.timeoutIntervalForResource = 600
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            delegate.continuation = continuation
-            session.dataTask(with: request).resume()
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                delegate.begin(
+                    continuation: continuation,
+                    task: session.dataTask(with: request)
+                )
+            }
+        }, onCancel: {
+            delegate.cancel()
+        })
+    }
+
+    /// Install the continuation and task together so cancellation cannot land
+    /// in the gap between them. If the parent was already cancelled, no socket
+    /// is opened and the continuation is still completed exactly once.
+    private func begin(
+        continuation: CheckedContinuation<Answer, Error>, task: URLSessionDataTask
+    ) {
+        let wasCancelled = stateLock.withLock { () -> Bool in
+            guard !completed else { return true }
+            self.continuation = continuation
+            dataTask = task
+            return cancelled
         }
+        if wasCancelled {
+            task.cancel()
+            finish(.failure(CancellationError()))
+        } else {
+            task.resume()
+        }
+    }
+
+    private func cancel() {
+        let task = stateLock.withLock { () -> URLSessionDataTask? in
+            guard !completed else { return nil }
+            cancelled = true
+            return dataTask
+        }
+        gate.cancel()
+        task?.cancel()
+    }
+
+    private var isCancelled: Bool { stateLock.withLock { cancelled } }
+
+    /// The only continuation-resume site. Both cancellation and delegate
+    /// completion may arrive, but only the first result is allowed through.
+    private func finish(_ result: Result<Answer, Error>) {
+        let pending = stateLock.withLock { () -> CheckedContinuation<Answer, Error>? in
+            guard !completed else { return nil }
+            completed = true
+            let pending = continuation
+            continuation = nil
+            dataTask = nil
+            return pending
+        }
+        pending?.resume(with: result)
     }
 
     /// Follow the platform's redirect, without the credentials.
@@ -547,6 +652,7 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard !isCancelled else { return }
         // Two different numbers, and only one of them is "the download".
         // `countOfBytesReceived` is the wire — twelve megabytes of gzip, and
         // what a data allowance is actually charged. `data.count` is what that
@@ -561,9 +667,12 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
         )
         // Blocks only once the parser is a whole buffer behind, which is the
         // one case where reading faster would just be filling memory.
-        gate.acquire(data.count)
+        guard gate.acquire(data.count) else { return }
         parsing.async { [self] in
-            onChunk(data)
+            // Chunks already handed to this queue before cancellation are
+            // discarded. The currently executing parser callback is allowed to
+            // finish; `didComplete` waits for it before resuming the caller.
+            if !isCancelled { onChunk(data) }
             gate.release(data.count)
         }
     }
@@ -574,21 +683,21 @@ final class ChunkedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendab
         // complete, or it would read a fleet with the tail missing. `sync` on a
         // serial queue is the whole barrier — every `async` above is ahead of
         // it in the same line.
-        if error == nil { monitor?.phase(.indexing) }
+        if error == nil && !isCancelled { monitor?.phase(.indexing) }
         parsing.sync {}
 
-        let pending = continuation
-        continuation = nil
-        if let error {
-            pending?.resume(throwing: error)
+        if isCancelled {
+            finish(.failure(CancellationError()))
+        } else if let error {
+            finish(.failure(error))
         } else {
-            pending?.resume(returning: Answer(
+            finish(.success(Answer(
                 status: status, response: budget ?? response,
                 // A transport that would not say how many bytes it moved is
                 // reported at the decoded size, which is the same fallback the
                 // progress readout already makes.
                 wire: wireBytes > 0 ? wireBytes : parsedBytes, payload: parsedBytes
-            ))
+            )))
         }
     }
 

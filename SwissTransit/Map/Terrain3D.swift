@@ -230,12 +230,17 @@ enum Terrain3D {
     /// it `basemap` today and there is no promise that it always will, and a
     /// hard-coded name that stops matching fails silently — the config is
     /// simply ignored and the map looks subtly wrong with nothing in the log.
-    static func applyStandardConfig(_ style: MapboxMap, preset: LightPreset) {
+    static func applyStandardConfig(
+        _ style: MapboxMap, preset: LightPreset, buildings: Bool
+    ) {
         guard let importId = style.styleImports.first?.id else { return }
         do {
             try style.setStyleImportConfigProperties(for: importId, configs: [
                 "lightPreset": preset.rawValue,
-                "show3dObjects": true,
+                // Standard owns these inside its import, so this is also the
+                // only route by which the app's 3D-buildings setting can avoid
+                // their geometry and depth passes.
+                "show3dObjects": buildings,
                 // The basemap's own transit labels, over an app whose entire
                 // subject is transit. Two sets of station names at two sizes in
                 // two fonts, and neither of them the one that can be tapped.

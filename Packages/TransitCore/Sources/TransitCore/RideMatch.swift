@@ -429,15 +429,6 @@ extension Fleet {
     /// rather than for the price of a fit.
     static let rideCone: Double = 55
 
-    /// How long may be spent building geometry for candidates, per ask.
-    ///
-    /// A chord cuts every corner, so a journey with no path yet can sit two
-    /// hundred metres off its own rails through a curve — which is the
-    /// difference between a match and a miss. Budgeted like the draw loop's own
-    /// geometry pass, and memoised, so this costs something once and nothing
-    /// after that.
-    static let rideGeometryBudget: TimeInterval = 0.012
-
     /// The journeys whose recent path the phone's own could be.
     ///
     /// Ordered best first. An empty answer means nothing fitted, which is the
@@ -452,7 +443,14 @@ extension Fleet {
         let moment = Double(now)
         let course = (latest.course).flatMap { $0 >= 0 ? $0 : nil }
         var near: [(journey: Journey, metres: Double)] = []
-        for journey in fleetVehicles() {
+        let reach = BBox(
+            west: latest.coord.lon, south: latest.coord.lat,
+            east: latest.coord.lon, north: latest.coord.lat
+        ).padded(byMetres: Self.rideReach)
+        for journey in activeFleetVehicles(at: moment) {
+            // Exact: the hull contains every point Positioning can return. This
+            // removes the rest of the country before walking a call list.
+            if let box = journey.drawnWithin(), !reach.intersects(box) { continue }
             guard let position = Positioning.position(of: journey, at: moment) else { continue }
             let metres = Geo.flatMetres(
                 position.lon, position.lat, latest.coord.lon, latest.coord.lat
@@ -466,12 +464,8 @@ extension Fleet {
         near.sort { $0.metres < $1.metres }
         if near.count > Self.rideField { near.removeLast(near.count - Self.rideField) }
 
-        var spent: TimeInterval = 0
         for entry in near where entry.journey.geometry == nil {
-            let started = Date()
-            attachGeometry(to: entry.journey)
-            spent += Date().timeIntervalSince(started)
-            if spent >= Self.rideGeometryBudget { break }
+            _ = prepareGeometryInBackground(for: entry.journey)
         }
 
         var out: [RideCandidate] = []
