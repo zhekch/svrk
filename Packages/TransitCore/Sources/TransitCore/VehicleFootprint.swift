@@ -141,6 +141,10 @@ public struct VehicleFootprint: Sendable, Equatable {
     public var emergence: Double
     public var stroke: String
     public var selected: Bool
+    /// Whether the body hangs from fixed infrastructure rather than resting on
+    /// the terrain. Its footprint is still the source geometry for the 3D
+    /// model and hit testing, but must never be painted as a flat ground shape.
+    public var hanging: Bool
     /// Whether to draw the selection ring round it.
     ///
     /// Not the same question as `selected`, and separating them is the point.
@@ -265,9 +269,25 @@ public enum VehicleShape {
     public static let shortestVehiclePoints = 8.0
     public static let perBodyPoints = 2.2
 
+    /// How long a hanging cabin has to be before it becomes a drawing.
+    ///
+    /// A cabin is already recognisable from its model silhouette at about a
+    /// point: the pod, hanger and rope do the descriptive work that a bus or a
+    /// train has to get from several points of body. Holding a two-metre cabin
+    /// to the ordinary eight-point floor leaves it as a dot until the reader is
+    /// almost on top of it, and on a busy gondola line that means a string of
+    /// dots long after the rope and stations have become the picture.
+    public static let hangingVehiclePoints = 1.0
+
     /// Where the change from dot to vehicle begins for a given layout.
     public static func emergeAt(bodies: Int) -> Double {
         max(shortestVehiclePoints, perBodyPoints * Double(max(1, bodies)))
+    }
+
+    /// The emergence floor for a vehicle whose relationship to the ground is
+    /// already known.
+    public static func emergeAt(bodies: Int, hanging: Bool) -> Double {
+        hanging ? hangingVehiclePoints : emergeAt(bodies: bodies)
     }
 
     /// Below this there is no point looking: at national zoom every vehicle in
@@ -412,7 +432,9 @@ public enum VehicleShape {
         // rest of them. Somebody who has tapped a train is looking at *that*
         // train, and the formation panel beside the map is already describing
         // the thing the dot is refusing to show.
-        let threshold = emergeAt(bodies: layout.units.count)
+        let threshold = emergeAt(
+            bodies: layout.units.count, hanging: Cableway.hangs(vehicle)
+        )
         let floor = selected ? threshold * 0.6 : threshold
         // Told, or worked out here. Told is the normal case and the one that
         // animates: the caller keeps a per-vehicle clock and hands in where
@@ -679,7 +701,8 @@ public enum VehicleShape {
             id: vehicle.id, parts: parts, slabs: slabs, placements: placements,
             lamps: lamps, centreline: line,
             lengthPoints: lengthPoints, emergence: emergence,
-            stroke: layout.livery.stroke, selected: selected, ringed: ringed ?? selected,
+            stroke: layout.livery.stroke, selected: selected,
+            hanging: Cableway.hangs(vehicle), ringed: ringed ?? selected,
             aboveGround: Self.isAboveGround(vehicle.mode)
         )
     }

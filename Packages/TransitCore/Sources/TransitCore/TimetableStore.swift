@@ -877,11 +877,16 @@ public final class TimetableStore: @unchecked Sendable {
     ///     weekday has 20,988 vehicles moving at once, which is the same order
     ///     as the SIRI fleet this replaces, but a caller asking for a whole day
     ///     would otherwise get three million calls.
+    ///   - uniquePatterns: build only the first running trip for each stop
+    ///     pattern. Fixed infrastructure needs the route once, not once per
+    ///     departure.
     public func journeys(
         from: Timestamp,
         to: Timestamp,
         zone: TimeZone = TimeZone(identifier: "Europe/Zurich") ?? .current,
         limit: Int = 30_000,
+        modes: Set<Mode>? = nil,
+        uniquePatterns: Bool = false,
         in region: BBox? = nil,
         place: (String) -> Place?,
         operatorName: (String) -> String? = { _ in nil }
@@ -908,6 +913,7 @@ public final class TimetableStore: @unchecked Sendable {
 
         var out: [Journey] = []
         out.reserveCapacity(min(limit, region == nil ? 24_000 : 4_000))
+        var seenPatterns: Set<Int> = []
 
         // A run filed under yesterday can still be moving — a night service
         // leaves at 25:40 — so the day before the window is always considered.
@@ -932,6 +938,7 @@ public final class TimetableStore: @unchecked Sendable {
 
                 let record = trip(i)
                 guard record.pattern < patternCount else { continue }
+                if let modes, !modes.contains(classMode(record.klass)) { continue }
                 // The cheap rejections first: a trip that had already finished,
                 // then one that does not run today. Both are far cheaper than
                 // reading the pattern's calls.
@@ -943,6 +950,7 @@ public final class TimetableStore: @unchecked Sendable {
                 // Every later trip of the same pattern — and there are a dozen
                 // an hour — reads the answer.
                 if let clip, !pattern(record.pattern, intersects: clip, place: place) { continue }
+                if uniquePatterns, !seenPatterns.insert(record.pattern).inserted { continue }
 
                 if let journey = build(record, row: i, dayZero: dayZero, place: place, operatorName: operatorName) {
                     out.append(journey)
@@ -1046,6 +1054,17 @@ public final class TimetableStore: @unchecked Sendable {
             stops: calls,
             journeyRef: ref
         )
+    }
+
+    /// The mode field alone, for queries that can reject a trip without
+    /// allocating the three strings beside it in the class record.
+    private func classMode(_ i: Int) -> Mode {
+        guard i >= 0, i < classCount else { return .other }
+        let raw = Int(bytes.loadUnaligned(
+            fromByteOffset: classesAt + i * 16 + 12, as: UInt32.self
+        ))
+        let modes: [Mode] = [.train, .tram, .bus, .metro, .boat, .cable, .other]
+        return raw < modes.count ? modes[raw] : .other
     }
 }
 

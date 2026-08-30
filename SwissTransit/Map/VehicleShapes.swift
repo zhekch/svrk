@@ -400,6 +400,11 @@ enum VehicleShapes {
         let drawn = excluded == nil ? footprints : footprints.filter { $0.id != excluded }
         let ordered = drawn.filter { !$0.aboveGround } + drawn.filter(\.aboveGround)
         for print in ordered {
+            // A gondola is either its elevated solid or its point fallback.
+            // Its rings are retained in `VehicleFootprint` to build and place
+            // that solid, but a fill layer would paint them on the terrain as
+            // a second cabin directly underneath the real one.
+            guard !print.hanging else { continue }
             let standing = stood.contains(print.id)
             let fade = print.emergence * solid
             let wagonLifts = lifts[print.id] ?? []

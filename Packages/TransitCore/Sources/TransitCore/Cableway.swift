@@ -134,7 +134,7 @@ public enum Cableway {
     /// Held by the coordinator after it is built, because two things need it
     /// and they must agree exactly: the line that draws the rope, and the lift
     /// that hangs the cabins on it. See `MapCoordinator.rest`.
-    public struct Rope {
+    public struct Rope: Sendable, Codable, Equatable {
         /// The plan, resampled.
         public var points: [Coord]
         /// How far along the span each of those is, in metres.
@@ -219,18 +219,98 @@ public enum Cableway {
     /// Nil if the terrain has not been measured at every point — a span half
     /// measured would be pulled tight against ground that is not there yet.
     public static func taut(along points: [Coord], ground: (Coord) -> Double?) -> Rope? {
-        var along: [Double] = [0]
-        var floor: [Double] = []
         var heights: [Double] = []
-        for (i, point) in points.enumerated() {
+        for point in points {
             guard let g = ground(point), g.isFinite else { return nil }
             heights.append(g)
-            if i > 0 { along.append(along[i - 1] + Geo.metres(points[i - 1], point)) }
+        }
+        guard let along = distances(along: points) else { return nil }
+        return taut(along: points, distances: along, ground: heights)
+    }
+
+    /// A temporary absolute-height rope when only part of the terrain is
+    /// currently resident in the renderer.
+    ///
+    /// Missing samples between known ones are interpolated; missing ends use
+    /// the nearest known height. If the renderer has no samples for this span
+    /// yet, `fallbackGround` (normally the ground under the camera) gives it a
+    /// visible level. The result still uses sea-level elevation and straight
+    /// 3D segments, so it never becomes a terrain-draped line when the camera
+    /// moves. Callers may cache an incomplete result as provisional, but must
+    /// keep retrying it until a complete profile can replace it.
+    public static func provisional(
+        along points: [Coord], fallbackGround: Double,
+        ground: (Coord) -> Double?
+    ) -> (rope: Rope, complete: Bool)? {
+        guard fallbackGround.isFinite,
+              let along = distances(along: points)
+        else { return nil }
+
+        var samples = points.map { point -> Double? in
+            guard let value = ground(point), value.isFinite else { return nil }
+            return value
+        }
+        let complete = samples.allSatisfy { $0 != nil }
+
+        let known = samples.indices.filter { samples[$0] != nil }
+        if known.isEmpty {
+            samples = Array(repeating: fallbackGround, count: points.count)
+        } else {
+            let first = known[0]
+            let firstHeight = samples[first]!
+            if first > 0 {
+                for i in 0..<first { samples[i] = firstHeight }
+            }
+
+            for pair in zip(known, known.dropFirst()) {
+                let a = pair.0, b = pair.1
+                let start = samples[a]!, end = samples[b]!
+                let run = along[b] - along[a]
+                if b > a + 1 {
+                    for i in (a + 1)..<b {
+                        let share = run > 0 ? (along[i] - along[a]) / run : 0
+                        samples[i] = start + (end - start) * share
+                    }
+                }
+            }
+
+            let last = known[known.count - 1]
+            let lastHeight = samples[last]!
+            if last + 1 < samples.count {
+                for i in (last + 1)..<samples.count { samples[i] = lastHeight }
+            }
+        }
+
+        let heights = samples.map { $0 ?? fallbackGround }
+        guard let rope = taut(along: points, distances: along, ground: heights) else {
+            return nil
+        }
+        return (rope, complete)
+    }
+
+    /// Cumulative ground distance for a valid span.
+    private static func distances(along points: [Coord]) -> [Double]? {
+        guard points.count >= 2 else { return nil }
+        var along = [Double](repeating: 0, count: points.count)
+        for i in 1..<points.count {
+            along[i] = along[i - 1] + Geo.metres(points[i - 1], points[i])
         }
         guard along.count == points.count, let last = along.last, last > 0 else { return nil }
+        return along
+    }
+
+    /// Pull a rope over an already complete set of terrain heights.
+    private static func taut(
+        along points: [Coord], distances along: [Double], ground heights: [Double]
+    ) -> Rope? {
+        guard points.count == along.count, along.count == heights.count,
+              points.count >= 2
+        else { return nil }
 
         // What the rope may not go below: its own station height at the two
         // ends, and a clearance over the ground everywhere between.
+        var floor: [Double] = []
+        floor.reserveCapacity(heights.count)
         for (i, g) in heights.enumerated() {
             let isEnd = i == 0 || i == heights.count - 1
             floor.append(g + (isEnd ? Cableway.drawnRopeHeight : clearance))
@@ -438,6 +518,15 @@ public enum Cableway {
     /// One rope between two stations, as the polyline it is strung along.
     public struct Span: Sendable, Equatable {
         public var points: [Coord]
+        /// Direction-independent service and terminal identity, when the feed
+        /// supplies enough text to form one. Both directions of a lift share
+        /// this even when their platform coordinates and paths differ.
+        public var identity: String?
+
+        public init(points: [Coord], identity: String? = nil) {
+            self.points = points
+            self.identity = identity
+        }
     }
 
     /// Every cableway currently worth drawing, deduplicated.
@@ -448,6 +537,61 @@ public enum Cableway {
         public init(stations: [Station] = [], spans: [Span] = []) {
             self.stations = stations
             self.spans = spans
+        }
+
+        /// Fold another source of the same fixed infrastructure into this one.
+        ///
+        /// The all-day timetable keeps an idle line on the map, while a live
+        /// cabin may carry a better alignment for the same span. Deduplicating
+        /// by nearby ends lets both answers be used even when the two feeds put
+        /// opposite platforms several metres apart: every scheduled line
+        /// remains, and the live or more detailed path wins where available.
+        public func merging(_ other: Plan) -> Plan {
+            func sameEnds(_ lhs: Span, _ rhs: Span) -> Bool {
+                if let identity = lhs.identity, identity == rhs.identity { return true }
+                guard let la = lhs.points.first, let lb = lhs.points.last,
+                      let ra = rhs.points.first, let rb = rhs.points.last
+                else { return false }
+                let shorter = min(Geo.metres(la, lb), Geo.metres(ra, rb))
+                // Platform offsets are a larger fraction of a short lift than
+                // a long one. Twenty-five metres covers paired terminals; five
+                // percent grows naturally with the span, while the cap keeps
+                // neighbouring but genuinely distinct systems separate.
+                let tolerance = min(80.0, max(25.0, shorter * 0.05))
+                let forward = max(Geo.metres(la, ra), Geo.metres(lb, rb))
+                let reverse = max(Geo.metres(la, rb), Geo.metres(lb, ra))
+                return min(forward, reverse) <= tolerance
+            }
+
+            var spans: [Span] = []
+            for span in self.spans + other.spans {
+                guard span.points.count >= 2 else { continue }
+                if let i = spans.firstIndex(where: { sameEnds($0, span) }) {
+                    // The latter source is live at the call site. On equal
+                    // detail it wins as well as when it has the richer path.
+                    if spans[i].points.count <= span.points.count { spans[i] = span }
+                } else {
+                    spans.append(span)
+                }
+            }
+
+            var stations: [Station] = []
+            for station in self.stations + other.stations {
+                // The latter plan is live and supplies the preferred bearing.
+                if let i = stations.firstIndex(where: {
+                    Geo.metres($0.at, station.at) <= 25
+                }) {
+                    stations[i] = station
+                } else {
+                    stations.append(station)
+                }
+            }
+            return Plan(
+                stations: stations.sorted { $0.at.lon < $1.at.lon },
+                spans: spans.sorted {
+                    ($0.points.first?.lon ?? 0) < ($1.points.first?.lon ?? 0)
+                }
+            )
         }
     }
 
@@ -470,21 +614,37 @@ public enum Cableway {
 
     /// The stations and ropes implied by whatever aerial runs are on screen.
     ///
-    /// **Deduplicated by place, not by line.** A gondola line is a great many
-    /// cabins and the feed reports each as its own journey, in both directions,
-    /// all of them on the same rope — so grouping by line number would draw the
-    /// same span forty times and grouping by journey would draw it once per
-    /// cabin. What identifies a span is its two ends, unordered, to about a
-    /// metre; what identifies a station is where it is. Both fall out of the
-    /// coordinates and neither needs the feed to be consistent about names.
+    /// **Deduplicated by physical segment.** A gondola line is a great many
+    /// cabins and the feed reports each as its own journey in both directions.
+    /// The direction-independent line and terminal names identify one segment;
+    /// nearby unordered endpoints are the fallback when names are unavailable.
+    /// That deliberately draws one cable for a two-way system rather than one
+    /// per direction, which is both clearer and substantially cheaper.
     ///
-    /// **Built from the journeys rather than from a table** because there is no
-    /// table: the packed data has no aerialway network in it. The cost of that
-    /// is honest and worth stating — a line with nothing running on it has no
-    /// rope, because nothing on the device knows it exists. In practice a
-    /// gondola runs a cabin every twenty seconds all day, and the run that has
-    /// just left carries the whole line's stop list with it.
+    /// **Built from journeys rather than a separate network table** because the
+    /// packed data has no aerialway network in it. Callers may supply the live
+    /// fleet for its detailed geometry or one representative journey from each
+    /// pattern in the full service day so idle lines remain present.
     public static func plan(for vehicles: [VehicleSnapshot]) -> Plan {
+        func token(_ text: String) -> String {
+            text.folding(
+                options: [.caseInsensitive, .diacriticInsensitive], locale: nil
+            )
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty }
+                .joined(separator: "-")
+        }
+
+        /// The same segment in opposite directions has the same line and stop
+        /// names even when each direction uses its own platform coordinates.
+        func identity(of vehicle: VehicleSnapshot, from: Call, to: Call) -> String? {
+            let line = token(vehicle.line)
+            let ends = [token(from.name), token(to.name)].sorted()
+            guard !ends[0].isEmpty, !ends[1].isEmpty else { return nil }
+            let service = line.isEmpty ? token(vehicle.operatorName ?? "") : line
+            return "\(service)|\(ends[0])|\(ends[1])"
+        }
+
         /// A coordinate rounded to about a metre, for matching two journeys'
         /// idea of the same station.
         func cell(_ at: Coord) -> Int64 {
@@ -493,7 +653,7 @@ public enum Cableway {
             return lon &* 4_000_000 &+ lat
         }
 
-        var spans: [Int64: Span] = [:]
+        var spans: [String: Span] = [:]
         /// Every direction the line leaves a station in, so a mid station can be
         /// aligned with the line through it rather than with one of its halves.
         var legs: [Int64: (at: Coord, bearings: [Double])] = [:]
@@ -507,9 +667,13 @@ public enum Cableway {
                 let length = Geo.metres(from, to)
                 guard length >= shortestSpan, length < longestSpan else { continue }
 
-                let key = cell(from) < cell(to)
-                    ? cell(from) &* 8_000_000_000 &+ cell(to)
-                    : cell(to) &* 8_000_000_000 &+ cell(from)
+                let coordinateKey = cell(from) < cell(to)
+                    ? "\(cell(from))|\(cell(to))"
+                    : "\(cell(to))|\(cell(from))"
+                let named = identity(
+                    of: vehicle, from: stops[i - 1], to: stops[i]
+                )
+                let key = named ?? coordinateKey
 
                 // The mapped alignment where the journey has one, and the chord
                 // where it has not — which for an aerial leg is the same line.
@@ -519,7 +683,7 @@ public enum Cableway {
                 // whose has.
                 let along = path(of: vehicle, leg: i - 1) ?? [from, to]
                 if (spans[key]?.points.count ?? 0) < along.count {
-                    spans[key] = Span(points: along)
+                    spans[key] = Span(points: along, identity: named)
                 }
 
                 note(&legs, at: from, towards: along.count > 1 ? along[1] : to)

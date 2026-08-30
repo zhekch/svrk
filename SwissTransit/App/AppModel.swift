@@ -261,6 +261,13 @@ final class AppModel {
     @ObservationIgnored private(set) var frameVersion = 0
     @ObservationIgnored private(set) var stopsVersion = 0
 
+    /// Fixed cableway infrastructure in and around the viewport, sourced from
+    /// the full service day rather than only the vehicles alive this minute.
+    @ObservationIgnored private(set) var cableways = Cableway.Plan()
+    @ObservationIgnored private(set) var cablewaysRevision = 0
+    private var cablewaysViewport: BBox?
+    private var cablewaysDay: Int?
+
     /// What each vehicle is made of: the shipped table of what every line
     /// normally runs, plus whatever the formation service has told us about
     /// individual trains since.
@@ -2658,9 +2665,11 @@ final class AppModel {
         let plateMark = plateRevision
         let trackMark = tracks.count
         let routeMark = selectedGeometryRevision
+        let cablewayMark = cablewaysRevision
 
         await refreshTracksIfNeeded()
         await refreshTunnelsIfNeeded()
+        await refreshCablewaysIfNeeded(at: now)
 
         // Fed generously and filtered by the layers themselves: the three stop
         // bands each carry their own zoom range, so the source only has to hold
@@ -2730,6 +2739,7 @@ final class AppModel {
         // integer comparisons on the ticks where nothing changed — which is
         // nearly all of them, on a map nobody is panning.
         if restated || plateRevision != plateMark || tracks.count != trackMark
+            || cablewaysRevision != cablewayMark
             || selectedGeometryRevision != routeMark {
             onFrame?()
         }
@@ -2888,7 +2898,9 @@ final class AppModel {
             // The decision, taken on the same two numbers the footprint takes
             // it on, before anything is built: this vehicle is long enough on
             // screen to be drawn, or it is a dot.
-            let threshold = VehicleShape.emergeAt(bodies: layout.units.count)
+            let threshold = VehicleShape.emergeAt(
+                bodies: layout.units.count, hanging: Cableway.hangs(vehicle)
+            )
             let floor = vehicle.id == selectedID ? threshold * 0.6 : threshold
             let target: Double = layout.length / metresPerPoint >= floor ? 1 : 0
             // A vehicle seen for the first time snaps. Panning onto a station
@@ -4438,6 +4450,43 @@ final class AppModel {
     /// See the stop block in `tick`.
     private var stopsViewport: BBox?
     private var stopsBand: Int?
+
+    /// Refresh the fixed cableway plan only when the held view or service day
+    /// changes. Unlike cabins, none of this geometry moves between frames.
+    private func refreshCablewaysIfNeeded(at now: Timestamp) async {
+        guard !hiddenModes.contains(.cable) else {
+            if !cableways.isEmpty {
+                cableways = Cableway.Plan()
+                cablewaysRevision &+= 1
+            }
+            cablewaysViewport = nil
+            cablewaysDay = nil
+            return
+        }
+        // Below the drawing floor the map hides the source, but the plan stays
+        // cached. Clearing it here made a zoom-out/zoom-in cycle briefly fall
+        // back to live vehicles only, so an idle direct line disappeared while
+        // the indirect line with moving cabins survived.
+        guard zoom >= VehicleShape.minZoom else { return }
+
+        let date = Date(timeIntervalSince1970: TimeInterval(now))
+        let zone = TimeZone(identifier: "Europe/Zurich") ?? .current
+        let day = Int((date.timeIntervalSince1970
+            + TimeInterval(zone.secondsFromGMT(for: date))) / 86_400)
+        if day == cablewaysDay, let held = cablewaysViewport,
+           held.contains(lon: viewport.west, lat: viewport.south),
+           held.contains(lon: viewport.east, lat: viewport.north) {
+            return
+        }
+        let generous = viewport.turned().padded(by: 0.4)
+        let found = await fleet.cablewayPlan(in: generous, at: date)
+        cablewaysViewport = generous
+        cablewaysDay = day
+        if cableways != found {
+            cableways = found
+            cablewaysRevision &+= 1
+        }
+    }
 
     /// Rebuild the plate layout when the view has actually moved.
     ///

@@ -133,6 +133,75 @@ struct TransitMap: UIViewRepresentable {
     }
 }
 
+/// Cable profiles, kept across pans, style reloads and app launches.
+///
+/// The expensive part is sampling terrain and reducing its clearance hull.
+/// Styling that answer for the current theme is cheap, so the cache stores the
+/// `Rope` rather than Mapbox features. Its key includes the complete alignment
+/// and terrain settings; a changed route or relief setting naturally misses.
+private final class CablewayRopeCache {
+    private struct Entry: Codable, Sendable {
+        var rope: Cableway.Rope
+        var complete: Bool
+    }
+
+    private struct Archive: Codable, Sendable {
+        var version: Int
+        var ropes: [String: Entry]
+    }
+
+    private static let version = 2
+    private static let limit = 512
+    private var ropes: [String: Entry] = [:]
+    private let file: URL?
+    private let writer = DispatchQueue(label: "ch.swisstransit.cableway-rope-cache")
+
+    init() {
+        file = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
+            .first?.appendingPathComponent("cableway-rope-profiles-v2.json")
+        guard let file, let data = try? Data(contentsOf: file),
+              let archive = try? JSONDecoder().decode(Archive.self, from: data),
+              archive.version == Self.version
+        else { return }
+        ropes = archive.ropes
+    }
+
+    func profile(
+        _ key: String, includingProvisional: Bool
+    ) -> (rope: Cableway.Rope, complete: Bool)? {
+        guard let entry = ropes[key], entry.complete || includingProvisional else {
+            return nil
+        }
+        return (entry.rope, entry.complete)
+    }
+
+    func store(
+        solved: [String: Cableway.Rope], provisional: [String: Cableway.Rope]
+    ) {
+        guard !solved.isEmpty || !provisional.isEmpty else { return }
+        var changed = false
+        for (key, rope) in provisional
+        where ropes[key]?.complete != true && ropes[key]?.rope != rope {
+            ropes[key] = Entry(rope: rope, complete: false)
+            changed = true
+        }
+        for (key, rope) in solved where ropes[key]?.complete != true {
+            ropes[key] = Entry(rope: rope, complete: true)
+            changed = true
+        }
+        guard changed else { return }
+        while ropes.count > Self.limit, let key = ropes.keys.first {
+            ropes.removeValue(forKey: key)
+        }
+        guard let file else { return }
+        let archive = Archive(version: Self.version, ropes: ropes)
+        writer.async {
+            guard let data = try? JSONEncoder().encode(archive) else { return }
+            try? data.write(to: file, options: .atomic)
+        }
+    }
+}
+
 /// Owns the map's sources and layers, and keeps them in step with the model.
 @MainActor
 final class MapCoordinator: NSObject {
@@ -141,6 +210,7 @@ final class MapCoordinator: NSObject {
     private var cancellables: Set<AnyCancelable> = []
     private var styleReady = false
     private var currentBasemap: Basemap?
+    private let cablewayRopeCache = CablewayRopeCache()
 
     private enum ID {
         static let tracks = "transit-tracks"
@@ -712,6 +782,7 @@ final class MapCoordinator: NSObject {
         let wasFollowing = followId != nil
         followId = nil
         followShape = nil
+        followedStandingVehicle = nil
         followBearing = nil
         followBearingRate = 0
         guard let mapView, styleReady else { drewFollowShape = false; return }
@@ -917,11 +988,14 @@ final class MapCoordinator: NSObject {
             // Cleared once rather than every frame: this lane runs at the
             // display's rate and re-emptying an empty source sixty times a
             // second is sixty parses of nothing.
+            followedStandingVehicle = nil
             drewFollowShape = false
             style.updateGeoJSONSource(
                 withId: VehicleShapes.followSource,
                 geoJSON: .featureCollection(FeatureCollection(features: []))
             )
+        } else {
+            followedStandingVehicle = nil
         }
         // The dot and its line label hang off the point source, and they have to
         // travel with the body or the label swims beside the train it names.
@@ -934,7 +1008,12 @@ final class MapCoordinator: NSObject {
                 Self.vehicleFeature(
                     vehicle,
                     at: Coord(lon: vehicle.lon + shift.lon, lat: vehicle.lat + shift.lat),
-                    selected: true, emerged: followShape?.emergence ?? 0,
+                    selected: true,
+                    emerged: Cableway.hangs(vehicle)
+                            && followedStandingVehicle == vehicle.id
+                        ? followShape?.emergence ?? 1
+                        : displayedVehicleEmergence[vehicle.id]
+                            ?? followShape?.emergence ?? 0,
                     tunnel: tunnelIndex.fade(
                         at: Coord(lon: vehicle.lon + shift.lon, lat: vehicle.lat + shift.lat),
                         heading: vehicle.bearing
@@ -956,7 +1035,9 @@ final class MapCoordinator: NSObject {
                     // the other lane is saying or the two fight. During the tick
                     // a selection is handed over they differ, which is exactly
                     // when getting it wrong would fade the wrong vehicle.
-                    open: vehicle.id == labelOpenId
+                    open: vehicle.id == labelOpenId,
+                    label: Cableway.hangs(vehicle) && !cablewayLabelIDs.contains(vehicle.id)
+                        ? "" : vehicle.line
                 )
             ])
         }
@@ -1142,7 +1223,7 @@ final class MapCoordinator: NSObject {
     /// feature back, fifteen times a second.
     private static func vehicleFeature(
         _ vehicle: VehicleSnapshot, at position: Coord, selected: Bool, emerged: Double,
-        tunnel: Double = 0, open: Bool = false
+        tunnel: Double = 0, open: Bool = false, label: String? = nil
     ) -> Feature {
         var feature = Feature(geometry: .point(Point(
             CLLocationCoordinate2D(latitude: position.lat, longitude: position.lon)
@@ -1151,7 +1232,7 @@ final class MapCoordinator: NSObject {
         // The body fades to nothing in a tunnel; the line number does not.
         let shown = (1 - emerged) * (1 - tunnel)
         feature.properties = [
-            "line": .string(vehicle.line),
+            "line": .string(label ?? vehicle.line),
             "color": .string(vehicle.mode.hex),
             "bearing": .number(vehicle.bearing),
             "selected": .boolean(selected),
@@ -2978,6 +3059,7 @@ final class MapCoordinator: NSObject {
         let style: MapboxMap = mapView.mapboxMap
 
         drawVehicles(style)
+        drawCableways(style)
         drawStops(style)
         drawPlatforms(style)
         drawTracks(style)
@@ -3034,6 +3116,54 @@ final class MapCoordinator: NSObject {
     /// that has just been built and has never been told.
     private var drawnHitboxes: Bool?
 
+    /// The one cabin allowed to carry the shared line label for each cableway.
+    ///
+    /// A gondola service reports every cabin as a vehicle, and every one has
+    /// the same line. Labelling the vehicles independently paints the same
+    /// number down the whole rope. The label is useful while the cabins are
+    /// still fallback dots, so one stable cabin per line keeps it; once a
+    /// cabin has become a drawing the rope, station and model identify it and
+    /// its ground-level symbol is both redundant and visibly displaced below
+    /// the hanging body in a pitched view.
+    private var cablewayLabelIDs: Set<String> = []
+    /// Emergence as actually visible. Hanging footprints never render flat, so
+    /// they stay dots until an elevated model or extrusion is on screen.
+    private var displayedVehicleEmergence: [String: Double] = [:]
+    /// The baked model in the high-rate follow source is deliberately excluded
+    /// from the main source's `standingVehicles`; keep its actual handover here
+    /// so selecting/following a gondola does not restore its fallback dot.
+    private var followedStandingVehicle: String?
+
+    private static func cablewayLabels(
+        in vehicles: [VehicleSnapshot], emergence: [String: Double]
+    ) -> Set<String> {
+        var representative: [String: String] = [:]
+        for vehicle in vehicles where Cableway.hangs(vehicle) {
+            // Labels belong only to the dot fallback. A positive emergence is
+            // already drawing the body and fading the dot away.
+            guard (emergence[vehicle.id] ?? 0) <= 0 else { continue }
+            let line = vehicle.line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let operatorName = vehicle.operatorName ?? ""
+            let key: String
+            if !line.isEmpty {
+                key = "\(operatorName)|\(line)"
+            } else {
+                // A nameless line is uncommon, but its terminal pair still
+                // identifies the rope without merging unrelated cableways.
+                let terminals = [vehicle.stops.first?.name ?? vehicle.from,
+                                 vehicle.stops.last?.name ?? vehicle.to ?? ""]
+                    .sorted().joined(separator: "|")
+                key = "\(operatorName)|\(terminals)"
+            }
+            if let current = representative[key] {
+                representative[key] = min(current, vehicle.id)
+            } else {
+                representative[key] = vehicle.id
+            }
+        }
+        return Set(representative.values)
+    }
+
     /// The fleet: the dots, and the drawn bodies behind them.
     private func drawVehicles(_ style: MapboxMap) {
         guard model.frameVersion != drawnFrameVersion else { return }
@@ -3047,8 +3177,32 @@ final class MapCoordinator: NSObject {
         // How far each vehicle has turned into a drawn vehicle, so its dot can
         // get out of the way by exactly that much. Absent means still a dot.
         var emergence: [String: Double] = [:]
+        var shapesByID: [String: VehicleFootprint] = [:]
         emergence.reserveCapacity(model.vehicleShapes.count)
-        for shape in model.vehicleShapes { emergence[shape.id] = shape.emergence }
+        shapesByID.reserveCapacity(model.vehicleShapes.count)
+        for shape in model.vehicleShapes {
+            emergence[shape.id] = shape.emergence
+            shapesByID[shape.id] = shape
+        }
+        // A hanging 2D footprint is not a valid fallback: it is a second cabin
+        // painted on the ground. Keep the point until the renderer confirms
+        // that this vehicle has an elevated drawing available.
+        for vehicle in model.vehicles where Cableway.hangs(vehicle) {
+            let has3D: Bool
+            if !showingSolids {
+                has3D = false
+            } else if model.bakedModels {
+                has3D = model.standingVehicles.contains(vehicle.id)
+                    || followedStandingVehicle == vehicle.id
+            } else {
+                has3D = !(shapesByID[vehicle.id]?.slabs.isEmpty ?? true)
+            }
+            if !has3D { emergence[vehicle.id] = 0 }
+        }
+        displayedVehicleEmergence = emergence
+        cablewayLabelIDs = Self.cablewayLabels(
+            in: model.vehicles, emergence: emergence
+        )
 
         // The followed vehicle is written where the follow lane has it, not
         // where the last tick left it. See `followShift`.
@@ -3063,14 +3217,15 @@ final class MapCoordinator: NSObject {
                 vehicle, at: at,
                 selected: vehicle.id == selectedId, emerged: emergence[vehicle.id] ?? 0,
                 tunnel: tunnelIndex.fade(at: at, heading: vehicle.bearing),
-                open: vehicle.id == labelOpenId
+                open: vehicle.id == labelOpenId,
+                label: Cableway.hangs(vehicle) && !cablewayLabelIDs.contains(vehicle.id)
+                    ? "" : vehicle.line
             )
         }
         style.updateGeoJSONSource(
             withId: ID.vehicles, geoJSON: .featureCollection(FeatureCollection(features: vehicleFeatures))
         )
         drawVehicleShapes(style)
-        drawCableways(style)
         #if DEBUG
         Diagnostics.pushed(vehicles: vehicleFeatures.count, tracks: model.tracks.count, styleReady: styleReady)
         #endif
@@ -3092,37 +3247,42 @@ final class MapCoordinator: NSObject {
     /// lift that hangs a cabin on it. See `rest`.
     private var ropes: [Cableway.Rope] = []
 
-    /// Whether some span was drawn draped because the elevation tiles under it
-    /// had not arrived. While this is true the cableways are rebuilt every
-    /// frame, which is how a rope pulls itself taut a moment after the ground
-    /// under it turns up.
+    /// Whether some span is waiting for elevation tiles. While this is true the
+    /// cableways are rebuilt so its provisional profile can be replaced when
+    /// the missing ground measurements return.
     private var cablewaysPending = false
+    private var cablewayRetryAfter: CFTimeInterval = 0
+
+    /// A visible terrain height used only when a newly encountered span has no
+    /// resident elevation samples at all. It keeps the provisional sea-level
+    /// rope near the current ground until the real profile can be solved.
+    private var cablewayReferenceGround: Double?
 
     /// The ground under a handful of points of the drawn cableways, as it was
     /// when they were last built.
     ///
     /// **The rope is the one thing this app draws at an absolute height**, and
     /// that is what makes it the one thing that can go stale. Everything else
-    /// —  a station, a tower, a wagon — is placed *on* the terrain by the
+    /// — a station or a wagon — is placed *on* the terrain by the
     /// renderer, so when a better elevation tile arrives it moves with it. The
     /// rope is at a height above sea level worked out by the app from the
     /// terrain it could see at the moment it was built, and if that was a
     /// coarse tile, or no tile, the rope stays where that put it while the
-    /// towers and stations under it rise into place without it.
+    /// stations and cabins under it rise into place without it.
     ///
     /// That is exactly the bug this exists for: a line drawn on arrival had a
-    /// straight rope that ran nowhere near its towers and cabins that hung
-    /// clear of it, and switching the basemap fixed it — because a style reload
+    /// straight rope with cabins hanging clear of it, and switching the basemap
+    /// fixed it — because a style reload
     /// throws the whole overlay away and rebuilds it, by which time the tiles
     /// had landed. Watching the ground is what makes the rebuild happen on its
     /// own. A dozen lookups a frame, against the several hundred `rest` already
     /// makes for the vehicles.
     private var cablewayGround: [Double] = []
 
-    /// The stations, ropes and towers under whatever is flying on them.
+    /// The stations and ropes under whatever is flying on them.
     ///
-    /// Built from the *fleet* rather than from the drawn shapes, and the
-    /// difference matters at the zoom this switches on at: a vehicle only
+    /// Built from the all-day plan and improved by the live fleet rather than
+    /// from the drawn shapes, and the difference matters at this zoom: a vehicle only
     /// becomes a drawing once it is long enough on screen to be worth one, and a
     /// gondola cabin is two metres long, so the cabins are still dots for a
     /// couple of zoom levels after their line is plainly visible. The rope is
@@ -3133,8 +3293,15 @@ final class MapCoordinator: NSObject {
         // tenth of a pixel, and every one of them is still a polygon being
         // parsed. See `Cableways.minZoom`.
         let wanted = model.zoom >= Cableways.minZoom
-            ? Cableway.plan(for: model.vehicles)
+            ? model.cableways.merging(Cableway.plan(for: model.vehicles))
             : Cableway.Plan()
+        let planChanged = wanted != drawnCableways
+        let clock = CACurrentMediaTime()
+        // A long span commonly reaches beyond the elevation tiles resident for
+        // the current viewport. Its provisional profile is already visible;
+        // retrying the full terrain walk every display frame only burns the
+        // frame budget while waiting for the same missing tile.
+        if !planChanged, cablewaysPending, clock < cablewayRetryAfter { return }
         func ground(_ at: Coord) -> Double? {
             guard model.terrain3D else { return 0 }
             let height = style.elevation(at: CLLocationCoordinate2D(
@@ -3144,26 +3311,67 @@ final class MapCoordinator: NSObject {
             return height
         }
 
-        // Rebuilt when the set of lines changes; while any of them is still
-        // waiting on the ground under it — a rope cannot be pulled tight
-        // against terrain that has not loaded, so it is drawn draped and asked
-        // again; and whenever the ground it *was* built against has since moved
-        // under it. See `cablewayGround`.
-        let measured = Self.probes(of: wanted).map { ground($0) ?? .nan }
+        let camera = style.cameraState.center
+        let cameraGround = ground(Coord(lon: camera.longitude, lat: camera.latitude))
+        if let cameraGround { cablewayReferenceGround = cameraGround }
+        let fallbackGround = cameraGround ?? cablewayReferenceGround ?? 0
+
+        // Rebuilt when the set of lines changes, while a provisional span is
+        // waiting for terrain, and whenever the ground it was built against
+        // has since moved under it. See `cablewayGround`.
+        let measured = Self.probes(of: wanted, ropes: ropes).map { ground($0) ?? .nan }
         let moved = measured.count != cablewayGround.count
             || zip(measured, cablewayGround).contains { now, then in
                 now.isNaN != then.isNaN || (!now.isNaN && abs(now - then) > 0.5)
             }
-        guard wanted != drawnCableways || cablewaysPending || moved else { return }
+        guard planChanged || cablewaysPending || moved else { return }
+        let includeProvisionalCache = planChanged || !cablewaysPending
+        let built = Cableways.features(
+            wanted, dark: isDarkTheme, ground: ground,
+            fallbackGround: fallbackGround,
+            cacheKey: cablewayRopeCacheKey,
+            cached: {
+                cablewayRopeCache.profile(
+                    $0, includingProvisional: includeProvisionalCache
+                )
+            }
+        )
+        cablewayRopeCache.store(
+            solved: built.solved, provisional: built.provisional
+        )
+        // Always publish this per-span result. In particular, `drawnCableways`
+        // is a non-nil empty plan after zooming below the layer floor; treating
+        // that as a source worth preserving made zooming back in retain the
+        // empty source whenever even one new span was waiting for terrain.
         drawnCableways = wanted
-        cablewayGround = measured
-        let built = Cableways.features(wanted, dark: isDarkTheme, ground: ground)
         ropes = built.ropes
+        cablewayGround = Self.probes(of: wanted, ropes: built.ropes).map {
+            ground($0) ?? .nan
+        }
         cablewaysPending = built.pending
+        cablewayRetryAfter = built.pending ? clock + 0.75 : 0
         style.updateGeoJSONSource(
             withId: Cableways.source,
             geoJSON: .featureCollection(FeatureCollection(features: built.features))
         )
+    }
+
+    /// A stable, direction-independent key for one solved terrain profile.
+    /// Exact geometry is included so a later, better live alignment does not
+    /// inherit the timetable chord's cached answer.
+    private func cablewayRopeCacheKey(_ span: Cableway.Span) -> String {
+        var points = span.points
+        if let first = points.first, let last = points.last,
+           last.lon < first.lon || (last.lon == first.lon && last.lat < first.lat) {
+            points.reverse()
+        }
+        let relief = model.terrain3D
+            ? "terrain-\(Int((model.terrainExaggeration * 1_000).rounded()))"
+            : "flat"
+        let geometry = points.map {
+            "\(Int64(($0.lon * 1_000_000).rounded())),\(Int64(($0.lat * 1_000_000).rounded()))"
+        }.joined(separator: ";")
+        return "v2|\(relief)|\(span.identity ?? "-")|\(geometry)"
     }
 
     /// The few points whose ground is watched for a cableway to be rebuilt.
@@ -3171,13 +3379,26 @@ final class MapCoordinator: NSObject {
     /// Both ends and the middle of every span, and every station. Not every
     /// vertex: the question is only whether the terrain under this line has
     /// changed at all, and a tile arriving changes all of it at once.
-    private static func probes(of plan: Cableway.Plan) -> [Coord] {
+    private static func probes(
+        of plan: Cableway.Plan, ropes: [Cableway.Rope]
+    ) -> [Coord] {
         var out: [Coord] = []
-        out.reserveCapacity(plan.spans.count * 3 + plan.stations.count)
+        out.reserveCapacity(plan.spans.count * 5 + plan.stations.count)
         for span in plan.spans where !span.points.isEmpty {
             out.append(span.points[0])
             out.append(span.points[span.points.count / 2])
             out.append(span.points[span.points.count - 1])
+        }
+        // A tower's base moves with its own terrain tile while the rope is held
+        // at absolute altitude. Watching the exact tower positions is what
+        // guarantees a newly refined tile restates the mast height and brings
+        // its crosshead back to the cable.
+        for rope in ropes {
+            for distance in Cableway.towerPoints(of: rope) {
+                if let point = Cableway.position(rope, at: distance) {
+                    out.append(point.coord)
+                }
+            }
         }
         out.append(contentsOf: plan.stations.map(\.at))
         return out
@@ -3469,7 +3690,11 @@ final class MapCoordinator: NSObject {
         // standing and every vehicle drawn as a bare body from then on. The
         // follow lane is handed one vehicle and sees only that one, so it must
         // not restate the whole set. See `AppModel.standingVehicles`.
-        if !follow, model.standingVehicles != stood { model.standingVehicles = stood }
+        if follow {
+            followedStandingVehicle = stood.first
+        } else if model.standingVehicles != stood {
+            model.standingVehicles = stood
+        }
 
         var features = VehicleShapes.features(
             shapes, excluding: excluded, flatness: flatness, stood: stood,

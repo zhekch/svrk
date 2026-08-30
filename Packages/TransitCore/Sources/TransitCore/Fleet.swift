@@ -2659,6 +2659,48 @@ public actor Fleet {
     /// makes after a refresh.
     public func everyRawJourney() -> [Journey] { Array(journeys.values) }
 
+    /// Cableway infrastructure scheduled anywhere in a view on this service
+    /// day, whether or not a cabin is running at the selected moment.
+    ///
+    /// Vehicle queries intentionally discard journeys that are not alive at
+    /// `now`; a station and its rope are not vehicles and must not inherit that
+    /// lifetime. The packed timetable is therefore asked for the whole service
+    /// day, clipped to the view and filtered to cable mode before any Journey
+    /// objects are built. Live runs are merged over this plan by the map, where
+    /// their attached geometry can improve the timetable's stop-to-stop chord.
+    public func cablewayPlan(in region: BBox, at moment: Date) -> Cableway.Plan {
+        let zone = TimeZone(identifier: "Europe/Zurich") ?? .current
+        guard let timetable, timetable.isReady,
+              let day = TimetableStore.dayStart(moment, zone: zone)
+        else { return Cableway.Plan() }
+
+        let scheduled = timetable.journeys(
+            from: day,
+            // GTFS permits departures after 24:00. Thirty hours covers the
+            // complete service day without pulling in the following daytime.
+            to: day + 30 * 3600,
+            zone: zone,
+            limit: 10_000,
+            modes: [.cable],
+            uniquePatterns: true,
+            in: region,
+            place: { [register] ref in register.lookup(ref) },
+            operatorName: { [operators] agency in operators.name(for: agency) }
+        )
+        let runs = scheduled.compactMap { journey -> VehicleSnapshot? in
+            guard let first = journey.stops.first else { return nil }
+            return VehicleSnapshot(
+                id: journey.id, mode: journey.mode, category: journey.category,
+                cable: cableKind(of: journey), line: journey.line,
+                operatorName: journey.operatorName, operatorFull: journey.operatorFull,
+                to: journey.to, from: journey.from,
+                lon: first.lon, lat: first.lat, stops: journey.stops,
+                geometry: journey.geometry, journeyRef: journey.journeyRef
+            )
+        }
+        return Cableway.plan(for: runs)
+    }
+
     /// Every vehicle in the loaded snapshot, with geometry attached.
     ///
     /// For measurement rather than for drawing — the map asks by viewport — but

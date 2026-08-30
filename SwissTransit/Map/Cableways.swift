@@ -2,8 +2,8 @@ import Foundation
 import MapboxMaps
 import TransitCore
 
-// The things a gondola hangs from: the station at each end, the rope between
-// them, and the towers carrying it over the ground in between.
+// The fixed things a gondola belongs to: the station at each end, the rope
+// between them, and the ordinary-height towers carrying it over the ground.
 //
 // **Why this is not part of the vehicle.** Everything else the map draws in
 // three dimensions is a vehicle, and a vehicle is a rigid body that is
@@ -15,12 +15,11 @@ import TransitCore
 // actually changes, which is once a pan rather than thirty times a second.
 //
 // **Two kinds of thing, and they are drawn by two different mechanisms because
-// they are two different kinds of thing.** A station and a tower are structures:
-// they have volume, they stand on the ground, and their size is a fact about
-// them measured in metres. Those are extrusions, on `flat` terrain alignment —
-// one elevation for the whole prism, exactly as a wagon is, so a shed on a
-// hillside has walls cut nowhere and the same shape it would have with the
-// relief switched off.
+// they are two different kinds of thing.** Stations and towers are structures:
+// they have volume, stand on the ground, and their sizes are facts measured in
+// metres. They are extrusions on `flat` terrain alignment — one elevation for
+// each prism, exactly as a wagon is, so a shed on a hillside has walls cut
+// nowhere and the same shape it would have with the relief switched off.
 //
 // A rope is not a structure and drawing it as one was the first attempt. A haul
 // rope is five centimetres across. Extruded honestly it is invisible; extruded
@@ -36,20 +35,18 @@ import TransitCore
 // is not level over the ground: it spans from tower to tower, sags between them,
 // and over a gorge it is two hundred metres up. What it *is* over the length of
 // an ordinary line is a profile following the mountain a fixed clearance above
-// it — which is what the towers are for, and what a reader looking at a hillside
-// sees. Drawn at a constant height over the ground the rope reads correctly
+// it — which is what its normal towers carry. Drawn at a constant height over
+// the ground the rope reads correctly
 // along nearly every line in the country, and it has the one property no chord
 // could offer: the cabins hanging from it are at that height too, because
 // `Silhouette.hover` is derived from the same number. A rope and a cabin drawn
 // by two different rules would meet nowhere.
 enum Cableways {
     static let source = "transit-cableway"
-    /// The stations and the towers: rigid, one elevation each.
+    /// The stations and ordinary-height towers: rigid, one elevation each.
     static let structures = "transit-cableway-structures"
     /// The rope, drawn taut between measured ends.
     static let ropes = "transit-cableway-ropes"
-    /// And the same rope over ground nobody has measured yet.
-    static let draped = "transit-cableway-ropes-draped"
 
     /// Which of the two layers a feature belongs to, and what colour it is.
     private enum Key {
@@ -57,9 +54,6 @@ enum Cableways {
         /// A rope whose two ends have been measured against the terrain, and so
         /// can be drawn taut at an absolute altitude.
         static let rope = "r"
-        /// A rope over ground the elevation tiles have not arrived for, draped
-        /// at a fixed height instead. See `install`.
-        static let draped = "d"
         static let structure = "s"
         static let colour = "c"
         static let base = "b"
@@ -98,20 +92,17 @@ enum Cableways {
 
     // MARK: - Heights, in the metres the ground is measured in
 
-    /// Where a tower's mast stops and its crosshead begins.
-    ///
-    /// The underside of the rope, which is the underside of a cabin's grip: a
-    /// sheave assembly hangs *below* the crosshead and the rope runs over it, so
-    /// a mast drawn all the way up to rope height would be a post with the rope
-    /// buried in its top.
-    private static var sheaves: Double {
-        (Cableway.ropeHeight - Cableway.gripDepth) * VehicleShape.modelExaggeration
-    }
-
     /// The top of a station building: over the running line, as a shed is.
     private static var stationTop: Double {
         Cableway.drawnRopeHeight + Cableway.stationRoof
     }
+
+    /// Towers taller than this are artifacts of putting an interval support
+    /// beneath a rope that is genuinely crossing high above a valley. A real
+    /// line leaves that stretch unsupported; drawing a mast hundreds of metres
+    /// up to it produces the black needles seen in the map. Normal hillside and
+    /// ridge towers remain, while those impossible fill-ins are omitted.
+    private static let maximumTowerHeight = 80.0
 
     // MARK: - Installing
 
@@ -145,22 +136,6 @@ enum Cableways {
             VehicleModels.setFlatOnTerrain(style, layer: structures)
         }
 
-        if !style.layerExists(withId: draped) {
-            // The fallback, and it is the drawing this feature started as: a
-            // rope carried a fixed height over whatever ground is under it.
-            // Correct along an even hillside and wrong across a valley, where
-            // it drapes into the hole instead of spanning it — but it needs no
-            // elevation tiles to have arrived, so it is what a span is drawn as
-            // for the second or two before the terrain under it is known.
-            var rope = LineLayer(id: draped, source: source)
-            rope.filter = Exp(.eq) { Exp(.get) { Key.kind }; Key.draped }
-            rope.lineColor = .expression(Exp(.get) { Key.colour })
-            rope.lineElevationReference = .constant(.ground)
-            rope.lineZOffset = .constant(Cableway.drawnRopeHeight)
-            trace(rope: &rope)
-            try style.addLayer(rope)
-        }
-
         if !style.layerExists(withId: ropes) {
             var rope = LineLayer(id: ropes, source: source)
             rope.filter = Exp(.eq) { Exp(.get) { Key.kind }; Key.rope }
@@ -170,10 +145,9 @@ enum Cableways {
             // A rope is not draped over anything. It is pulled tight between
             // two points and it stays where that leaves it: level across a
             // valley the ground falls away under, and nowhere near parallel to
-            // the hillside. Carried at a fixed height over the ground — which
-            // is what this drew before, and what `draped` still draws — it
-            // rippled over every hummock the terrain tiles have, and the
-            // cabins strung on it rippled with it.
+            // the hillside. Carried at a fixed height over the ground it
+            // ripples over every hummock the terrain tiles have, and the
+            // cabins strung on it ripple with it.
             //
             // So each segment is given an absolute height at its start and how
             // much it climbs, and `line-progress` — the fraction of the way
@@ -282,14 +256,22 @@ enum Cableways {
     /// `ground` answers with the drawn height of the terrain at a point, or nil
     /// where the tile for it has not arrived — the same question and the same
     /// nil `MapCoordinator.rest` asks of the renderer for the vehicles. A span
-    /// whose ends cannot be measured is drawn draped rather than not at all,
-    /// and `pending` says so, so the next frame asks again.
+    /// whose ground is incomplete gets a provisional absolute-height profile,
+    /// so it remains visible without ever falling back to terrain alignment.
     static func features(
-        _ plan: Cableway.Plan, dark: Bool, ground: (Coord) -> Double?
-    ) -> (features: [Feature], ropes: [Cableway.Rope], pending: Bool) {
+        _ plan: Cableway.Plan, dark: Bool, ground: (Coord) -> Double?,
+        fallbackGround: Double,
+        cacheKey: (Cableway.Span) -> String,
+        cached: (String) -> (rope: Cableway.Rope, complete: Bool)?
+    ) -> (
+        features: [Feature], ropes: [Cableway.Rope], pending: Bool,
+        solved: [String: Cableway.Rope], provisional: [String: Cableway.Rope]
+    ) {
         let paint = palette(dark: dark)
         var out: [Feature] = []
         var ropes: [Cableway.Rope] = []
+        var solved: [String: Cableway.Rope] = [:]
+        var provisional: [String: Cableway.Rope] = [:]
         var pending = false
         out.reserveCapacity(plan.spans.count * 4 + plan.stations.count * 4)
 
@@ -297,20 +279,27 @@ enum Cableways {
             let walked = resampled(span.points, every: ropeStep)
             guard walked.count >= 2 else { continue }
 
-            guard let rope = Cableway.taut(along: walked, ground: ground) else {
-                // Nothing measured yet. Draped, at a fixed height, and asked
-                // about again next frame.
-                pending = true
-                out.append(line(
-                    walked, kind: Key.draped, colour: paint.rope, from: 0, climb: 0
-                ))
-                for tower in Cableway.towers(along: span.points) {
-                    out.append(contentsOf: mast(
-                        at: tower.at, bearing: tower.bearing, paint: paint,
-                        base: 0, top: nil
-                    ))
+            let key = cacheKey(span)
+            let rope: Cableway.Rope
+            if let stored = cached(key) {
+                rope = stored.rope
+                if !stored.complete { pending = true }
+            } else {
+                guard let generated = Cableway.provisional(
+                    along: walked, fallbackGround: fallbackGround, ground: ground
+                ) else {
+                    pending = true
+                    continue
                 }
-                continue
+                rope = generated.rope
+                if generated.complete {
+                    solved[key] = generated.rope
+                } else {
+                    // This answer is drawable but not persistent: ask again
+                    // when the missing terrain tiles become available.
+                    pending = true
+                    provisional[key] = generated.rope
+                }
             }
             ropes.append(rope)
 
@@ -333,29 +322,19 @@ enum Cableways {
                 ))
             }
 
-            // A tower wherever the rope bends, which is where a tower actually
-            // is, and fill-ins down the straight stretches so a long clear span
-            // is still plainly being held up.
+            // Bends are the supports the terrain actually requires; long,
+            // otherwise straight stretches receive ordinary fill-in towers.
+            // A fill-in under a high valley crossing is deliberately rejected
+            // by `mast` rather than stretched all the way to the rope.
             for at in Cableway.towerPoints(of: rope) {
                 guard let point = Cableway.position(rope, at: at) else { continue }
-                // How tall the mast has to be to reach the rope, measured
-                // against the ground **under the tower's own footprint** rather
-                // than against the profile's idea of it.
-                //
-                // A tower is an extrusion, and an extrusion on `flat`
-                // alignment stands on the one elevation the renderer finds
-                // under it; its height is added to that. The profile's ground
-                // is interpolated between samples twenty-five metres apart, so
-                // on a mountainside the two disagree by metres — and the
-                // disagreement is the tower's top missing the rope, which is
-                // the one place on this drawing where a couple of metres is
-                // plainly visible.
                 let floor = ground(point.coord) ?? point.ground
                 out.append(contentsOf: mast(
                     at: point.coord, bearing: point.bearing, paint: paint,
                     base: 0, top: Cableway.height(of: rope, at: at) - floor
                 ))
             }
+
         }
 
         for station in plan.stations {
@@ -404,18 +383,23 @@ enum Cableways {
                 base: Cableway.drawnRopeHeight, height: stationTop
             ))
         }
-        return (out, ropes, pending)
+        return (out, ropes, pending, solved, provisional)
     }
 
     /// A tower: the mast, and the crosshead the sheaves hang from.
     ///
     /// `top` is how far above the ground here the rope is, or nil to fall back
-    /// to the fixed height a draped rope uses.
+    /// to the fixed height a draped rope uses. An implausibly high measured top
+    /// means this point lies under a clear span, so it gets no tower at all.
     private static func mast(
         at: Coord, bearing: Double, paint: Palette, base: Double, top: Double?
     ) -> [Feature] {
         let reach = max(4.0, top ?? Cableway.drawnRopeHeight)
-        let head = max(base + 1, reach - Cableway.gripDepth * VehicleShape.modelExaggeration)
+        guard reach.isFinite, reach <= maximumTowerHeight else { return [] }
+        let head = max(
+            base + 1,
+            reach - Cableway.gripDepth * VehicleShape.modelExaggeration
+        )
         return [
             prism(
                 box(at: at, bearing: bearing,
