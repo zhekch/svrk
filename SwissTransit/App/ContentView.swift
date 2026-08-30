@@ -1,5 +1,6 @@
 import SwiftUI
 import TransitCore
+import UIKit
 
 struct ContentView: View {
     @Bindable var model: AppModel
@@ -34,7 +35,7 @@ struct ContentView: View {
 
     /// The three heights the one sheet stands at, named rather than measured.
     ///
-    /// `ride` is the offer — see `RidePill` — and it is a detent of *this*
+    /// `offer` is the nearby context — see `RidePill` — and it is a detent of *this*
     /// sheet rather than a badge of its own. That is the only arrangement in
     /// which the pull that opens the offer is the sheet's own gesture: one
     /// element, three heights, and the finger free to stop between them.
@@ -45,7 +46,7 @@ struct ContentView: View {
     /// and only a swipe down from here takes the sheet off the screen. A ride
     /// that ended when the panel closed made the app forget, between one
     /// gesture and the next, the one thing it had worked out for itself.
-    private enum Stand { case ride, resting, large }
+    private enum Stand { case offer, resting, large }
 
     /// Whether the loading curtain is still in the hierarchy. It outlives
     /// `model.isLoading` by the length of the fade, then unmounts — a material
@@ -57,6 +58,16 @@ struct ContentView: View {
     /// made the sheet repeatedly relayout against live map updates and could
     /// leave the main thread stuck in the presentation feedback loop.
     @State private var detailSheetPresented = false
+    /// True from the moment the live-ride sheet starts moving upwards, rather
+    /// than from the later moment UIKit commits its next detent.
+    ///
+    /// `PresentationDetent`'s selection binding is intentionally discrete: it
+    /// changes after the finger lets go.  The panel is much more useful if it
+    /// can spend that drag building its rows and fetching the selected service,
+    /// so the sheet's own pan is observed below and this state swaps the content
+    /// while the gesture is still in flight.
+    @State private var offerPullingOpen = false
+    @State private var offerPullSettlement: Task<Void, Never>?
 
     var body: some View {
         GeometryReader { proxy in
@@ -154,9 +165,9 @@ struct ContentView: View {
                 // up to the panel. The two cannot both have the bottom of the
                 // screen, and the tap is the newer answer — but the offer is
                 // not *refused*, so it comes back if Done closes the panel.
-                if stand == .ride { stand = .resting }
+                if stand == .offer, !offerPullingOpen { stand = .resting }
                 detailSheetPresented = true
-            } else if detailSheetPresented, stand != .ride {
+            } else if detailSheetPresented, stand != .offer {
                 // Keep programmatic clears behaving like a normal dismissal —
                 // unless the sheet has come down to the offer's own height, in
                 // which case clearing the selection is what *put* it there and
@@ -173,25 +184,28 @@ struct ContentView: View {
         }
         // A new offer opens the sheet at its smallest height. Nothing else
         // moves: if a panel is already up, the offer waits for it to close.
-        .onChange(of: model.rides.offeringID) { _, _ in offerRide() }
-        .onChange(of: otherSheetUp) { _, _ in offerRide() }
+        .onChange(of: model.rides.offeringID) { _, _ in presentOffer() }
+        .onChange(of: otherSheetUp) { _, _ in presentOffer() }
         .onChange(of: mapCovered) { _, covered in model.mapObscured = covered }
         // The fit can be withdrawn from under a standing bar — a tunnel long
         // enough, a train that turns out to be the one on the next track. The
         // sheet is showing the bar and the bar has lost its subject, so it goes
         // rather than standing there empty. A panel open over it is untouched:
         // whatever is in it was asked for by name.
-        .onChange(of: rideStanding) { _, standing in
-            guard !standing, stand == .ride else { return }
+        .onChange(of: offerStanding) { _, standing in
+            guard !standing, stand == .offer else { return }
             detailSheetPresented = false
         }
         .sheet(isPresented: $detailSheetPresented, onDismiss: {
+            offerPullSettlement?.cancel()
+            offerPullSettlement = nil
+            offerPullingOpen = false
             // Off the bottom from the bar's own height, which is the one
             // gesture that retires a ride: not my train, or I know, stop
             // telling me. Every *other* way out of the sheet lands on the bar
             // instead — see `closeSheet` and the detent watcher below — so this
             // is reached only by a deliberate swipe down on the bar itself.
-            if stand == .ride { model.rides.dismiss() }
+            if stand == .offer { model.rides.dismiss() }
             model.selection = .none
             // A sheet always opens at its resting height. `stand` is the
             // sheet's own state and nothing was clearing it, so pulling one
@@ -205,11 +219,21 @@ struct ContentView: View {
             // screen back. Refusing it above is what stops this: `offering` is
             // nil by the time it is read.
             if model.rides.offering != nil {
-                stand = .ride
+                stand = .offer
                 detailSheetPresented = true
             }
         }) {
             sheetBody
+                // UIKit only writes the selected detent after the pull ends.
+                // Listen to that same native pan without adding a competing
+                // gesture, so the real panel can render under the finger.
+                .background {
+                    SheetPullObserver(
+                        active: stand == .offer && offerStanding,
+                        pulledUp: beginOfferPull,
+                        ended: finishOfferPull
+                    )
+                }
                 .presentationDetents(detents, selection: standing)
                 .presentationBackgroundInteraction(.enabled(upThrough: resting))
                 .presentationDragIndicator(.visible)
@@ -223,35 +247,40 @@ struct ContentView: View {
                 // Leaving the offer's height by any means — a drag, a flick, a
                 // tap on the row — is "yes, that is my train". The panel it
                 // grows into is the one a tap on the train would have opened,
-                // and the camera goes to find it. See `AppModel.openRide`.
+                // and the camera goes to find it. See `AppModel.openOffer`.
                 // And coming back down to it is the other direction of the
                 // same gesture: the sheet has returned to its floor, so the
                 // panel it was showing is over. Clearing the selection here
                 // rather than dismissing the sheet is what makes a collapse
                 // land on the bar instead of on bare map.
                 .onChange(of: stand) { was, now in
-                    if now == .ride, model.selection != .none { model.selection = .none }
-                    guard was == .ride, now != .ride, model.selection == .none else { return }
-                    model.openRide()
+                    if now != .offer {
+                        offerPullSettlement?.cancel()
+                        offerPullSettlement = nil
+                        offerPullingOpen = false
+                    }
+                    if now == .offer, model.selection != .none { model.selection = .none }
+                    guard was == .offer, now != .offer, model.selection == .none else { return }
+                    model.openOffer()
                 }
         }
     }
 
     /// The offer, or whatever the last tap selected.
     ///
-    /// One sheet, two contents. The swap happens when the detent commits rather
-    /// than under the finger — that is the price of the gesture being the
-    /// sheet's own — and it is cheap, because the row being replaced is a line
-    /// of text and the panel behind it is what the pull was asking for anyway.
+    /// One sheet, two contents. A tap swaps them when the detent changes; a pull
+    /// swaps them as soon as the native sheet gesture has moved far enough to
+    /// be unambiguous, so the panel lays itself out during the expansion rather
+    /// than appearing only after the finger lets go.
     @ViewBuilder private var sheetBody: some View {
         // No `selection == .none` here. The selection is cleared *by* arriving
         // at this height rather than before it, and requiring it first meant
         // the frame in which the sheet reached its floor still had the panel in
         // it — a full-height list crammed into a hundred points, for one frame,
         // every time somebody pushed the sheet down.
-        if stand == .ride, let ride = model.rides.offering {
+        if stand == .offer, !offerPullingOpen, let offer = model.rides.offering {
             RidePill(
-                ride: ride,
+                offer: offer,
                 open: { withAnimation(.snappy(duration: 0.3)) { stand = .resting } },
                 dismiss: { detailSheetPresented = false }
             )
@@ -267,12 +296,12 @@ struct ContentView: View {
     /// bar's height stays in the sheet's set the whole time. That is what makes
     /// a downward drag land on the bar — a detent the sheet already has — and
     /// what makes the *next* downward drag, from the bar, a dismissal.
-    private var rideStanding: Bool { model.rides.offering != nil }
+    private var offerStanding: Bool { model.rides.offering != nil }
 
     /// Whether there is an offer standing with nothing on top of it, which is
     /// the only state the sheet may put itself up in.
-    private var rideOffered: Bool {
-        model.selection == .none && rideStanding
+    private var offerAvailable: Bool {
+        model.selection == .none && offerStanding
     }
 
     /// Settings, the map controls and the download panel are nothing to do with
@@ -290,10 +319,43 @@ struct ContentView: View {
     private var mapCovered: Bool { showSettings || showOffline }
 
     /// Put the offer up, if there is one and there is room for it.
-    private func offerRide() {
-        guard rideOffered, !detailSheetPresented, !otherSheetUp else { return }
-        stand = .ride
+    private func presentOffer() {
+        guard offerAvailable, !detailSheetPresented, !otherSheetUp else { return }
+        offerPullSettlement?.cancel()
+        offerPullSettlement = nil
+        offerPullingOpen = false
+        stand = .offer
         detailSheetPresented = true
+    }
+
+    /// Start answering the pull before UIKit has chosen its destination detent.
+    private func beginOfferPull() {
+        guard stand == .offer, !offerPullingOpen,
+              model.selection == .none, offerStanding
+        else { return }
+        offerPullSettlement?.cancel()
+        offerPullSettlement = nil
+        offerPullingOpen = true
+        model.openOffer()
+    }
+
+    /// A short pull can snap back to the live bar without changing the selected
+    /// detent. Give UIKit's settling animation time to decide; if it remained at
+    /// `.offer`, put the offer back and undo the speculative selection.
+    private func finishOfferPull() {
+        guard offerPullingOpen else { return }
+        offerPullSettlement?.cancel()
+        offerPullSettlement = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled, offerPullingOpen else { return }
+            offerPullSettlement = nil
+            guard stand == .offer else {
+                offerPullingOpen = false
+                return
+            }
+            offerPullingOpen = false
+            if model.selection != .none { model.selection = .none }
+        }
     }
 
     /// Close whatever the sheet is showing.
@@ -303,23 +365,23 @@ struct ContentView: View {
     /// come through here, so all three agree with the drag: the way out of the
     /// panel is the floor, and the way out of the *floor* is a swipe down.
     private func closeSheet() {
-        guard rideStanding else {
+        guard offerStanding else {
             detailSheetPresented = false
             return
         }
-        withAnimation(.snappy(duration: 0.3)) { stand = .ride }
+        withAnimation(.snappy(duration: 0.3)) { stand = .offer }
         model.selection = .none
     }
 
     /// The heights this sheet is offered: two, unless there is an offer to
     /// make, in which case the offer's own height is the first of three.
     private var detents: Set<PresentationDetent> {
-        rideStanding ? [Self.rideDetent, resting, .large] : [resting, .large]
+        offerStanding ? [Self.offerDetent, resting, .large] : [resting, .large]
     }
 
     /// Constant, so it is the same value in the set and in the selection, and
     /// so it never moves the sheet. See `RidePill.height`.
-    private static let rideDetent = PresentationDetent.height(RidePill.height)
+    private static let offerDetent = PresentationDetent.height(RidePill.height)
 
     /// Where the sheet is standing, in terms of the detents it is offered.
     ///
@@ -335,13 +397,13 @@ struct ContentView: View {
                 // or withdrawn, and a selection naming a detent that is no
                 // longer offered is the "Cannot set selected sheet detent"
                 // complaint and a write back through this binding to repair it.
-                case .ride: return rideStanding ? Self.rideDetent : resting
+                case .offer: return offerStanding ? Self.offerDetent : resting
                 case .resting: return resting
                 }
             },
             set: { picked in
                 if picked == .large { stand = .large }
-                else if picked == Self.rideDetent { stand = .ride }
+                else if picked == Self.offerDetent { stand = .offer }
                 else { stand = .resting }
             }
         )
@@ -458,7 +520,7 @@ struct ContentView: View {
         // holding: a selection outlives the collapse to the bar by a frame, and
         // reading it first lifted the locate button over a panel that was on
         // its way to being a hundred points tall.
-        if detailSheetPresented, stand == .ride {
+        if detailSheetPresented, stand == .offer {
             // The offer is a sheet now, so it takes the bottom of the screen
             // the way one does, and the locate button lifts over it.
             sheet = RidePill.height + 10
@@ -713,6 +775,115 @@ struct MapControlStyle: ButtonStyle {
 
 extension ButtonStyle where Self == MapControlStyle {
     static var mapControl: MapControlStyle { MapControlStyle() }
+}
+
+/// Reads the sheet presentation controller's existing pan gesture.
+///
+/// Adding a SwiftUI `DragGesture` here would make it compete with the system
+/// sheet for the same touch. This zero-impact view instead adds itself as one
+/// more target of the recogniser UIKit already owns, so detent physics,
+/// scrolling and dismissal remain entirely native.
+private struct SheetPullObserver: UIViewRepresentable {
+    var active: Bool
+    var pulledUp: () -> Void
+    var ended: () -> Void
+
+    func makeUIView(context: Context) -> ObservationView {
+        let view = ObservationView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        return view
+    }
+
+    func updateUIView(_ view: ObservationView, context: Context) {
+        view.active = active
+        view.pulledUp = pulledUp
+        view.ended = ended
+        view.installWhenReady()
+    }
+
+    static func dismantleUIView(_ view: ObservationView, coordinator: ()) {
+        view.removeObservations()
+    }
+
+    @MainActor
+    final class ObservationView: UIView {
+        var active = false {
+            didSet {
+                if !active { openedThisPull = false }
+            }
+        }
+        var pulledUp: () -> Void = {}
+        var ended: () -> Void = {}
+
+        private var pans: [UIPanGestureRecognizer] = []
+        private var openedThisPull = false
+        private var installationQueued = false
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            installWhenReady()
+        }
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            installWhenReady()
+        }
+
+        /// The presentation wrapper and its recognisers are installed after
+        /// SwiftUI's representable joins the hierarchy, hence the next-run-loop
+        /// pass. Repeated calls are cheap and identity-checked.
+        func installWhenReady() {
+            guard window != nil, !installationQueued else { return }
+            installationQueued = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                installationQueued = false
+                installOnAncestors()
+            }
+        }
+
+        private func installOnAncestors() {
+            var ancestor: UIView? = self
+            while let view = ancestor {
+                for case let pan as UIPanGestureRecognizer in view.gestureRecognizers ?? [] {
+                    guard !pans.contains(where: { $0 === pan }) else { continue }
+                    pan.addTarget(self, action: #selector(observe(_:)))
+                    pans.append(pan)
+                }
+                ancestor = view.superview
+            }
+        }
+
+        @objc private func observe(_ pan: UIPanGestureRecognizer) {
+            guard active else { return }
+            switch pan.state {
+            case .began:
+                openedThisPull = false
+            case .changed:
+                let movement = pan.translation(in: window)
+                guard !openedThisPull,
+                      movement.y < -12,
+                      abs(movement.y) > abs(movement.x)
+                else { return }
+                openedThisPull = true
+                pulledUp()
+            case .ended, .cancelled, .failed:
+                if openedThisPull { ended() }
+                openedThisPull = false
+            default:
+                break
+            }
+        }
+
+        func removeObservations() {
+            for pan in pans {
+                pan.removeTarget(self, action: #selector(observe(_:)))
+            }
+            pans.removeAll()
+            openedThisPull = false
+        }
+    }
 }
 
 /// What the draw loop is doing, over the map.

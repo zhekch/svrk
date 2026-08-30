@@ -91,6 +91,9 @@ enum VehicleShapes {
         static let selected = "sel"
         static let above = "up"
         static let shade = "sh"
+        /// Width of the street-level casing in screen points. This must follow
+        /// the body width: a fixed casing turns a small bus into a black blob.
+        static let casing = "cw"
         /// Whether this vehicle is also being drawn as a solid right now.
         ///
         /// The flat drawing of a vehicle that is standing up as a model is
@@ -171,7 +174,7 @@ enum VehicleShapes {
         // body that is a third of the way in is a dark smear arriving before
         // the thing that casts it.
         shadow.lineColor = .expression(Exp(.get) { Key.shade })
-        shadow.lineWidth = .constant(4.5)
+        shadow.lineWidth = .expression(Exp(.get) { Key.casing })
         shadow.lineJoin = .constant(.round)
         shadow.lineCap = .constant(.round)
         try style.addLayer(shadow)
@@ -407,6 +410,15 @@ enum VehicleShapes {
             guard !print.hanging else { continue }
             let standing = stood.contains(print.id)
             let fade = print.emergence * solid
+            // The fill is painted over the inner half of this line, so this is
+            // also the total amount the dark casing adds to the silhouette.
+            // Scale it with the rendered body rather than with the real-world
+            // vehicle: at the zoom where a single bus first becomes a shape it
+            // can be under two points wide, and the former fixed 4.5-point line
+            // buried it under more than twice its own width. The clamps retain
+            // a crisp one-pixel edge on a Retina display and keep long trains
+            // from regaining the oversized halo.
+            let casingWidth = min(1.6, max(0.8, print.widthPoints * 0.4))
             let wagonLifts = lifts[print.id] ?? []
             let wagonOp = opacities[print.id] ?? []
             let vehicleOp = wagonOp.min() ?? 1
@@ -463,6 +475,7 @@ enum VehicleShapes {
                     Key.selected: .boolean(print.ringed),
                     Key.above: .boolean(print.aboveGround),
                     Key.shade: .string(shade(drawn)),
+                    Key.casing: .number(casingWidth),
                     Key.lift: .number(lift),
                     Key.opacity: .number(op),
                     // Written on every one of them, never left off. A property

@@ -20,9 +20,11 @@ enum VehicleDot {
     /// The zoom a vehicle's line number appears at.
     ///
     /// Also where the thinning stops: below it a vehicle is a dot and nothing
-    /// else, so one behind another says nothing that is not already on the map;
-    /// from here up it carries a number, and a number behind a dot is a service
-    /// missing from the map.
+    /// else, so one behind another says nothing that is not already on the map.
+    /// From here up every vehicle is handed to the renderer, which keeps all of
+    /// the dots but only places the line numbers for which there is room. That
+    /// lets a hidden number take the next available position as the map moves,
+    /// rather than permanently choosing one service in the feed.
     static let labelMinZoom = 11.0
 
     /// Past this zoom, the line number comes off the vehicle that is open on

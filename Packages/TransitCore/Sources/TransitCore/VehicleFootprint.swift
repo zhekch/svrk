@@ -136,6 +136,14 @@ public struct VehicleFootprint: Sendable, Equatable {
     /// How long the vehicle is on screen right now, in points. What decides
     /// whether it is worth drawing as a shape at all.
     public var lengthPoints: Double
+    /// How wide its widest body is drawn on screen right now, in points.
+    ///
+    /// Kept beside the footprint so a renderer can size screen-space effects
+    /// around the body instead of assuming every vehicle is the same width.
+    /// That assumption is especially destructive for buses: their bounded
+    /// width can be under two points when they first emerge, so the old fixed
+    /// 4.5-point road casing was wider than the vehicle it surrounded.
+    public var widthPoints: Double
     /// How far through the change from dot to vehicle this one is: 0 is a dot,
     /// 1 is fully drawn.
     public var emergence: Double
@@ -370,7 +378,9 @@ public enum VehicleShape {
 
         public static func < (a: Detail, b: Detail) -> Bool { a.rawValue < b.rawValue }
 
-        /// Chosen from how long one unit comes out on screen, in points.
+        /// Chosen from how long one unit comes out on screen, in physical
+        /// pixels. The map scale arrives in points and `pixelsPerPoint` turns
+        /// it into the resolution the renderer actually has available.
         ///
         /// Length rather than width, and per unit rather than per vehicle, and
         /// both of those were got wrong first. Width cannot decide it: every
@@ -380,10 +390,15 @@ public enum VehicleShape {
         /// never fires. And a rule written against the whole vehicle puts doors
         /// on a four-hundred-metre train whose individual coaches are four
         /// points long, because the train is plenty long enough and the coach
-        /// is not.
-        public static func forUnit(lengthPoints: Double) -> Detail {
-            if lengthPoints >= 22 { return .full }
-            if lengthPoints >= 8 { return .trim }
+        /// is not. Measuring that coach in physical pixels is equally
+        /// important: treating a 3x screen as 1x discards two-thirds of the
+        /// detail its framebuffer can resolve.
+        public static func forUnit(
+            lengthPoints: Double, pixelsPerPoint: Double = 1
+        ) -> Detail {
+            let lengthPixels = lengthPoints * max(1, pixelsPerPoint)
+            if lengthPixels >= 22 { return .full }
+            if lengthPixels >= 8 { return .trim }
             return .outline
         }
     }
@@ -419,13 +434,20 @@ public enum VehicleShape {
 
     public static func footprint(
         of vehicle: VehicleSnapshot, layout: VehicleLayout,
-        metresPerPoint: Double, selected: Bool = false, ringed: Bool? = nil,
+        metresPerPoint: Double, pixelsPerPoint: Double = 1,
+        selected: Bool = false, ringed: Bool? = nil,
         lateralOffset: Double = 0, solid: Bool = false, extruded: Bool = true,
         emerged: Double? = nil, bodiesOnly: Bool = false
     ) -> VehicleFootprint? {
         guard metresPerPoint > 0 else { return nil }
         let total = layout.length
         guard total > 0 else { return nil }
+        // `metresPerPoint` deliberately stays in UIKit points: it controls how
+        // large the vehicle is on the map. Detail is a different question. A
+        // five-point bus section occupies fifteen physical pixels on a 3x
+        // phone, and reducing it as though it occupied five is the blocky 2D
+        // rendering that the full-detail model never suffered from.
+        let rasterScale = max(1, pixelsPerPoint)
 
         let lengthPoints = total / metresPerPoint
         // The selected vehicle is drawn as a shape a little sooner than the
@@ -489,7 +511,8 @@ public enum VehicleShape {
         var lamps: [VehicleLamp] = []
         // How much the bodies are widened past the truth so that they read as
         // bodies. See `drawnWidth`.
-        let scale = drawnWidth(of: layout, metresPerPoint: metresPerPoint).scale
+        let drawnWidth = drawnWidth(of: layout, metresPerPoint: metresPerPoint)
+        let scale = drawnWidth.scale
 
         var offset = 0.0
         var lastHeading: Double?
@@ -525,7 +548,10 @@ public enum VehicleShape {
             let unitPoints = unit.length / metresPerPoint
             let ring = outline(
                 length: unit.length, width: width, front: ends.front, back: ends.back,
-                steps: smoothness(lengthPoints: unitPoints, widthPoints: width / metresPerPoint),
+                steps: smoothness(
+                    lengthPoints: unitPoints, widthPoints: width / metresPerPoint,
+                    pixelsPerPoint: rasterScale
+                ),
                 // The one body in the country whose sides are not straight.
                 sponsons: sponsons(for: unit)
             )
@@ -544,7 +570,9 @@ public enum VehicleShape {
             // is a smear of subpixel rectangles that costs a feature each.
             let detail = emergence < 1
                 ? Detail.outline
-                : Detail.forUnit(lengthPoints: unitPoints)
+                : Detail.forUnit(
+                    lengthPoints: unitPoints, pixelsPerPoint: rasterScale
+                )
 
             // The solid, from the same frame, the same ends and the same width
             // the flat body was just built from. Sharing those four is what
@@ -700,7 +728,9 @@ public enum VehicleShape {
         return VehicleFootprint(
             id: vehicle.id, parts: parts, slabs: slabs, placements: placements,
             lamps: lamps, centreline: line,
-            lengthPoints: lengthPoints, emergence: emergence,
+            lengthPoints: lengthPoints,
+            widthPoints: drawnWidth.metres / metresPerPoint,
+            emergence: emergence,
             stroke: layout.livery.stroke, selected: selected,
             hanging: Cableway.hangs(vehicle), ringed: ringed ?? selected,
             aboveGround: Self.isAboveGround(vehicle.mode)
@@ -1277,12 +1307,16 @@ public enum VehicleShape {
 
     /// How many segments a curved end is drawn with.
     ///
-    /// A number rather than a constant because the same nose is four points
-    /// across at zoom 13 and two hundred at zoom 18, and the vertex that is
+    /// A number rather than a constant because the same nose is a handful of
+    /// pixels across at zoom 13 and hundreds at zoom 18, and the vertex that is
     /// invisible in the first case is the difference between a curve and a
     /// bevel in the second. Vertices are the currency here: every one of them
     /// is emitted, projected, serialised and uploaded fifteen times a second
     /// for every vehicle on screen.
+    ///
+    /// `lengthPoints` and `widthPoints` are converted to physical pixels here;
+    /// using them directly on a Retina screen was under-tessellating every
+    /// curved end by the display scale.
     ///
     /// **From how big the body is on screen, and not from how long it is.** An
     /// end is an arc across the body's *width*, so a body eleven points long
@@ -1290,12 +1324,15 @@ public enum VehicleShape {
     /// deserves and spending them on a seven-point curve — which is a bevel,
     /// and is most of why the coaches read as boxes with a corner cut off. The
     /// larger of the two dimensions is what the eye is resolving.
-    public static func smoothness(lengthPoints: Double, widthPoints: Double = 0) -> Int {
-        let points = max(lengthPoints, widthPoints)
-        if points >= 120 { return 8 }
-        if points >= 45 { return 5 }
-        if points >= 16 { return 3 }
-        if points >= 5 { return 2 }
+    public static func smoothness(
+        lengthPoints: Double, widthPoints: Double = 0,
+        pixelsPerPoint: Double = 1
+    ) -> Int {
+        let pixels = max(lengthPoints, widthPoints) * max(1, pixelsPerPoint)
+        if pixels >= 120 { return 8 }
+        if pixels >= 45 { return 5 }
+        if pixels >= 16 { return 3 }
+        if pixels >= 5 { return 2 }
         return 1
     }
 

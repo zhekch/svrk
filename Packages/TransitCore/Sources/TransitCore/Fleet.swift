@@ -181,6 +181,13 @@ public struct PlatformBoard: Sendable, Equatable {
     public var lat: Double
     public var now: Timestamp
     public var departures: [BoardEntry]
+    /// Whether this is a railway platform rather than a bus/tram/boat stop.
+    ///
+    /// The distinction is wording, not decoration: track 7 is “Platform 7”,
+    /// while the two sides of a tram or bus stop are “Stop A” and “Stop B”.
+    /// Carry it with the board so every surface names the same place the same
+    /// way instead of guessing from whichever departures happen to be present.
+    public var rail: Bool
     /// True where the timetable does not split this station into platforms, so
     /// these are the station's departures. Said plainly rather than passed off
     /// as a platform board.
@@ -194,6 +201,50 @@ public struct PlatformBoard: Sendable, Equatable {
     /// the shape that is selected and cannot end up outlining one that is not:
     /// the highlight is a function of the selection, not a second copy of it.
     public var shape: String?
+}
+
+/// The board belonging to a stationary phone near public transport.
+///
+/// A platform is returned only when the GPS uncertainty circle fits clearly
+/// nearer one separated stop than every sibling. Otherwise this deliberately
+/// falls back to the whole station: an honest “Bern” is more useful than a
+/// confident-looking but invented “Platform 4”.
+public enum NearbyBoard: Sendable, Equatable {
+    case station(StationBoard)
+    case platform(PlatformBoard)
+
+    public var id: String {
+        switch self {
+        case let .station(board): return "station:\(board.id)"
+        case let .platform(board): return "platform:\(board.id)"
+        }
+    }
+
+    public var name: String {
+        switch self {
+        case let .station(board): return board.name
+        case let .platform(board): return board.name
+        }
+    }
+
+    public var coordinate: Coord {
+        switch self {
+        case let .station(board): return Coord(lon: board.lon, lat: board.lat)
+        case let .platform(board): return Coord(lon: board.lon, lat: board.lat)
+        }
+    }
+
+    /// What the compact offer says. Whole stations intentionally have no
+    /// platform suffix; a specific result includes the one distinction the
+    /// confidence test was able to establish.
+    public var title: String {
+        guard case let .platform(board) = self, !board.stationOnly else { return name }
+        let code = [board.code, board.assigned]
+            .compactMap { $0 }
+            .first { !$0.isEmpty }
+        guard let code else { return name }
+        return "\(name) · \(board.rail ? "Platform" : "Stop") \(code)"
+    }
 }
 
 /// How the fleet last refreshed, for the status panel.
@@ -2941,11 +2992,17 @@ public actor Fleet {
     /// Proximity alone is worse than useless here: in a city centre 300 metres
     /// reaches several unrelated stops, and clicking Bern, Waisenhausplatz
     /// listed departures from Bärenplatz, Bundesplatz and Bollwerk — none of
-    /// which are Waisenhausplatz. The comma is the separator the Swiss stop
-    /// register uses for a stop inside a larger place, so it says what
+    /// which are Waisenhausplatz. The comma is normally the separator the Swiss
+    /// stop register uses for a stop inside a larger place, so it says what
     /// proximity cannot.
+    ///
+    /// Some interchanges are filed both ways, though. The Spiez boat landing is
+    /// `Spiez Schiffstation` while the bus stop beside it is
+    /// `Spiez, Schiffstation`. Those are two identifiers for one place, not two
+    /// choices, and comparing letters and digits lets their board contain both
+    /// modes without weakening the prefix rule for genuinely different stops.
     static func partOfStation(_ name: String, _ stationName: String) -> Bool {
-        name == stationName || name.hasPrefix("\(stationName), ")
+        sameStop(name, stationName) || name.hasPrefix("\(stationName), ")
     }
 
     /// The name the stop register holds for a UIC number.
@@ -2974,6 +3031,142 @@ public actor Fleet {
         return board(name: place.name, id: place.id, lon: place.lon, lat: place.lat, at: now, limit: limit)
     }
 
+    /// The stop a stationary, accurately located phone can honestly claim.
+    ///
+    /// The register's platform points answer proximity; `StopPlace` answers
+    /// ownership. That order matters at a large station, whose centre may be a
+    /// hundred metres from the platform the phone is standing on. Nearby child
+    /// stops such as “Bern, Bahnhof” are folded into their parent “Bern” for the
+    /// station fallback, while a confidently isolated child can still return
+    /// its own platform board.
+    public func nearbyBoard(
+        lon: Double, lat: Double, accuracy: Double, at now: Timestamp
+    ) -> NearbyBoard? {
+        guard accuracy.isFinite, accuracy >= 0, accuracy <= 35,
+              stopPlaces.count > 0
+        else { return nil }
+
+        // Wide enough to see the parent point from the outer platforms of a
+        // main station, but the final acceptance below is against a stop the
+        // phone can actually be standing at, not against this search radius.
+        let placeReach = max(Self.stationSpread, accuracy + 80)
+        let places = stopPlaces.nearby(
+            lon: lon, lat: lat, within: placeReach, limit: 80
+        )
+
+        /// Prefer the encompassing railway station or shorter interchange name
+        /// when the register has separate place ids for its modes.
+        func canonical(_ place: StopPlace) -> StopPlace {
+            let parents = places.filter { candidate in
+                candidate.id != place.id
+                    && Self.partOfStation(place.name, candidate.name)
+                    && Geo.flatMetres(
+                        place.lon, place.lat, candidate.lon, candidate.lat
+                    ) <= Self.stationSpread
+            }
+            return parents.min { a, b in
+                if a.rail != b.rail { return a.rail && !b.rail }
+                if a.name.count != b.name.count { return a.name.count < b.name.count }
+                return a.id < b.id
+            } ?? place
+        }
+
+        var groupPlace: [String: StopPlace] = [:]
+        var groupStops: [String: [RegisteredStop]] = [:]
+        var groupDistance: [String: Double] = [:]
+
+        func include(_ place: StopPlace, distance: Double) {
+            let parent = canonical(place)
+            groupPlace[parent.id] = parent
+            groupDistance[parent.id] = min(groupDistance[parent.id] ?? .infinity, distance)
+        }
+
+        for place in places {
+            include(
+                place,
+                distance: Geo.flatMetres(place.lon, place.lat, lon, lat)
+            )
+        }
+
+        // A phone need only be close to a platform point. The parent station's
+        // own point may be much further away and must not veto it.
+        let stopReach = max(120, accuracy + 50)
+        for stop in register.near(lon: lon, lat: lat, metres: stopReach) {
+            let station = StopRegister.stationOf(stop.id)
+            guard let place = stopPlaces.place(id: station) else { continue }
+            let parent = canonical(place)
+            let distance = Geo.flatMetres(stop.lon, stop.lat, lon, lat)
+            include(place, distance: distance)
+            groupStops[parent.id, default: []].append(stop)
+        }
+
+        let ranked = groupDistance.sorted { a, b in
+            a.value == b.value ? a.key < b.key : a.value < b.value
+        }
+        guard let nearest = ranked.first,
+              // The uncertainty circle may reach the stop, with a modest
+              // allowance for the register point sitting beside the shelter.
+              nearest.value <= max(25, accuracy + 25),
+              let station = groupPlace[nearest.key]
+        else { return nil }
+
+        // Two unrelated stops equally plausible under the accuracy circle are
+        // not a choice to make silently. Equivalent interchange names have
+        // already been canonicalised into one group above.
+        if ranked.count > 1,
+           ranked[1].value - nearest.value <= max(8, accuracy * 1.5) {
+            return nil
+        }
+
+        if let stop = Self.confidentStop(
+            among: groupStops[nearest.key] ?? [],
+            lon: lon, lat: lat, accuracy: accuracy
+        ), let board = platformBoard(ref: stop.id, at: now) {
+            return .platform(board)
+        }
+
+        return stationBoard(placeId: station.id, at: now).map(NearbyBoard.station)
+    }
+
+    /// Choose one platform only when its uncertainty disc and its nearest
+    /// sibling's do not overlap. Rows naming the same track are collapsed first
+    /// so duplicate directional records cannot manufacture ambiguity.
+    static func confidentStop(
+        among stops: [RegisteredStop],
+        lon: Double, lat: Double, accuracy: Double
+    ) -> RegisteredStop? {
+        guard accuracy <= 18 else { return nil }
+
+        var nearestByLabel: [String: (stop: RegisteredStop, distance: Double)] = [:]
+        for stop in stops {
+            guard stop.platform != nil || stop.assigned != nil else { continue }
+            let label: String
+            if let platform = stop.platform {
+                label = "platform:\(StopRegister.trackOf(platform) ?? platform)"
+            } else {
+                label = "assigned:\(stop.assigned!)"
+            }
+            let distance = Geo.flatMetres(stop.lon, stop.lat, lon, lat)
+            if distance < (nearestByLabel[label]?.distance ?? .infinity) {
+                nearestByLabel[label] = (stop, distance)
+            }
+        }
+
+        let ranked = nearestByLabel.values.sorted { a, b in
+            a.distance == b.distance ? a.stop.id < b.stop.id : a.distance < b.distance
+        }
+        guard ranked.count >= 2 else { return nil }
+        let first = ranked[0], second = ranked[1]
+        let separation = Geo.flatMetres(
+            first.stop.lon, first.stop.lat, second.stop.lon, second.stop.lat
+        )
+        guard first.distance <= max(12, accuracy * 1.5),
+              separation >= max(16, accuracy * 2.5),
+              second.distance - first.distance > accuracy * 2
+        else { return nil }
+        return first.stop
+    }
+
     private func board(
         name: String, id: String, lon: Double, lat: Double, at now: Timestamp, limit: Int
     ) -> StationBoard {
@@ -2999,6 +3192,21 @@ public actor Fleet {
 
         // Exact, and free: a DIDOK number is `85` plus the SLOID number.
         if let own = StopRegister.sloid(forDidok: id) { hereStations.insert(own) }
+
+        // Sibling stop places first. Most stations are joined below through
+        // their registered platforms, but a boat landing has no platform row.
+        // Without this symmetric pass, tapping `Spiez Schiffstation` found the
+        // buses beside it while tapping `Spiez, Schiffstation` did not find the
+        // boats: only the bus stop existed in the platform register. Stop-place
+        // identity closes that one-way join before the platform detail is added.
+        for place in stopPlaces.nearby(
+            lon: lon, lat: lat, within: Self.stationSpread, limit: 200
+        ) where Self.partOfStation(place.name, name) {
+            if let station = StopRegister.sloid(forDidok: place.id) {
+                hereStations.insert(station)
+            }
+            kerbs.append(Coord(lon: place.lon, lat: place.lat))
+        }
 
         if register.isReady {
             for stop in register.near(lon: lon, lat: lat, metres: Self.stationSpread)
@@ -3342,10 +3550,14 @@ public actor Fleet {
         }
         departures.sort { $0.departure < $1.departure }
 
+        let rail = stopPlaces.place(id: station)?.rail
+            ?? departures.contains { $0.mode == .train }
+
         return PlatformBoard(
             id: ref, name: place.name, code: place.platform, assigned: place.assigned,
             lon: place.lon, lat: place.lat, now: now,
-            departures: Self.trim(departures, to: limit), stationOnly: false,
+            departures: Self.trim(departures, to: limit), rail: rail,
+            stationOnly: false,
             serving: servingLines(
                 at: [Coord(lon: place.lon, lat: place.lat)], besides: departures
             )
@@ -3391,7 +3603,8 @@ public actor Fleet {
             id: shape.sloids[0], name: shape.name,
             code: shape.codes.filter { !$0.isEmpty }.joined(separator: " · "),
             assigned: nil, lon: first.lon, lat: first.lat, now: now,
-            departures: Self.trim(departures, to: 40), stationOnly: shape.stationOnly,
+            departures: Self.trim(departures, to: 40), rail: first.rail,
+            stationOnly: shape.stationOnly,
             // Asked again for the whole shape rather than unioning the tracks'
             // lists: a line live at one track and idle at the other is running
             // here, and each track's own list only knows about its own board.

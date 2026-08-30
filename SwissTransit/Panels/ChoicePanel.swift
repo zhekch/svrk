@@ -106,11 +106,11 @@ extension TapChoice {
         if board.stationOnly {
             subtitle = "Whole station's departures"
         } else if let code = board.code, !code.isEmpty {
-            subtitle = "Platform \(code)"
+            subtitle = "\(board.rail ? "Platform" : "Stop") \(code)"
         } else if let assigned = board.assigned {
-            subtitle = "Platform \(assigned) (auto generated)"
+            subtitle = "\(board.rail ? "Platform" : "Stop") \(assigned) (auto generated)"
         } else {
-            subtitle = "Stop"
+            subtitle = board.rail ? "Platform" : "Stop"
         }
         return TapChoice(
             id: "platform:\(board.shape ?? board.id)",

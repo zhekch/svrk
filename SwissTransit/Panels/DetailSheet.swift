@@ -118,12 +118,13 @@ struct DetailSheet: View {
             // station's departures.
             return "Whole station's departures"
         }
-        if let code = board.code, !code.isEmpty { return "Platform \(code)" }
+        let noun = board.rail ? "Platform" : "Stop"
+        if let code = board.code, !code.isEmpty { return "\(noun) \(code)" }
         if let assigned = board.assigned {
             // Ours, not signage — and the panel says so, because a letter that
             // looks like a sign and is not would send somebody to the wrong kerb.
-            return "Platform \(assigned) (auto generated)"
+            return "\(noun) \(assigned) (auto generated)"
         }
-        return "Stop"
+        return noun
     }
 }

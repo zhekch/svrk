@@ -165,8 +165,11 @@ order — whatever was drawn last frame, then rail over road, then a hash of the
 id — because a greedy pass in whatever order the fleet was walked in would
 repaint a different thousand dots on every refresh. The drawn set turns over
 about one per cent a second. Nothing is thinned from zoom 11, where a vehicle
-starts carrying its line number: a dot behind a dot is nothing, but a number
-behind a dot is a service missing from the map. See `Fleet.thinTheHidden`.
+starts carrying its line number: every dot reaches the renderer, while its
+collision index places each number above, below or beside the marker and leaves
+out only the labels for which none of those positions is readable. That keeps
+busy station throats legible without permanently choosing one service over
+another; placement is reconsidered as the map moves. See `Fleet.thinTheHidden`.
 
 **The change is per vehicle, not per zoom.** A single threshold has to be set
 for the average vehicle, and there is no average vehicle: an IC is thirty times

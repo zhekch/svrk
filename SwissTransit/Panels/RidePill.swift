@@ -1,10 +1,10 @@
 import SwiftUI
 import TransitCore
 
-/// "You appear to be on the RE1." — the sheet, at its smallest.
+/// "RE1 to Brig" or "Bern · Platform 7" — the sheet, at its smallest.
 ///
-/// Deliberately the smallest thing that can carry that: a red dot, the word
-/// Live, and the line. The app has worked out something the person holding it
+/// Deliberately the smallest thing that can carry that: a status dot and the
+/// name. The app has worked out something the person holding it
 /// already knows — they can see the train they are sitting in — so it has no
 /// business taking the screen to announce it. What it *does* know that they do
 /// not is where the train is going, how late it is and what it is made of, and
@@ -35,7 +35,7 @@ import TransitCore
 /// closing the panel left bare map and no way back to the train underneath the
 /// phone — the app throwing away the one thing it had worked out.
 struct RidePill: View {
-    let ride: RideWatch.Ride
+    let offer: RideWatch.Offer
     /// Take the offer. A tap does what the pull does, for anyone who does not
     /// read the handle as an invitation.
     let open: () -> Void
@@ -70,18 +70,7 @@ struct RidePill: View {
                     .easeInOut(duration: 1.05).repeatForever(autoreverses: true),
                     value: lit
                 )
-            Text("Live")
-                .foregroundStyle(.secondary)
-            Text(verbatim: "•")
-                .foregroundStyle(.tertiary)
-            Text(ride.line)
-                .fontWeight(.semibold)
-            if let destination = ride.to, !destination.isEmpty {
-                Text("to \(destination)")
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
+            offerText
         }
         .font(.title3)
         // Long line-and-destination pairs shrink rather than clip the line
@@ -100,17 +89,53 @@ struct RidePill: View {
         .accessibilityElement(children: .ignore)
         .accessibilityAddTraits(.isButton)
         .accessibilityLabel(spoken)
-        .accessibilityHint("Opens this service and follows it on the map")
+        .accessibilityHint(accessibilityHint)
         .accessibilityAction { open() }
-        .accessibilityAction(named: "Not my service") { dismiss() }
+        .accessibilityAction(named: dismissName) { dismiss() }
+    }
+
+    @ViewBuilder private var offerText: some View {
+        switch offer {
+        case let .ride(ride):
+            Text(ride.line)
+                .fontWeight(.semibold)
+            if let destination = ride.to, !destination.isEmpty {
+                Text("to \(destination)")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        case let .nearby(board):
+            Text(board.title)
+                .fontWeight(.semibold)
+        }
     }
 
     /// Said in full, because the badge's whole trick — a dot standing in for
     /// the word "live" — is a visual one.
     private var spoken: String {
-        var said = "Live. You appear to be on the \(ride.line)"
-        if let destination = ride.to, !destination.isEmpty { said += " to \(destination)" }
-        return said + "."
+        switch offer {
+        case let .ride(ride):
+            var said = "You appear to be on the \(ride.line)"
+            if let destination = ride.to, !destination.isEmpty { said += " to \(destination)" }
+            return said + "."
+        case let .nearby(board):
+            return "You are near \(board.title)."
+        }
+    }
+
+    private var accessibilityHint: String {
+        switch offer {
+        case .ride: return "Opens this service and follows it on the map"
+        case .nearby: return "Opens departures for this place"
+        }
+    }
+
+    private var dismissName: String {
+        switch offer {
+        case .ride: return "Not my service"
+        case .nearby: return "Not this place"
+        }
     }
 }
 
@@ -119,10 +144,10 @@ struct RidePill: View {
         .ignoresSafeArea()
         .sheet(isPresented: .constant(true)) {
             RidePill(
-                ride: RideWatch.Ride(
+                offer: .ride(RideWatch.Ride(
                     id: "preview-re1", line: "RE1", mode: .train,
                     to: "Brig", shift: 42, metres: 61
-                ),
+                )),
                 open: {}, dismiss: {}
             )
             .presentationDetents([.height(RidePill.height), .large])

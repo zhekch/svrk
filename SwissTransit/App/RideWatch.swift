@@ -43,8 +43,28 @@ final class RideWatch {
         var metres: Double
     }
 
+    /// The compact sheet can identify either the service carrying the phone or
+    /// the place beside a stationary phone. A ride wins while it is still a
+    /// settled answer; the station appears only after that answer has ended.
+    enum Offer: Equatable, Identifiable {
+        case ride(Ride)
+        case nearby(NearbyBoard)
+
+        var id: String {
+            switch self {
+            case let .ride(ride): return "ride:\(ride.id)"
+            case let .nearby(board): return "nearby:\(board.id)"
+            }
+        }
+    }
+
     /// What the phone is on, once it has been said the same way several times.
     private(set) var ride: Ride?
+
+    /// The stop or station around a stationary phone, if the location is good
+    /// enough to make that claim. `NearbyBoard` itself decides whether that is
+    /// a particular platform/stop side or only the encompassing station.
+    private(set) var nearbyBoard: NearbyBoard?
 
     /// What to actually put on screen: the ride, unless this one has been
     /// swiped away.
@@ -56,9 +76,12 @@ final class RideWatch {
     /// so closing the panel took the whole thing off the screen and the only
     /// way back to the train you were sitting on was to find it on the map.
     /// Refusing it is the one thing that ends it. See `dismiss`.
-    var offering: Ride? {
-        guard let ride, !silenced.contains(ride.id) else { return nil }
-        return ride
+    var offering: Offer? {
+        if let ride, !silenced.contains(ride.id) { return .ride(ride) }
+        if let nearbyBoard, dismissedNearbyID != nearbyBoard.id {
+            return .nearby(nearbyBoard)
+        }
+        return nil
     }
 
     /// Which journey is being offered, for the things that only need to know
@@ -85,7 +108,10 @@ final class RideWatch {
         didSet {
             guard enabled != oldValue else { return }
             Settings.set(enabled, "rides.enabled")
-            if !enabled { forget() }
+            if !enabled {
+                forget()
+                clearNearby()
+            }
         }
     }
 
@@ -99,6 +125,10 @@ final class RideWatch {
     private var fixes: [RideFix] = []
     /// Journeys the passenger has said are not theirs, by swiping the bar away.
     private var silenced: Set<String> = []
+    /// A station dismissal lasts while the phone remains there. Leaving clears
+    /// it, so arriving again later is a new and useful offer.
+    private var dismissedNearbyID: String?
+    private var dismissedNearbyCoordinate: Coord?
     private var leader: String?
     private var agreements = 0
     private var misses = 0
@@ -190,6 +220,15 @@ final class RideWatch {
         }
         fixes.append(fix)
 
+        if let dismissedNearbyCoordinate,
+           Geo.flatMetres(
+               dismissedNearbyCoordinate.lon, dismissedNearbyCoordinate.lat,
+               fix.coord.lon, fix.coord.lat
+           ) > 75 {
+            dismissedNearbyID = nil
+            self.dismissedNearbyCoordinate = nil
+        }
+
         // Pruned against the newest fix rather than against the wall clock, so
         // a replayed or synthesised trail behaves the same as a live one.
         let cutoff = fix.at - RideMatching.window
@@ -197,6 +236,7 @@ final class RideWatch {
             fixes.removeAll { $0.at < cutoff }
         }
         moving = RideMatching.isRiding(fixes)
+        if moving { clearNearby() }
     }
 
     /// Ask, if it is time to and there is anything worth asking about.
@@ -218,6 +258,7 @@ final class RideWatch {
             if !fixes.isEmpty { fixes.removeAll(keepingCapacity: true) }
             if moving { moving = false }
             stillSince = nil
+            clearNearby()
             hold(fleet: fleet, clock: clock, at: moment)
             return
         }
@@ -244,12 +285,40 @@ final class RideWatch {
         }
 
         // Only against real time. The clock is a dial on this map — hand it a
-        // different number and it draws a different hour — and "which of these
-        // is the phone inside" is a question only about now.
-        guard clock.isLive || ignoresClock, moving else { return }
+        // different number and it draws a different hour — and both "which of
+        // these is the phone inside" and "where is this phone standing" are
+        // questions only about now.
+        guard clock.isLive || ignoresClock else {
+            clearNearby()
+            return
+        }
         guard moment.timeIntervalSince(askedAt) >= Self.interval else { return }
         askedAt = moment
         asking = true
+
+        if !moving {
+            // A settled ride remains the better answer while a train is at a
+            // station: stillness alone cannot distinguish dwelling aboard from
+            // having stepped onto the platform. Once the ride has genuinely
+            // ended, a tight stationary cluster may name the place instead.
+            guard ride == nil, RideMatching.isStill(fixes), let fix = fixes.last
+            else {
+                asking = false
+                if ride == nil { clearNearby(resetDismissal: false) }
+                return
+            }
+            let now = clock.nowSeconds()
+            Task { [weak self] in
+                let found = await fleet.nearbyBoard(
+                    lon: fix.coord.lon, lat: fix.coord.lat,
+                    accuracy: fix.accuracy, at: now
+                )
+                self?.settleNearby(found)
+            }
+            return
+        }
+
+        clearNearby()
 
         // The fixes are stamped in real time and the fleet is asked in the
         // clock's, which are the same thing while `isLive` holds and are still
@@ -314,6 +383,26 @@ final class RideWatch {
         forget()
     }
 
+    private func settleNearby(_ found: NearbyBoard?) {
+        asking = false
+        guard enabled, ride == nil, !moving, RideMatching.isStill(fixes)
+        else { return }
+
+        if nearbyBoard?.id != found?.id, dismissedNearbyID != found?.id {
+            dismissedNearbyID = nil
+            dismissedNearbyCoordinate = nil
+        }
+        nearbyBoard = found
+    }
+
+    private func clearNearby(resetDismissal: Bool = true) {
+        nearbyBoard = nil
+        if resetDismissal {
+            dismissedNearbyID = nil
+            dismissedNearbyCoordinate = nil
+        }
+    }
+
     /// Pushed off the bottom of the screen from the bar's own height: this is
     /// not my train, or I know, stop telling me.
     ///
@@ -321,8 +410,15 @@ final class RideWatch {
     /// bar is not this — that is the sheet returning to its floor, and the
     /// floor is still the train you are on.
     func dismiss() {
-        guard let ride else { return }
-        silenced.insert(ride.id)
+        switch offering {
+        case let .ride(ride):
+            silenced.insert(ride.id)
+        case let .nearby(board):
+            dismissedNearbyID = board.id
+            dismissedNearbyCoordinate = board.coordinate
+        case nil:
+            break
+        }
     }
 
     /// Forget the answer without forgetting the trail.
@@ -342,7 +438,10 @@ final class RideWatch {
             let held = holdingSince.map { Int(Date().timeIntervalSince($0).rounded()) } ?? 0
             return "\(ride.line) · held \(held)s"
         }
-        guard moving else { return fixes.isEmpty ? "no fix" : "still" }
+        guard moving else {
+            if let nearbyBoard { return nearbyBoard.title }
+            return fixes.isEmpty ? "no fix" : "still"
+        }
         guard let ride else {
             return leader == nil
                 ? "looking · \(Int(RideMatching.span(of: fixes).rounded()))s"

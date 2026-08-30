@@ -283,6 +283,44 @@ public enum RideMatching {
         return pace >= movingAt
     }
 
+    /// Whether the newest fixes describe a phone resting in one place.
+    ///
+    /// This is intentionally stricter than simply being "not riding". A walk
+    /// through a station and the first seconds after leaving a vehicle are both
+    /// not rides, but neither is permission to announce a stop. The recent
+    /// fixes must span several seconds, report walking speed or less, and fit
+    /// inside the uncertainty-sized circle around the newest fix.
+    public static func isStill(_ fixes: [RideFix]) -> Bool {
+        guard let last = fixes.last, last.accuracy <= 35 else { return false }
+        let recent = fixes.filter { last.at - $0.at <= 12 }
+        guard recent.count >= 4, let first = recent.first,
+              last.at - first.at >= 6
+        else { return false }
+
+        let stated = recent.compactMap { $0.speed }.filter { $0 >= 0 }
+        if !stated.isEmpty,
+           stated.reduce(0, +) / Double(stated.count) > 1.0 {
+            return false
+        }
+
+        let span = max(1, last.at - first.at)
+        let net = Geo.flatMetres(
+            first.coord.lon, first.coord.lat, last.coord.lon, last.coord.lat
+        )
+        guard net / span <= 1.1 else { return false }
+
+        // A good GPS fix should form a tight cluster; a less exact one gets
+        // room equal to its own honest uncertainty, but never enough to cover
+        // a person walking from one stop side to another.
+        let widestAccuracy = recent.map(\.accuracy).max() ?? last.accuracy
+        let radius = max(12, min(30, widestAccuracy))
+        return recent.allSatisfy {
+            Geo.flatMetres(
+                $0.coord.lon, $0.coord.lat, last.coord.lon, last.coord.lat
+            ) <= radius
+        }
+    }
+
     /// The smallest turn between two bearings, in degrees.
     public static func turn(_ a: Double, _ b: Double) -> Double {
         let raw = abs((a - b).truncatingRemainder(dividingBy: 360))

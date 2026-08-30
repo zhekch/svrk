@@ -83,6 +83,11 @@ struct TransitMap: UIViewRepresentable {
         // See `OpeningCamera`.
         let opening = model.opening
         let options = MapInitOptions(
+            // Do not leave the framebuffer scale implicit. Mapbox currently
+            // defaults this to `nativeScale`, but spelling it out guarantees
+            // that the Metal drawable is allocated at the panel's physical
+            // pixel resolution rather than at one pixel per UIKit point.
+            mapOptions: MapOptions(pixelRatio: UIScreen.main.nativeScale),
             cameraOptions: CameraOptions(
                 center: opening.coordinate,
                 zoom: opening.zoom,
@@ -2581,19 +2586,24 @@ final class MapCoordinator: NSObject {
             labels.textOpacity = .expression(
                 Exp(.subtract) { 1.0; Exp(.toNumber) { Exp(.get) { "followed" } } }
             )
-            labels.textOffset = .constant([0, -1.2])
-            labels.textAnchor = .constant(.bottom)
+            // Try the familiar position above the marker first, then use the
+            // other three sides before giving up on the label. At a station
+            // throat this keeps substantially more line numbers readable than
+            // one fixed pile directly above the dots.
+            labels.textVariableAnchor = .constant([.bottom, .top, .left, .right])
+            labels.textJustify = .constant(.auto)
+            labels.textRadialOffset = .constant(1.2)
             labels.textColor = .constant(StyleColor(UIColor.white))
             labels.textHaloColor = .constant(StyleColor(UIColor.black.withAlphaComponent(0.8)))
             labels.textHaloWidth = .constant(1.2)
-            // Constants, not data-driven. `text-allow-overlap` and
-            // `text-optional` do not take feature expressions — asking for
-            // `["get", "tunnel"]` refused the whole layer, so the line
-            // number never appeared. Always drawn: in a tunnel it *is* the
-            // train, and in the open a number over a four-coach rake is
-            // still the thing you follow.
-            labels.textAllowOverlap = .constant(true)
-            labels.textIgnorePlacement = .constant(true)
+            // Let the symbol collision index choose a readable subset in a
+            // dense cluster. The dots remain visible, so this removes only a
+            // name that could not have been read in the first place. Both
+            // flags have to be false: `allow-overlap` keeps this label from
+            // checking the index, while `ignore-placement` keeps it from
+            // reserving its box for the labels considered after it.
+            labels.textAllowOverlap = .constant(false)
+            labels.textIgnorePlacement = .constant(false)
             // Default 0 hides a label that terrain occludes — which is every
             // number on a tunnel under a hill. The body has faded; the number
             // is what is left to follow, including through the mountain.
@@ -2601,21 +2611,26 @@ final class MapCoordinator: NSObject {
             labels.textEmissiveStrength = .constant(1)
             labels.symbolZElevate = .constant(true)
             labels.minZoom = VehicleDot.labelMinZoom
-            try addLayer(labels, to: style)
 
             // And the same layer again for the one vehicle that is open, whose
             // only difference is an opacity the app turns off close in.
             var openLabel = labels
             openLabel.id = Self.openLabelLayer
             openLabel.filter = Exp(.toBoolean) { Exp(.get) { "open" } }
+            // The label a reader explicitly selected must not disappear just
+            // because the station is busy. It claims its space before the
+            // ordinary labels are considered, but never yields to a basemap
+            // label underneath the transit overlay.
+            openLabel.textAllowOverlap = .constant(true)
             openLabel.textOpacity = .constant(1)
             openLabel.textOpacityTransition = StyleTransition(
                 duration: VehicleDot.labelFadeSeconds, delay: 0
             )
             try addLayer(openLabel, to: style)
+            try addLayer(labels, to: style)
 
             // Last, and above everything: where *you* are.
-            installPuck(topmost: Self.openLabelLayer)
+            installPuck(topmost: labels.id)
 
             // And now that every layer of ours exists, put the whole overlay
             // where it belongs in somebody else's style: the ground markings

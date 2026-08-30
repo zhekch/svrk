@@ -580,16 +580,38 @@ final class AppModel {
         }
     }
 
-    /// Open the service the badge is offering, and go to it.
+    /// Open what the compact location offer is naming, and go to it.
     ///
-    /// The same selection a tap on the train would make, so everything
+    /// These are the same selections a map tap would make, so everything
     /// downstream — the panel, the highlighted route, the formation lookup —
     /// is the code that already exists rather than a second path through it.
-    /// What the badge adds is the camera: the train is somewhere under the
-    /// finger of a person who cannot see the map, and "snap to it" is the whole
-    /// difference between an answer and a hunt.
-    func openRide() {
-        guard let ride = rides.offering else { return }
+    func openOffer() {
+        guard let offer = rides.offering else { return }
+        switch offer {
+        case let .ride(ride):
+            openRide(ride)
+
+        case let .nearby(board):
+            switch board {
+            case let .station(station):
+                selection = .station(station)
+                onFocus?(board.coordinate, max(zoom, 14))
+                if station.departures.isEmpty {
+                    let now = clock.nowSeconds()
+                    Task { [weak self] in
+                        await self?.fillStationFromMirror(placeId: station.id, at: now)
+                    }
+                }
+            case let .platform(platform):
+                selection = .platform(platform)
+                onFocus?(board.coordinate, max(zoom, 14))
+            }
+        }
+    }
+
+    /// Open a service offer. The camera needs one special rule when the map is
+    /// already following it: the follower owns the centre, so only zoom here.
+    private func openRide(_ ride: RideWatch.Ride) {
         // The offer is not consumed by being taken. It stays the bar the sheet
         // stands on, so closing this panel lands back on the train rather than
         // on nothing. Only a swipe off the bottom retires it — `RideWatch`.
@@ -598,10 +620,20 @@ final class AppModel {
             guard let self,
                   let vehicle = await fleet.journey(id: ride.id, at: clock.nowSeconds())
             else { return }
+            guard case let .vehicle(selected) = selection, selected == ride.id else { return }
             // Closer than `focusOnSelection` goes for a tap. A tap already had
             // the vehicle on screen; this one may be arriving from a map
             // showing the whole country, and the train is the subject.
-            onFocus?(Coord(lon: vehicle.lon, lat: vehicle.lat), max(zoom, 15))
+            //
+            // Following owns the camera centre every display frame. Starting a
+            // second ease with a centre of its own made the train jump in front
+            // of the sheet and then spring back as those two writers alternated.
+            // Let the follower place it and animate only the independent zoom.
+            if isFollowingVehicle {
+                onZoom?(max(zoom, 15))
+            } else {
+                onFocus?(Coord(lon: vehicle.lon, lat: vehicle.lat), max(zoom, 15))
+            }
         }
     }
 
@@ -2356,11 +2388,12 @@ final class AppModel {
     /// The dot's own radius is the distance, read off the curve the layer is
     /// drawn with so the two cannot drift apart.
     ///
-    /// Nothing is thinned once a vehicle carries its line number: a dot behind
-    /// a dot is nothing, but a *number* behind a dot is a service missing from
-    /// the map. Eased out over the zoom below that rather than switched off at
-    /// it, so the dots it was holding back arrive across a pinch instead of all
-    /// in the one frame that crosses zoom 11.
+    /// Nothing is thinned once vehicles can carry line numbers. The renderer
+    /// may hide a number that has no collision-free position, but it needs the
+    /// complete set to reconsider placement as the camera moves. Eased out over
+    /// the zoom below that rather than switched off at it, so the dots it was
+    /// holding back arrive across a pinch instead of all in the one frame that
+    /// crosses zoom 11.
     private var dotSpacing: Double {
         let room = min(1, max(0, VehicleDot.labelMinZoom - zoom))
         guard room > 0 else { return 0 }
@@ -2921,6 +2954,7 @@ final class AppModel {
             guard shown > 0 else { continue }
             guard let shape = VehicleShape.footprint(
                 of: vehicle, layout: layout, metresPerPoint: metresPerPoint,
+                pixelsPerPoint: UIScreen.main.nativeScale,
                 selected: vehicle.id == selectedID,
                 ringed: vehicle.id == ringedID,
                 lateralOffset: sideways[vehicle.id] ?? 0,
@@ -3902,8 +3936,21 @@ final class AppModel {
     ) async -> [TapChoice] {
         var out: [TapChoice] = []
         var seen = Set<String>()
+        // A physical interchange can have separate official identifiers for
+        // its modes and names that differ only by punctuation: the boat landing
+        // `Spiez Schiffstation` and the bus stop `Spiez, Schiffstation`, for
+        // example. Their boards are joined by `Fleet.partOfStation`; the picker
+        // must present that joined place once as well. Platforms are excluded
+        // deliberately — two bays with the same station name remain two things
+        // somebody may need to choose between.
+        var stationNames: [String] = []
         func add(_ choice: TapChoice) {
             guard seen.insert(choice.id).inserted else { return }
+            if case let .station(board) = choice.selection {
+                guard !stationNames.contains(where: { Self.sameStop($0, board.name) })
+                else { return }
+                stationNames.append(board.name)
+            }
             out.append(choice)
         }
 
