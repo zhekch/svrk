@@ -2717,6 +2717,11 @@ final class MapCoordinator: NSObject {
                 guard !style.sourceExists(withId: id) else { continue }
                 var source = GeoJSONSource(id: id)
                 source.data = .featureCollection(FeatureCollection(features: []))
+                // Route progress and line trimming are measured over the
+                // whole LineString. Without line metrics Mapbox trims each
+                // tile's copy independently, making the travelled dots start
+                // over at every tile boundary.
+                if id == ID.route { source.lineMetrics = true }
                 try style.addSource(source)
             }
 
@@ -2806,8 +2811,12 @@ final class MapCoordinator: NSObject {
             RailwayShapes.setVisible(style, model.showRailwayShapes)
 
             // The route next, so it lies under the markers rather than over
-            // them. Two layers over one source, split on `exact`: solid where
-            // the line follows mapped track, dashed where it is a guess.
+            // them. An unoccupied line is split on `exact`: solid where it
+            // follows mapped track, dashed where it is a guess. A vehicle's
+            // own route is instead split at the vehicle: dots behind it and a
+            // solid line ahead. Both progress layers use the same full-length
+            // feature, so changing the trim is a cheap style write rather than
+            // new GeoJSON and a retessellation on every position tick.
             //
             // The web app drew one style for a whole journey, chosen by where
             // *most* of its geometry came from — so a night train with real
@@ -2823,7 +2832,10 @@ final class MapCoordinator: NSObject {
             try addLayer(glow, to: style)
 
             var solid = LineLayer(id: "\(ID.route)-solid", source: ID.route)
-            solid.filter = Exp(.get) { "exact" }
+            solid.filter = Exp(.all) {
+                Exp(.not) { Exp(.get) { "progress" } }
+                Exp(.get) { "exact" }
+            }
             solid.lineColor = .constant(StyleColor(UIColor.white))
             solid.lineWidth = .expression(Exp(.interpolate) { Exp(.linear); Exp(.zoom); 8; 1.6; 16; 5.0 })
             solid.lineCap = .constant(.round)
@@ -2831,12 +2843,34 @@ final class MapCoordinator: NSObject {
             try addLayer(solid, to: style)
 
             var dashed = LineLayer(id: "\(ID.route)-dashed", source: ID.route)
-            dashed.filter = Exp(.not) { Exp(.get) { "exact" } }
+            dashed.filter = Exp(.all) {
+                Exp(.not) { Exp(.get) { "progress" } }
+                Exp(.not) { Exp(.get) { "exact" } }
+            }
             dashed.lineColor = .constant(StyleColor(UIColor.white))
             dashed.lineOpacity = .constant(0.75)
             dashed.lineWidth = .expression(Exp(.interpolate) { Exp(.linear); Exp(.zoom); 8; 1.4; 16; 4.0 })
             dashed.lineDasharray = .constant([1.5, 1.5])
             try addLayer(dashed, to: style)
+
+            var ahead = LineLayer(id: "\(ID.route)-ahead", source: ID.route)
+            ahead.filter = Exp(.get) { "progress" }
+            ahead.lineColor = .constant(StyleColor(UIColor.white))
+            ahead.lineWidth = .expression(Exp(.interpolate) { Exp(.linear); Exp(.zoom); 8; 1.6; 16; 5.0 })
+            ahead.lineCap = .constant(.round)
+            ahead.lineJoin = .constant(.round)
+            try addLayer(ahead, to: style)
+
+            var travelled = LineLayer(id: "\(ID.route)-travelled", source: ID.route)
+            travelled.filter = Exp(.get) { "progress" }
+            travelled.lineColor = .constant(StyleColor(UIColor.white))
+            travelled.lineOpacity = .constant(0.78)
+            travelled.lineWidth = .expression(Exp(.interpolate) { Exp(.linear); Exp(.zoom); 8; 1.4; 16; 4.0 })
+            // A very short round-capped dash reads as a dot at every zoom.
+            travelled.lineCap = .constant(.round)
+            travelled.lineJoin = .constant(.round)
+            travelled.lineDasharray = .constant([0.1, 1.8])
+            try addLayer(travelled, to: style)
 
             var routeStops = CircleLayer(id: ID.routeStops, source: ID.routeStops)
             routeStops.circleRadius = .expression(Exp(.interpolate) { Exp(.linear); Exp(.zoom); 10; 2.0; 16; 4.5 })
@@ -3239,6 +3273,10 @@ final class MapCoordinator: NSObject {
         drawnTrackOpacity = -1
         drawnHighContrast = nil
         drawnRouteRevision = -1
+        drawnRouteUsesProgress = nil
+        drawnRouteProgress = -1
+        routeCumulativeDistance = []
+        routeTotalDistance = 0
         drawnPlateRevision = -1
         drawnShapesVisible = nil
         drewVehicleShapes = false
@@ -4787,8 +4825,14 @@ final class MapCoordinator: NSObject {
     /// Whether ORM's own lines are the ones currently visible.
     private var drawnHighContrast: Bool?
     /// The selected route does not change as its marker moves. Re-uploading it
-    /// every live tick makes Mapbox retessellate the white line visibly.
+    /// every live tick makes Mapbox retessellate the white line visibly. Only
+    /// the two layer trims move; `drawnRouteProgress` guards those style writes.
     private var drawnRouteRevision = -1
+    private var drawnRouteUsesProgress: Bool?
+    private var drawnRouteProgress = -1.0
+    /// Distance at each path vertex, computed only when the route changes.
+    private var routeCumulativeDistance: [Double] = []
+    private var routeTotalDistance = 0.0
 
     private func drawTracks(_ style: MapboxMap) {
         if model.trackOpacity != drawnTrackOpacity {
@@ -4826,34 +4870,62 @@ final class MapCoordinator: NSObject {
         )
     }
 
-    /// The drawn line, cut into runs of equal confidence.
+    /// The drawn line, cut into runs of equal confidence when it is not the
+    /// route of a selected vehicle. A vehicle route stays one LineString so its
+    /// travelled and remaining halves can be moved with `line-trim-offset`.
     ///
     /// Runs are emitted with their shared vertex in both, so there is no gap at
     /// the seam where the style changes.
     private func drawRoute(_ style: MapboxMap) {
-        guard drawnRouteRevision != model.selectedGeometryRevision else { return }
-        drawnRouteRevision = model.selectedGeometryRevision
-
         guard let geometry = model.selectedGeometry, geometry.path.count > 1 else {
-            style.updateGeoJSONSource(
-                withId: ID.route, geoJSON: .featureCollection(FeatureCollection(features: []))
-            )
-            style.updateGeoJSONSource(
-                withId: ID.routeStops, geoJSON: .featureCollection(FeatureCollection(features: []))
-            )
+            if drawnRouteRevision != model.selectedGeometryRevision || drawnRouteUsesProgress != nil {
+                drawnRouteRevision = model.selectedGeometryRevision
+                drawnRouteUsesProgress = nil
+                drawnRouteProgress = -1
+                routeCumulativeDistance = []
+                routeTotalDistance = 0
+                style.updateGeoJSONSource(
+                    withId: ID.route, geoJSON: .featureCollection(FeatureCollection(features: []))
+                )
+                style.updateGeoJSONSource(
+                    withId: ID.routeStops, geoJSON: .featureCollection(FeatureCollection(features: []))
+                )
+            }
             return
         }
+
+        let usesProgress: Bool
+        if case .vehicle = model.selection { usesProgress = true }
+        else { usesProgress = false }
+
+        // The route geometry is static; the trim is not. Keep advancing it on
+        // every model frame even when the source itself needs no work.
+        let sourceChanged = drawnRouteRevision != model.selectedGeometryRevision
+            || drawnRouteUsesProgress != usesProgress
+        guard sourceChanged else {
+            if usesProgress { updateRouteProgress(style, geometry: geometry) }
+            return
+        }
+        drawnRouteRevision = model.selectedGeometryRevision
+        drawnRouteUsesProgress = usesProgress
+        drawnRouteProgress = -1
 
         var features: [Feature] = []
         let legs = geometry.legs
         let sources = geometry.legSources
 
+        if usesProgress {
+            // One feature is essential here: line trim is a fraction of each
+            // feature, so confidence runs would each grow their own travelled
+            // section instead of sharing one cutoff at the vehicle.
+            features.append(runFeature(geometry.path, exact: true, progress: true))
+            measureRoute(geometry.path)
         // `!sources.isEmpty` as well as the length check, because the two agree
         // on a one-stop geometry — no legs, no sources — and the loop below
         // then has nothing to iterate and draws nothing at all. A line whose
         // confidence is not recorded per leg is drawn whole, which is what the
         // else branch is for.
-        if !sources.isEmpty, sources.count == legs.count - 1 {
+        } else if !sources.isEmpty, sources.count == legs.count - 1 {
             var start = 0
             for leg in sources.indices {
                 let exact = sources[leg] != .chord
@@ -4868,6 +4940,11 @@ final class MapCoordinator: NSObject {
             }
         } else {
             features.append(runFeature(geometry.path, exact: geometry.source == .osmRoute))
+        }
+
+        if !usesProgress {
+            routeCumulativeDistance = []
+            routeTotalDistance = 0
         }
 
         // The other half of a splitting train, from where the two part company.
@@ -4903,14 +4980,74 @@ final class MapCoordinator: NSObject {
             withId: ID.routeStops,
             geoJSON: .featureCollection(FeatureCollection(features: stopFeatures))
         )
+
+        if usesProgress { updateRouteProgress(style, geometry: geometry) }
     }
 
-    private func runFeature(_ points: [Coord], exact: Bool) -> Feature {
+    private func runFeature(_ points: [Coord], exact: Bool, progress: Bool = false) -> Feature {
         var feature = Feature(geometry: .lineString(LineString(
             points.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
         )))
-        feature.properties = ["exact": .boolean(exact)]
+        feature.properties = [
+            "exact": .boolean(exact),
+            "progress": .boolean(progress),
+        ]
         return feature
+    }
+
+    private func measureRoute(_ path: [Coord]) {
+        routeCumulativeDistance = [0]
+        routeCumulativeDistance.reserveCapacity(path.count)
+        for index in 1..<path.count {
+            routeCumulativeDistance.append(
+                routeCumulativeDistance[index - 1] + Geo.metres(path[index - 1], path[index])
+            )
+        }
+        routeTotalDistance = routeCumulativeDistance.last ?? 0
+    }
+
+    /// Move the seam between the dotted past and solid future to the selected
+    /// vehicle. `index` identifies the leg even on a route that doubles back;
+    /// `progress` is distance through that leg, the same fraction positioning
+    /// used to place the marker.
+    private func updateRouteProgress(_ style: MapboxMap, geometry: JourneyGeometry) {
+        guard case let .vehicle(id) = model.selection else { return }
+        let vehicle = model.departingVehicle
+            ?? model.vehicles.first(where: { $0.id == id })
+            ?? (model.selectedVehicle?.id == id ? model.selectedVehicle : nil)
+
+        var progress = 0.0
+        if let vehicle,
+           routeTotalDistance > 0,
+           routeCumulativeDistance.count == geometry.path.count,
+           !geometry.legs.isEmpty {
+            let leg = min(max(0, vehicle.index), geometry.legs.count - 1)
+            let start = geometry.legs[leg]
+            if start >= 0, start < routeCumulativeDistance.count {
+                var travelled = routeCumulativeDistance[start]
+                if leg + 1 < geometry.legs.count {
+                    let end = geometry.legs[leg + 1]
+                    if end > start, end < routeCumulativeDistance.count {
+                        let throughLeg = min(1, max(0, vehicle.progress))
+                        travelled += (routeCumulativeDistance[end]
+                            - routeCumulativeDistance[start]) * throughLeg
+                    }
+                }
+                progress = min(1, max(0, travelled / routeTotalDistance))
+            }
+        }
+
+        guard abs(progress - drawnRouteProgress) > 0.000_001 else { return }
+        drawnRouteProgress = progress
+        // The interval inside line-trim-offset is transparent. The solid layer
+        // hides its start; the dotted layer hides its end, leaving one clean
+        // seam and no overlapping strokes beneath the dots.
+        try? style.setLayerProperty(
+            for: "\(ID.route)-ahead", property: "line-trim-offset", value: [0, progress]
+        )
+        try? style.setLayerProperty(
+            for: "\(ID.route)-travelled", property: "line-trim-offset", value: [progress, 1]
+        )
     }
 }
 

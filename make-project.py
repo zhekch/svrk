@@ -16,8 +16,11 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 APP = "SwissTransit"
+WATCH_APP = "SwissTransitWatch"
+WATCH_TARGET = "SwissTransit Watch App"
 BUNDLE_ID = "com.kexts.swisstransit"
 DEPLOYMENT = "17.0"
+WATCH_DEPLOYMENT = "10.0"
 
 
 def oid(key: str) -> str:
@@ -25,9 +28,9 @@ def oid(key: str) -> str:
     return hashlib.md5(key.encode()).hexdigest()[:24].upper()
 
 
-def swift_sources() -> list[str]:
+def swift_sources(directory: str) -> list[str]:
     found = []
-    for base, dirs, files in os.walk(os.path.join(ROOT, APP)):
+    for base, dirs, files in os.walk(os.path.join(ROOT, directory)):
         dirs[:] = [d for d in dirs if d != "Resources"]
         for name in sorted(files):
             if name.endswith(".swift"):
@@ -35,8 +38,23 @@ def swift_sources() -> list[str]:
     return sorted(found)
 
 
-SOURCES = swift_sources()
-if not SOURCES:
+IOS_SOURCES = swift_sources(APP)
+# Only the packed-file reader is shared with the phone. Compile these six
+# dependency-free files directly into the watch executable instead of linking
+# the full TransitCore package, whose formation, disruption, geometry and
+# vehicle-model services have no place on a watch.
+WATCH_CORE_ROOT = "Packages/TransitCore/Sources/TransitCore"
+WATCH_CORE_SOURCES = [
+    f"{WATCH_CORE_ROOT}/BinaryFormat.swift",
+    f"{WATCH_CORE_ROOT}/Categories.swift",
+    f"{WATCH_CORE_ROOT}/Geo.swift",
+    f"{WATCH_CORE_ROOT}/Models.swift",
+    f"{WATCH_CORE_ROOT}/StopRegister.swift",
+    f"{WATCH_CORE_ROOT}/TimetableStore.swift",
+]
+WATCH_SOURCES = sorted(swift_sources(WATCH_APP) + WATCH_CORE_SOURCES)
+ALL_SOURCES = sorted(set(IOS_SOURCES + WATCH_SOURCES))
+if not IOS_SOURCES:
     sys.exit("no Swift sources found")
 
 # Resources: the packed data as a folder reference (so it lands as Data/ in the
@@ -57,6 +75,7 @@ PACKAGES = [
     ("TransitCore", "Packages/TransitCore"),
     ("MapboxMaps", "Vendor/mapbox-maps-ios"),
 ]
+WATCH_PACKAGES = []
 
 out = []
 w = out.append
@@ -65,13 +84,16 @@ w("// !$*UTF8*$!")
 w("{")
 w("\tarchiveVersion = 1;")
 w("\tclasses = {};")
-w("\tobjectVersion = 56;")
+w("\tobjectVersion = 60;")
 w("\tobjects = {")
 
 # ---------------------------------------------------------------- build files
 w("\n/* Begin PBXBuildFile section */")
-for path in SOURCES:
+for path in IOS_SOURCES:
     w(f"\t\t{oid('bf:' + path)} /* {os.path.basename(path)} in Sources */ = "
+      f"{{isa = PBXBuildFile; fileRef = {oid('fr:' + path)} /* {os.path.basename(path)} */; }};")
+for path in WATCH_SOURCES:
+    w(f"\t\t{oid('bf:watch:' + path)} /* {os.path.basename(path)} in Sources */ = "
       f"{{isa = PBXBuildFile; fileRef = {oid('fr:' + path)} /* {os.path.basename(path)} */; }};")
 for path, _ in RESOURCES:
     w(f"\t\t{oid('bf:' + path)} /* {os.path.basename(path)} in Resources */ = "
@@ -79,13 +101,22 @@ for path, _ in RESOURCES:
 for product, _ in PACKAGES:
     w(f"\t\t{oid('bf:pkg:' + product)} /* {product} in Frameworks */ = "
       f"{{isa = PBXBuildFile; productRef = {oid('prod:' + product)} /* {product} */; }};")
+for product in WATCH_PACKAGES:
+    w(f"\t\t{oid('bf:watch:pkg:' + product)} /* {product} in Frameworks */ = "
+      f"{{isa = PBXBuildFile; productRef = {oid('prod:' + product)} /* {product} */; }};")
+w(f"\t\t{oid('bf:embed:watch')} /* {WATCH_TARGET}.app in Embed Watch Content */ = "
+  f"{{isa = PBXBuildFile; fileRef = {oid('product:watch')} /* {WATCH_TARGET}.app */; "
+  "settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };")
 w("/* End PBXBuildFile section */")
 
 # ------------------------------------------------------------ file references
 w("\n/* Begin PBXFileReference section */")
 w(f"\t\t{oid('product')} /* {APP}.app */ = {{isa = PBXFileReference; explicitFileType = "
   f'wrapper.application; includeInIndex = 0; path = "{APP}.app"; sourceTree = BUILT_PRODUCTS_DIR; }};')
-for path in SOURCES:
+w(f"\t\t{oid('product:watch')} /* {WATCH_TARGET}.app */ = {{isa = PBXFileReference; "
+  f'explicitFileType = wrapper.application; includeInIndex = 0; path = "{WATCH_TARGET}.app"; '
+  'sourceTree = BUILT_PRODUCTS_DIR; };')
+for path in ALL_SOURCES:
     w(f"\t\t{oid('fr:' + path)} /* {os.path.basename(path)} */ = {{isa = PBXFileReference; "
       f"lastKnownFileType = sourcecode.swift; path = {os.path.basename(path)}; sourceTree = \"<group>\"; }};")
 for path, kind in RESOURCES:
@@ -96,7 +127,7 @@ w("/* End PBXFileReference section */")
 
 # -------------------------------------------------------------------- groups
 by_dir: dict[str, list[str]] = {}
-for path in SOURCES:
+for path in ALL_SOURCES:
     by_dir.setdefault(os.path.dirname(path), []).append(path)
 for path, _ in RESOURCES:
     by_dir.setdefault(os.path.dirname(path), []).append(path)
@@ -104,8 +135,12 @@ for path, _ in RESOURCES:
 w("\n/* Begin PBXGroup section */")
 
 # Root.
-children = [f"\t\t\t\t{oid('group:' + APP)} /* {APP} */,",
-            f"\t\t\t\t{oid('group:products')} /* Products */,"]
+children = [
+    f"\t\t\t\t{oid('group:' + APP)} /* {APP} */,",
+    f"\t\t\t\t{oid('group:' + WATCH_APP)} /* {WATCH_APP} */,",
+    f"\t\t\t\t{oid('group:watch-core')} /* Watch Archive Core */,",
+    f"\t\t\t\t{oid('group:products')} /* Products */,",
+]
 w(f"\t\t{oid('group:root')} = {{")
 w("\t\t\tisa = PBXGroup;")
 w("\t\t\tchildren = (")
@@ -118,35 +153,50 @@ w(f"\t\t{oid('group:products')} /* Products */ = {{")
 w("\t\t\tisa = PBXGroup;")
 w("\t\t\tchildren = (")
 w(f"\t\t\t\t{oid('product')} /* {APP}.app */,")
+w(f"\t\t\t\t{oid('product:watch')} /* {WATCH_TARGET}.app */,")
 w("\t\t\t);")
 w("\t\t\tname = Products;")
 w("\t\t\tsourceTree = \"<group>\";")
 w("\t\t};")
 
-# One group per directory under the app.
-subdirs = sorted({d for d in by_dir if d != APP})
-w(f"\t\t{oid('group:' + APP)} /* {APP} */ = {{")
+w(f"\t\t{oid('group:watch-core')} /* Watch Archive Core */ = {{")
 w("\t\t\tisa = PBXGroup;")
 w("\t\t\tchildren = (")
-for d in subdirs:
-    w(f"\t\t\t\t{oid('group:' + d)} /* {os.path.basename(d)} */,")
-for path in sorted(by_dir.get(APP, [])):
+for path in WATCH_CORE_SOURCES:
     w(f"\t\t\t\t{oid('fr:' + path)} /* {os.path.basename(path)} */,")
 w("\t\t\t);")
-w(f"\t\t\tpath = {APP};")
+w(f"\t\t\tpath = {WATCH_CORE_ROOT};")
 w("\t\t\tsourceTree = \"<group>\";")
 w("\t\t};")
 
-for d in subdirs:
-    w(f"\t\t{oid('group:' + d)} /* {os.path.basename(d)} */ = {{")
+# One group per directory under each application source root.
+for source_root in (APP, WATCH_APP):
+    subdirs = sorted(
+        d for d in by_dir
+        if d != source_root and d.startswith(source_root + os.sep)
+    )
+    w(f"\t\t{oid('group:' + source_root)} /* {source_root} */ = {{")
     w("\t\t\tisa = PBXGroup;")
     w("\t\t\tchildren = (")
-    for path in sorted(by_dir[d]):
+    for d in subdirs:
+        w(f"\t\t\t\t{oid('group:' + d)} /* {os.path.basename(d)} */,")
+    for path in sorted(by_dir.get(source_root, [])):
         w(f"\t\t\t\t{oid('fr:' + path)} /* {os.path.basename(path)} */,")
     w("\t\t\t);")
-    w(f"\t\t\tpath = {os.path.basename(d)};")
+    w(f"\t\t\tpath = {source_root};")
     w("\t\t\tsourceTree = \"<group>\";")
     w("\t\t};")
+
+    for d in subdirs:
+        w(f"\t\t{oid('group:' + d)} /* {os.path.basename(d)} */ = {{")
+        w("\t\t\tisa = PBXGroup;")
+        w("\t\t\tchildren = (")
+        for path in sorted(by_dir[d]):
+            w(f"\t\t\t\t{oid('fr:' + path)} /* {os.path.basename(path)} */,")
+        w("\t\t\t);")
+        w(f"\t\t\tpath = {os.path.basename(d)};")
+        w("\t\t\tsourceTree = \"<group>\";")
+        w("\t\t};")
 w("/* End PBXGroup section */")
 
 # ------------------------------------------------------------- build phases
@@ -155,8 +205,17 @@ w(f"\t\t{oid('phase:sources')} /* Sources */ = {{")
 w("\t\t\tisa = PBXSourcesBuildPhase;")
 w("\t\t\tbuildActionMask = 2147483647;")
 w("\t\t\tfiles = (")
-for path in SOURCES:
+for path in IOS_SOURCES:
     w(f"\t\t\t\t{oid('bf:' + path)} /* {os.path.basename(path)} in Sources */,")
+w("\t\t\t);")
+w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
+w("\t\t};")
+w(f"\t\t{oid('phase:watch:sources')} /* Sources */ = {{")
+w("\t\t\tisa = PBXSourcesBuildPhase;")
+w("\t\t\tbuildActionMask = 2147483647;")
+w("\t\t\tfiles = (")
+for path in WATCH_SOURCES:
+    w(f"\t\t\t\t{oid('bf:watch:' + path)} /* {os.path.basename(path)} in Sources */,")
 w("\t\t\t);")
 w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
 w("\t\t};")
@@ -172,6 +231,13 @@ for path, _ in RESOURCES:
 w("\t\t\t);")
 w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
 w("\t\t};")
+w(f"\t\t{oid('phase:watch:resources')} /* Resources */ = {{")
+w("\t\t\tisa = PBXResourcesBuildPhase;")
+w("\t\t\tbuildActionMask = 2147483647;")
+w("\t\t\tfiles = (")
+w("\t\t\t);")
+w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
+w("\t\t};")
 w("/* End PBXResourcesBuildPhase section */")
 
 w("\n/* Begin PBXFrameworksBuildPhase section */")
@@ -184,7 +250,42 @@ for product, _ in PACKAGES:
 w("\t\t\t);")
 w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
 w("\t\t};")
+w(f"\t\t{oid('phase:watch:frameworks')} /* Frameworks */ = {{")
+w("\t\t\tisa = PBXFrameworksBuildPhase;")
+w("\t\t\tbuildActionMask = 2147483647;")
+w("\t\t\tfiles = (")
+for product in WATCH_PACKAGES:
+    w(f"\t\t\t\t{oid('bf:watch:pkg:' + product)} /* {product} in Frameworks */,")
+w("\t\t\t);")
+w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
+w("\t\t};")
 w("/* End PBXFrameworksBuildPhase section */")
+
+# The companion app owns installation. Its Watch/ directory contains this
+# product, and the target dependency makes sure that product exists first.
+w("\n/* Begin PBXContainerItemProxy section */")
+w(f"\t\t{oid('proxy:watch')} /* PBXContainerItemProxy */ = {{")
+w("\t\t\tisa = PBXContainerItemProxy;")
+w(f"\t\t\tcontainerPortal = {oid('project')} /* Project object */;")
+w("\t\t\tproxyType = 1;")
+w(f"\t\t\tremoteGlobalIDString = {oid('target:watch')};")
+w(f"\t\t\tremoteInfo = \"{WATCH_TARGET}\";")
+w("\t\t};")
+w("/* End PBXContainerItemProxy section */")
+
+w("\n/* Begin PBXCopyFilesBuildPhase section */")
+w(f"\t\t{oid('phase:embed:watch')} /* Embed Watch Content */ = {{")
+w("\t\t\tisa = PBXCopyFilesBuildPhase;")
+w("\t\t\tbuildActionMask = 2147483647;")
+w("\t\t\tdstPath = \"$(CONTENTS_FOLDER_PATH)/Watch\";")
+w("\t\t\tdstSubfolderSpec = 16;")
+w("\t\t\tfiles = (")
+w(f"\t\t\t\t{oid('bf:embed:watch')} /* {WATCH_TARGET}.app in Embed Watch Content */,")
+w("\t\t\t);")
+w("\t\t\tname = \"Embed Watch Content\";")
+w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
+w("\t\t};")
+w("/* End PBXCopyFilesBuildPhase section */")
 
 # -------------------------------------------------------------------- target
 w("\n/* Begin PBXNativeTarget section */")
@@ -195,9 +296,12 @@ w("\t\t\tbuildPhases = (")
 w(f"\t\t\t\t{oid('phase:sources')} /* Sources */,")
 w(f"\t\t\t\t{oid('phase:frameworks')} /* Frameworks */,")
 w(f"\t\t\t\t{oid('phase:resources')} /* Resources */,")
+w(f"\t\t\t\t{oid('phase:embed:watch')} /* Embed Watch Content */,")
 w("\t\t\t);")
 w("\t\t\tbuildRules = ();")
-w("\t\t\tdependencies = ();")
+w("\t\t\tdependencies = (")
+w(f"\t\t\t\t{oid('dependency:watch')} /* PBXTargetDependency */,")
+w("\t\t\t);")
 w(f"\t\t\tname = {APP};")
 w("\t\t\tpackageProductDependencies = (")
 for product, _ in PACKAGES:
@@ -207,7 +311,34 @@ w(f"\t\t\tproductName = {APP};")
 w(f"\t\t\tproductReference = {oid('product')} /* {APP}.app */;")
 w("\t\t\tproductType = \"com.apple.product-type.application\";")
 w("\t\t};")
+w(f"\t\t{oid('target:watch')} /* {WATCH_TARGET} */ = {{")
+w("\t\t\tisa = PBXNativeTarget;")
+w(f"\t\t\tbuildConfigurationList = {oid('conflist:watch')};")
+w("\t\t\tbuildPhases = (")
+w(f"\t\t\t\t{oid('phase:watch:sources')} /* Sources */,")
+w(f"\t\t\t\t{oid('phase:watch:frameworks')} /* Frameworks */,")
+w(f"\t\t\t\t{oid('phase:watch:resources')} /* Resources */,")
+w("\t\t\t);")
+w("\t\t\tbuildRules = ();")
+w("\t\t\tdependencies = ();")
+w(f"\t\t\tname = \"{WATCH_TARGET}\";")
+w("\t\t\tpackageProductDependencies = (")
+for product in WATCH_PACKAGES:
+    w(f"\t\t\t\t{oid('prod:' + product)} /* {product} */,")
+w("\t\t\t);")
+w(f"\t\t\tproductName = \"{WATCH_TARGET}\";")
+w(f"\t\t\tproductReference = {oid('product:watch')} /* {WATCH_TARGET}.app */;")
+w("\t\t\tproductType = \"com.apple.product-type.application\";")
+w("\t\t};")
 w("/* End PBXNativeTarget section */")
+
+w("\n/* Begin PBXTargetDependency section */")
+w(f"\t\t{oid('dependency:watch')} /* PBXTargetDependency */ = {{")
+w("\t\t\tisa = PBXTargetDependency;")
+w(f"\t\t\ttarget = {oid('target:watch')} /* {WATCH_TARGET} */;")
+w(f"\t\t\ttargetProxy = {oid('proxy:watch')} /* PBXContainerItemProxy */;")
+w("\t\t};")
+w("/* End PBXTargetDependency section */")
 
 # ------------------------------------------------------------------- project
 w("\n/* Begin PBXProject section */")
@@ -219,9 +350,11 @@ w("\t\t\t\tLastSwiftUpdateCheck = 2700;")
 w("\t\t\t\tLastUpgradeCheck = 2700;")
 w("\t\t\t\tTargetAttributes = {")
 w(f"\t\t\t\t\t{oid('target')} = {{ CreatedOnToolsVersion = 27.0; }};")
+w(f"\t\t\t\t\t{oid('target:watch')} = {{ CreatedOnToolsVersion = 27.0; }};")
 w("\t\t\t\t};")
 w("\t\t\t};")
 w(f"\t\t\tbuildConfigurationList = {oid('conflist:project')};")
+w("\t\t\tcompatibilityVersion = \"Xcode 14.0\";")
 w("\t\t\tdevelopmentRegion = en;")
 w("\t\t\thasScannedForEncodings = 0;")
 w("\t\t\tknownRegions = ( en, Base );")
@@ -235,6 +368,7 @@ w("\t\t\tprojectDirPath = \"\";")
 w("\t\t\tprojectRoot = \"\";")
 w("\t\t\ttargets = (")
 w(f"\t\t\t\t{oid('target')} /* {APP} */,")
+w(f"\t\t\t\t{oid('target:watch')} /* {WATCH_TARGET} */,")
 w("\t\t\t);")
 w("\t\t};")
 w("/* End PBXProject section */")
@@ -288,6 +422,7 @@ TARGET_SETTINGS = {
     "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
     "CODE_SIGN_STYLE": "Automatic",
     "CURRENT_PROJECT_VERSION": "6",
+    "DEVELOPMENT_TEAM": "K83N2TZ5G3",
     "GENERATE_INFOPLIST_FILE": "YES",
     "INFOPLIST_KEY_UIApplicationSceneManifest_Generation": "YES",
     "INFOPLIST_KEY_UILaunchScreen_Generation": "YES",
@@ -308,6 +443,30 @@ TARGET_SETTINGS = {
     "SWIFT_EMIT_LOC_STRINGS": "YES",
     "TARGETED_DEVICE_FAMILY": '"1,2"',
 }
+WATCH_TARGET_SETTINGS = {
+    "CODE_SIGN_STYLE": "Automatic",
+    "CURRENT_PROJECT_VERSION": "6",
+    "DEVELOPMENT_TEAM": "K83N2TZ5G3",
+    "ENABLE_PREVIEWS": "YES",
+    "GENERATE_INFOPLIST_FILE": "YES",
+    "INFOPLIST_KEY_CFBundleDisplayName": APP,
+    "INFOPLIST_KEY_NSLocationWhenInUseUsageDescription":
+        '"Uses one foreground location fix to show nearby transit vehicles. '
+        'Location is not tracked in the background."',
+    "INFOPLIST_KEY_UISupportedInterfaceOrientations":
+        '"UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown"',
+    "INFOPLIST_KEY_WKCompanionAppBundleIdentifier": BUNDLE_ID,
+    "INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp": "YES",
+    "LD_RUNPATH_SEARCH_PATHS": '"$(inherited) @executable_path/Frameworks"',
+    "MARKETING_VERSION": "1.0.5",
+    "PRODUCT_BUNDLE_IDENTIFIER": f"{BUNDLE_ID}.watchkitapp",
+    "PRODUCT_NAME": '"$(TARGET_NAME)"',
+    "SDKROOT": "watchos",
+    "SKIP_INSTALL": "YES",
+    "SWIFT_EMIT_LOC_STRINGS": "YES",
+    "TARGETED_DEVICE_FAMILY": "4",
+    "WATCHOS_DEPLOYMENT_TARGET": WATCH_DEPLOYMENT,
+}
 
 def config(key, name, settings):
     w(f"\t\t{oid(key)} /* {name} */ = {{")
@@ -324,6 +483,8 @@ config("conf:project:debug", "Debug", {**PROJECT_SETTINGS, **DEBUG_ONLY})
 config("conf:project:release", "Release", {**PROJECT_SETTINGS, **RELEASE_ONLY})
 config("conf:target:debug", "Debug", TARGET_SETTINGS)
 config("conf:target:release", "Release", TARGET_SETTINGS)
+config("conf:watch:debug", "Debug", WATCH_TARGET_SETTINGS)
+config("conf:watch:release", "Release", WATCH_TARGET_SETTINGS)
 w("/* End XCBuildConfiguration section */")
 
 def conflist(key, debug, release, name):
@@ -340,6 +501,10 @@ def conflist(key, debug, release, name):
 w("\n/* Begin XCConfigurationList section */")
 conflist("conflist:project", "conf:project:debug", "conf:project:release", "PBXProject")
 conflist("conflist:target", "conf:target:debug", "conf:target:release", "PBXNativeTarget")
+conflist(
+    "conflist:watch", "conf:watch:debug", "conf:watch:release",
+    f'PBXNativeTarget "{WATCH_TARGET}"'
+)
 w("/* End XCConfigurationList section */")
 
 w("\t};")
@@ -370,6 +535,8 @@ with open(os.path.join(schemes, f"{APP}.xcscheme"), "w") as handle:
          </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
+   <TestAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv = "YES" shouldAutocreateTestPlan = "YES">
+   </TestAction>
    <LaunchAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" launchStyle = "0" useCustomWorkingDirectory = "NO" ignoresPersistentStateOnLaunch = "NO" debugDocumentVersioning = "YES" debugServiceExtension = "internal" allowLocationSimulation = "YES">
       <BuildableProductRunnable runnableDebuggingMode = "0">
          <BuildableReference
@@ -388,5 +555,54 @@ with open(os.path.join(schemes, f"{APP}.xcscheme"), "w") as handle:
 </Scheme>
 """)
 
+with open(os.path.join(schemes, f"{WATCH_TARGET}.xcscheme"), "w") as handle:
+    handle.write(f"""<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="2700" version="1.7">
+   <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
+      <BuildActionEntries>
+         <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">
+            <BuildableReference
+               BuildableIdentifier="primary"
+               BlueprintIdentifier="{oid('target:watch')}"
+               BuildableName="{WATCH_TARGET}.app"
+               BlueprintName="{WATCH_TARGET}"
+               ReferencedContainer="container:{APP}.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <TestAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.DebuggerFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv="YES" shouldAutocreateTestPlan="YES">
+   </TestAction>
+   <LaunchAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.DebuggerFoundation.Launcher.LLDB" launchStyle="0" useCustomWorkingDirectory="NO" ignoresPersistentStateOnLaunch="NO" debugDocumentVersioning="YES" debugServiceExtension="internal" allowLocationSimulation="YES">
+      <BuildableProductRunnable runnableDebuggingMode="0">
+         <BuildableReference
+            BuildableIdentifier="primary"
+            BlueprintIdentifier="{oid('target:watch')}"
+            BuildableName="{WATCH_TARGET}.app"
+            BlueprintName="{WATCH_TARGET}"
+            ReferencedContainer="container:{APP}.xcodeproj">
+         </BuildableReference>
+      </BuildableProductRunnable>
+   </LaunchAction>
+   <ProfileAction buildConfiguration="Release" shouldUseLaunchSchemeArgsEnv="YES" savedToolIdentifier="" useCustomWorkingDirectory="NO" debugDocumentVersioning="YES">
+      <BuildableProductRunnable runnableDebuggingMode="0">
+         <BuildableReference
+            BuildableIdentifier="primary"
+            BlueprintIdentifier="{oid('target:watch')}"
+            BuildableName="{WATCH_TARGET}.app"
+            BlueprintName="{WATCH_TARGET}"
+            ReferencedContainer="container:{APP}.xcodeproj">
+         </BuildableReference>
+      </BuildableProductRunnable>
+   </ProfileAction>
+   <AnalyzeAction buildConfiguration="Debug"></AnalyzeAction>
+   <ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"></ArchiveAction>
+</Scheme>
+""")
+
 print(f"wrote {project_dir}")
-print(f"  {len(SOURCES)} Swift sources, {len(RESOURCES)} resources, {len(PACKAGES)} packages")
+print(f"  iOS: {len(IOS_SOURCES)} Swift sources, {len(RESOURCES)} resources, {len(PACKAGES)} packages")
+print(
+    f"  watchOS: {len(WATCH_SOURCES)} Swift sources, 0 resources, "
+    f"{len(WATCH_PACKAGES)} packages"
+)

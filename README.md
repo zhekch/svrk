@@ -1,9 +1,44 @@
-# Swiss Live Transit — iOS
+# Swiss Live Transit — iOS and watchOS
 
 The same app, natively. No web view, no Node server, no `localhost`: the phone
 fetches the national feed itself, parses it, matches every journey to its
 OpenStreetMap route, routes what it cannot match over the railway graph, and
 draws the result with the Mapbox Maps SDK.
+
+## Apple Watch
+
+`SwissTransit Watch App` is a deliberately small standalone watchOS app rather
+than the phone renderer squeezed onto a smaller display. It works without the
+iPhone nearby: the watch makes a few filtered requests to the public Swiss
+transport API for nearby station boards, turns active trips into simple dots,
+and caches the result locally. Tapping a dot opens a compact vehicle page with
+its next stop, platform, expected time, origin, destination and complete stop
+list. Stops are tappable too and open their own departure board. The route
+button shows a low-cost stop-to-stop line rather than loading detailed route
+geometry.
+
+The watch screens use native Liquid Glass on watchOS 26 and later, with the
+same card layout backed by a lightweight system material on watchOS 10–25.
+Every menu, vehicle, route and stop board is pushed full-screen for the small
+display.
+
+“Download everything” is an explicit full-offline option. It transfers the
+same packed national timetable and stop index used by the phone (about 124 MB)
+directly to the watch in a background URL session, validates them, and
+memory-maps the files. Once installed, visible-area dots come entirely from the
+year-wide archive; the large download never happens automatically.
+
+The watch bundle contains no WatchConnectivity dependency, Mapbox SDK,
+detailed or downloaded route geometry, vehicle silhouettes or models,
+cableway infrastructure, formation service, or disruption/engineering
+service. It uses one foreground location fix on launch or when the location
+button is tapped; there is no live location tracking, background location, or
+periodic polling. A stale dot cache is refreshed when the app next becomes
+active and can also be refreshed manually. Cable services, like every other
+mode, remain plain dots.
+
+Run `python3 make-project.py` after adding sources. It generates both app
+targets, the companion embed phase, and the shared schemes.
 
 ```
 node scripts/fetch-mapbox-sdk.mjs    # ~330 MB, once
