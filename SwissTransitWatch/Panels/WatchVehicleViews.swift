@@ -1,117 +1,25 @@
 import Foundation
-import Observation
 import SwiftUI
-
-struct WatchFleetView: View {
-    @Bindable var model: WatchTransitModel
-
-    private var vehicles: [WatchTransitVehicle] {
-        model.snapshot.vehicles.sorted { lhs, rhs in
-            let lineOrder = lhs.line.localizedStandardCompare(rhs.line)
-            if lineOrder != .orderedSame { return lineOrder == .orderedAscending }
-            return (lhs.destination ?? lhs.origin)
-                .localizedStandardCompare(rhs.destination ?? rhs.origin)
-                == .orderedAscending
-        }
-    }
-
-    var body: some View {
-        Group {
-            if vehicles.isEmpty {
-                VStack(spacing: 9) {
-                    Image(systemName: "circle.grid.2x2")
-                        .font(.title2)
-                        .foregroundStyle(.secondary)
-                    Text("No vehicles cached")
-                        .font(.headline)
-                        .multilineTextAlignment(.center)
-                    Button {
-                        model.refresh()
-                    } label: {
-                        WatchGlassActionLabel(
-                            title: "Refresh",
-                            systemName: "arrow.clockwise",
-                            tint: .cyan
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(model.isRefreshing)
-                }
-                .padding(8)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 7) {
-                        ForEach(vehicles) { vehicle in
-                            NavigationLink(value: WatchRoute.vehicle(vehicle.id)) {
-                                WatchGlassCard(interactive: true) {
-                                    WatchVehicleRow(vehicle: vehicle)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.bottom, 10)
-                }
-            }
-        }
-        .watchGlassScreen()
-        .navigationTitle("Vehicles")
-    }
-}
-
-private struct WatchVehicleRow: View {
-    let vehicle: WatchTransitVehicle
-
-    var body: some View {
-        HStack(spacing: 8) {
-            ZStack {
-                Circle()
-                    .fill(WatchModeStyle.color(for: vehicle.mode).opacity(0.2))
-                    .frame(width: 28, height: 28)
-                Image(systemName: WatchModeStyle.symbol(for: vehicle.mode))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(WatchModeStyle.color(for: vehicle.mode))
-            }
-
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 4) {
-                    Text(vehicle.displayLine)
-                        .font(.headline)
-                        .lineLimit(1)
-                    if let delay = vehicle.delayMinutes, delay > 0 {
-                        Text("+\(delay)")
-                            .font(.caption2.weight(.bold).monospacedDigit())
-                            .foregroundStyle(.orange)
-                    }
-                }
-                Text(vehicle.displayDestination)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            Image(systemName: "chevron.right")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
-        }
-    }
-}
 
 struct WatchVehicleDetailView: View {
     let vehicle: WatchTransitVehicle
-    let snapshotDate: Date
-
-    private var nextStop: WatchTransitStop? {
-        vehicle.nextStop(at: snapshotDate)
-    }
 
     private var canShowRoute: Bool {
         vehicle.stops.lazy.compactMap(\.coordinate).filter(\.isValid).prefix(2).count == 2
     }
 
     var body: some View {
-        ScrollView {
+        // TimelineView lets watchOS coalesce this inexpensive minute update.
+        // It keeps "next" tied to the clock without re-enabling vehicle or
+        // location polling.
+        TimelineView(.periodic(from: .now, by: 60)) { timeline in
+            content(at: timeline.date)
+        }
+    }
+
+    private func content(at now: Date) -> some View {
+        let nextStop = vehicle.nextStop(at: now)
+        return ScrollView {
             LazyVStack(alignment: .leading, spacing: 8) {
                 WatchGlassCard {
                     header
@@ -119,7 +27,7 @@ struct WatchVehicleDetailView: View {
 
                 if let nextStop {
                     WatchGlassCard {
-                        nextStopSummary(nextStop)
+                        nextStopSummary(nextStop, now: now)
                     }
                 }
 
@@ -134,10 +42,6 @@ struct WatchVehicleDetailView: View {
                     .buttonStyle(.plain)
                 }
 
-                WatchGlassCard {
-                    journeySummary
-                }
-
                 if !vehicle.stops.isEmpty {
                     Text("Stops")
                         .font(.caption.weight(.semibold))
@@ -148,16 +52,13 @@ struct WatchVehicleDetailView: View {
                         LazyVStack(spacing: 0) {
                             ForEach(Array(vehicle.stops.enumerated()), id: \.element.id) { index, stop in
                                 NavigationLink(
-                                    value: WatchRoute.station(
-                                        vehicleID: vehicle.id,
-                                        stopID: stop.id
-                                    )
+                                    value: WatchRoute.station(stop)
                                 ) {
                                     WatchStopTimelineRow(
                                         stop: stop,
                                         index: index,
                                         count: vehicle.stops.count,
-                                        snapshotDate: snapshotDate,
+                                        now: now,
                                         isNext: stop.id == nextStop?.id,
                                         tint: WatchModeStyle.color(for: vehicle.mode)
                                     )
@@ -188,34 +89,45 @@ struct WatchVehicleDetailView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 9) {
-            ZStack {
-                Circle()
-                    .fill(WatchModeStyle.color(for: vehicle.mode).opacity(0.22))
-                    .frame(width: 36, height: 36)
-                Image(systemName: WatchModeStyle.symbol(for: vehicle.mode))
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(WatchModeStyle.color(for: vehicle.mode))
-            }
-            VStack(alignment: .leading, spacing: 1) {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                ZStack {
+                    Circle()
+                        .fill(WatchModeStyle.color(for: vehicle.mode).opacity(0.22))
+                        .frame(width: 22, height: 22)
+                    Image(systemName: WatchModeStyle.symbol(for: vehicle.mode))
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(WatchModeStyle.color(for: vehicle.mode))
+                }
                 Text(vehicle.displayLine)
                     .font(.title3.weight(.bold))
                     .lineLimit(1)
-                Text(vehicle.displayDestination)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                Spacer(minLength: 0)
+                if let delay = vehicle.delayMinutes {
+                    if delay != 0 {
+                        Text(delayDescription(delay))
+                            .font(.caption2.weight(.bold).monospacedDigit())
+                            .foregroundStyle(delay > 0 ? .orange : .green)
+                    }
+                }
             }
-            Spacer(minLength: 0)
-            if let delay = vehicle.delayMinutes {
-                Text(delayDescription(delay))
-                    .font(.caption2.weight(.bold).monospacedDigit())
-                    .foregroundStyle(delay > 0 ? .orange : .green)
+
+            Text(vehicle.displayDestination)
+                .font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(2)
+
+            if vehicle.origin != vehicle.displayDestination {
+                Text("From \(vehicle.origin)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(2)
             }
         }
     }
 
-    private func nextStopSummary(_ stop: WatchTransitStop) -> some View {
+    private func nextStopSummary(_ stop: WatchTransitStop, now: Date) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Label("Next stop", systemImage: "arrow.down.circle.fill")
                 .font(.caption2.weight(.semibold))
@@ -225,14 +137,17 @@ struct WatchVehicleDetailView: View {
                 .font(.headline)
                 .lineLimit(2)
 
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
+            HStack(alignment: .bottom, spacing: 6) {
                 if let time = stop.eventTime {
-                    Text(time.formatted(date: .omitted, time: .shortened))
-                        .font(.body.weight(.semibold).monospacedDigit())
-                    Text(relativeDescription(time))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(time.formatted(date: .omitted, time: .shortened))
+                            .font(.body.weight(.semibold).monospacedDigit())
+                        Text(relativeDescription(time, from: now))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
                 }
                 Spacer(minLength: 2)
                 if let platform = stop.displayPlatform {
@@ -246,46 +161,19 @@ struct WatchVehicleDetailView: View {
         }
     }
 
-    private var journeySummary: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Label("Journey", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-            WatchJourneyFact(caption: "From", value: vehicle.origin)
-            Divider().opacity(0.4)
-            WatchJourneyFact(caption: "To", value: vehicle.displayDestination)
-        }
-    }
-
     private func delayDescription(_ minutes: Int) -> String {
-        if minutes == 0 { return "On time" }
         if minutes > 0 { return "+\(minutes) min" }
         return "\(-minutes) min early"
     }
 
-    private func relativeDescription(_ date: Date) -> String {
-        let minutes = Int((date.timeIntervalSince(snapshotDate) / 60).rounded())
+    private func relativeDescription(_ date: Date, from now: Date) -> String {
+        let minutes = Int((date.timeIntervalSince(now) / 60).rounded())
         if minutes == 0 { return "now" }
-        if minutes < 0 { return "\(-minutes)m ago" }
-        if minutes < 60 { return "in \(minutes)m" }
-        return "in \(minutes / 60)h \(minutes % 60)m"
-    }
-}
-
-private struct WatchJourneyFact: View {
-    let caption: String
-    let value: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(caption.uppercased())
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.caption.weight(.semibold))
-                .lineLimit(2)
-        }
+        if minutes < 0 { return "\(-minutes) min ago" }
+        if minutes < 60 { return "in \(minutes) min" }
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        return remainder == 0 ? "in \(hours) hr" : "in \(hours) hr \(remainder) min"
     }
 }
 
@@ -293,7 +181,7 @@ private struct WatchStopTimelineRow: View {
     let stop: WatchTransitStop
     let index: Int
     let count: Int
-    let snapshotDate: Date
+    let now: Date
     let isNext: Bool
     let tint: Color
 
@@ -303,7 +191,7 @@ private struct WatchStopTimelineRow: View {
 
     private var isPast: Bool {
         guard let time else { return false }
-        return time < snapshotDate && !isNext
+        return time < now && !isNext
     }
 
     var body: some View {
@@ -351,6 +239,7 @@ private struct WatchStopTimelineRow: View {
                 .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
 }

@@ -1368,14 +1368,13 @@ final class AppModel {
     /// from `tickTask`, which is only the clock that asks this pump for work.
     private var tickPumpTask: Task<Void, Never>?
     private var pathMonitor: NWPathMonitor?
-    /// Serialises the Fleet-side half of scene transitions. CoreLocation and
-    /// main-actor loops stop immediately, while actor messages from a rapid
-    /// inactive → active → background sequence are applied in that same order.
+    /// Serialises the Fleet-side half of true background transitions. A merely
+    /// inactive scene pauses presentation without touching the geometry worker.
     private var geometryLifecycleTask: Task<Void, Never>?
-    /// True while the scene is not visible. Unlike `tickSchedulerSuspended`,
-    /// this covers the utility/network producers that do not draw frames.
-    /// Keeping the state explicit also handles a scene that resigns active
-    /// while `start()` is suspended in one of its disk reads.
+    /// True while the scene is actually backgrounded. Unlike
+    /// `tickSchedulerSuspended`, this covers utility/network producers that do
+    /// not draw frames. Keeping the state explicit also handles a background
+    /// transition while `start()` is suspended in one of its disk reads.
     private var backgroundWorkSuspended = false
     /// Whether there is a route to the network at all. Read by the background
     /// formation sweep, which otherwise spends a request every second and a
@@ -1829,7 +1828,7 @@ final class AppModel {
         started = true
         // `start()` can outlive a trip to the background because its disk and
         // actor work is intentionally asynchronous. Do not resurrect loops for
-        // a scene that became inactive while that work was in flight.
+        // a scene that entered the background while that work was in flight.
         if !backgroundWorkSuspended {
             watchNetwork()
             startTicking()
@@ -2077,8 +2076,27 @@ final class AppModel {
         layouts.save()
     }
 
-    /// Stop everything that costs anything, because the app is no longer on
-    /// screen.
+    /// Pause the moving presentation while a system surface covers the app.
+    ///
+    /// Inactivity is not necessarily backgrounding. The screenshot editor,
+    /// Control Center and other short system interruptions all pass through it.
+    /// Cancelling geometry, live-data requests and selection work for those
+    /// covers made the next active frame pay the full resume cost, and repeated
+    /// screenshots repeatedly restarted that work. Only the tick producer and
+    /// its in-flight frame need to stop; Mapbox independently pauses its display
+    /// link when the scene deactivates.
+    func pausePresentation() {
+        guard !tickSchedulerSuspended else { return }
+        tickTask?.cancel(); tickTask = nil
+        tickSchedulerSuspended = true
+        invalidateTickWork(requestingFreshFrame: false)
+        // Announce the rate again after the cover lifts. The map coordinator
+        // temporarily caps its renderer while inactive.
+        announcedInterval = nil
+        pacedInterval = nil
+    }
+
+    /// Stop everything that costs anything, because the app is backgrounded.
     ///
     /// iOS suspends a backgrounded process soon enough, and that alone stops
     /// the loops — but "soon enough" is not "now", and the seconds in between
@@ -2092,14 +2110,11 @@ final class AppModel {
     /// thing it does is the one frame it was careful never to do — catch up.
     /// Cancelled and restarted, the deadline is simply taken again from now.
     func suspend() {
-        // SwiftUI reports `.inactive` and then `.background` for one departure.
-        // The second report is the same transition, not another cancellation
-        // to enqueue behind a possible resume.
+        // `pausePresentation` normally ran for the preceding `.inactive`, but
+        // background can be delivered directly and must be complete on its own.
         guard !backgroundWorkSuspended else { return }
         backgroundWorkSuspended = true
-        tickTask?.cancel(); tickTask = nil
-        tickSchedulerSuspended = true
-        invalidateTickWork(requestingFreshFrame: false)
+        pausePresentation()
         let previousGeometryTransition = geometryLifecycleTask
         geometryLifecycleTask = Task { [fleet] in
             _ = await previousGeometryTransition?.value
@@ -2118,29 +2133,28 @@ final class AppModel {
         situationTask?.cancel(); situationTask = nil
         searchTask?.cancel(); searchTask = nil
         pathMonitor?.cancel(); pathMonitor = nil
-        // So the map is told the rate again on the way back, whatever it was
-        // holding its display link at when the app went away.
-        announcedInterval = nil
-        pacedInterval = nil
     }
 
-    /// Back on screen. The loops pick up from now rather than from whenever
-    /// they were interrupted.
+    /// Back on screen. A transient cover needs only a fresh frame; a real
+    /// background departure restores the rest of the producers as well.
     func resume() {
-        guard backgroundWorkSuspended else { return }
+        guard backgroundWorkSuspended else {
+            resumePresentation()
+            return
+        }
         backgroundWorkSuspended = false
-        tickSchedulerSuspended = false
         let previousGeometryTransition = geometryLifecycleTask
         geometryLifecycleTask = Task { @MainActor [weak self, fleet] in
             _ = await previousGeometryTransition?.value
             await fleet.resumeBackgroundGeometry()
-            guard let self, !self.backgroundWorkSuspended, self.started else { return }
+            guard let self, !self.backgroundWorkSuspended else { return }
             // What the phone thinks of us may well have changed while we were
             // away — a background app does not get the notification it was not
             // running to hear.
             self.readPower()
+            self.resumePresentation()
+            guard self.started else { return }
             self.watchNetwork()
-            self.startTicking()
             self.restartRefreshLoop()
             self.restartSituationLoop()
             if self.selection != .none {
@@ -2164,6 +2178,17 @@ final class AppModel {
                 self.finishOpening(at: Date(timeIntervalSince1970: self.clock.now()))
             }
         }
+    }
+
+    /// Restart only the frame producer after an inactive foreground cover.
+    /// The fresh request makes the map current immediately instead of waiting
+    /// for the first cadence deadline.
+    private func resumePresentation() {
+        guard tickSchedulerSuspended else { return }
+        tickSchedulerSuspended = false
+        guard started else { return }
+        startTicking()
+        requestTick()
     }
 
     /// What the app can draw, which with a timetable in the bundle is the whole

@@ -3,8 +3,8 @@ import Foundation
 import Observation
 
 /// Standalone watch runtime: one foreground location fix, then either the
-/// optional memory-mapped national archive or a few compact HTTPS requests.
-/// No phone session, background polling or live location tracking is kept alive.
+/// optional memory-mapped national archive or compact viewport HTTPS requests.
+/// There is no phone session, background polling or live location tracking.
 @MainActor
 @Observable
 final class WatchTransitModel: NSObject {
@@ -31,6 +31,8 @@ final class WatchTransitModel: NSObject {
     @ObservationIgnored private var fullDownloadTask: Task<Void, Never>?
     @ObservationIgnored private var nationalInfoTask: Task<Void, Never>?
     @ObservationIgnored private var locationTimeoutTask: Task<Void, Never>?
+    @ObservationIgnored private var lastViewportRefreshAt = Date.distantPast
+    @ObservationIgnored private var lastRefreshedViewport: WatchViewport?
 
     private static let cacheKey = "watch.transit.snapshot.v3"
 
@@ -57,10 +59,6 @@ final class WatchTransitModel: NSObject {
     var isSnapshotStale: Bool {
         guard hasSnapshot else { return true }
         return Date().timeIntervalSince(snapshot.generatedAt) >= Self.staleInterval
-    }
-
-    var vehicleCount: Int {
-        snapshot.vehicles.count
     }
 
     var locationViewport: WatchViewport? {
@@ -191,10 +189,44 @@ final class WatchTransitModel: NSObject {
         }
     }
 
-    /// Panning only changes the centre used by a later manual refresh.
+    /// Panning changes the centre used by the slow viewport refresh.
     func updateViewport(_ viewport: WatchViewport) {
         guard viewport.center.isValid else { return }
         currentViewport = viewport
+    }
+
+    /// Keeps the visible service set current while the map is actually open.
+    /// Dot movement itself is local interpolation; this slower refresh is only
+    /// for new/finished runs and updated prognosis data.
+    func refreshVisibleMapIfNeeded(at date: Date = Date()) {
+        guard isForeground, !isRefreshing, currentViewport.center.isValid else { return }
+
+        let latitudeSpan = abs(currentViewport.north - currentViewport.south)
+        let longitudeSpan = abs(currentViewport.east - currentViewport.west)
+        // A country-scale camera cannot usefully show individual dots and
+        // should never trigger a broad timetable scan or radio request.
+        guard max(latitudeSpan, longitudeSpan) <= 1 else { return }
+
+        let isDue = date.timeIntervalSince(lastViewportRefreshAt)
+            >= WatchTransitPolicy.viewportRefreshInterval
+        let movedOutsideCoverage: Bool
+        if let lastRefreshedViewport {
+            let coverage = lastRefreshedViewport.padded(by: 0.25)
+            let oldLatitudeSpan = abs(
+                lastRefreshedViewport.north - lastRefreshedViewport.south
+            )
+            let oldLongitudeSpan = abs(
+                lastRefreshedViewport.east - lastRefreshedViewport.west
+            )
+            movedOutsideCoverage = !coverage.contains(currentViewport.center)
+                || latitudeSpan > oldLatitudeSpan * 1.5
+                || longitudeSpan > oldLongitudeSpan * 1.5
+        } else {
+            movedOutsideCoverage = true
+        }
+
+        guard isDue || movedOutsideCoverage else { return }
+        startRefresh(near: currentViewport.center, viewport: currentViewport)
     }
 
     /// Loaded only after a stop is tapped. No board polling or background work
@@ -202,11 +234,23 @@ final class WatchTransitModel: NSObject {
     func stationBoard(for stop: WatchTransitStop) async throws -> [WatchStationDeparture] {
         let now = Date()
         if let info = try? await nationalService.installedInfo(),
-           (info.validFrom ... info.validUntil).contains(now),
-           stop.stationID != nil {
+           (info.validFrom ... info.validUntil).contains(now) {
             return try await nationalService.stationBoard(for: stop, at: now)
         }
         return try await onlineService.stationBoard(for: stop, at: now)
+    }
+
+    /// Resolves a tap on a native Apple Maps transit label. This is a one-shot
+    /// lookup; it starts no map, location or board polling.
+    func station(near coordinate: WatchCoordinate) async -> WatchTransitStop? {
+        guard coordinate.isValid else { return nil }
+        let now = Date()
+        if let info = try? await nationalService.installedInfo(),
+           (info.validFrom ... info.validUntil).contains(now),
+           let station = try? await nationalService.station(near: coordinate) {
+            return station
+        }
+        return try? await onlineService.station(near: coordinate)
     }
 
     private func requestSingleLocation() {
@@ -305,6 +349,8 @@ final class WatchTransitModel: NSObject {
     private func startRefresh(near coordinate: WatchCoordinate, viewport: WatchViewport) {
         guard isForeground, coordinate.isValid else { return }
         refreshTask?.cancel()
+        lastViewportRefreshAt = Date()
+        lastRefreshedViewport = viewport
         isRefreshing = true
         lastError = nil
 

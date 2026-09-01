@@ -7,7 +7,6 @@ struct WatchMenuView: View {
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 7) {
-                destination(.fleet, title: "Vehicles", symbol: "circle.grid.2x2.fill", tint: .cyan)
                 destination(.status, title: "Status", symbol: "gauge.with.dots.needle.50percent", tint: .green)
                 destination(.about, title: "About", symbol: "info.circle.fill", tint: .blue)
 
@@ -157,8 +156,6 @@ struct WatchStatusView: View {
                                 ? (model.isSnapshotStale ? "Needs refresh" : "Ready")
                                 : "No cache"
                         )
-                        Divider().opacity(0.4)
-                        WatchStatusRow(title: "Vehicles", value: "\(model.vehicleCount)")
                         Divider().opacity(0.4)
                         WatchStatusRow(
                             title: "Data",

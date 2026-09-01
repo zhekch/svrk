@@ -2,8 +2,16 @@ import Foundation
 
 enum WatchTransitPolicy {
     /// Cached dots and a recent location remain useful for a short wrist check.
-    /// There is deliberately no timer: this is evaluated only in the foreground.
     static let staleInterval: TimeInterval = 15 * 60
+
+    /// Vehicle coordinates are cheap timetable interpolation, not radio or GPS
+    /// samples. Five seconds is visibly current on a watch without asking
+    /// MapKit to redraw at phone-like frame rates.
+    static let mapPositionInterval: TimeInterval = 5
+
+    /// Pull new runs and prognosis changes much less often than dots move. The
+    /// request is centred on the visible map and only runs while it is onscreen.
+    static let viewportRefreshInterval: TimeInterval = 2 * 60
 }
 
 struct WatchCoordinate: Codable, Equatable, Hashable, Sendable {
@@ -76,6 +84,18 @@ struct WatchViewport: Codable, Equatable, Hashable, Sendable {
             && (min(west, east) ... max(west, east)).contains(coordinate.longitude)
     }
 
+    func padded(by fraction: Double) -> WatchViewport {
+        let fraction = max(0, fraction)
+        let latitudePadding = abs(north - south) * fraction
+        let longitudePadding = abs(east - west) * fraction
+        return WatchViewport(
+            west: min(west, east) - longitudePadding,
+            south: min(south, north) - latitudePadding,
+            east: max(west, east) + longitudePadding,
+            north: max(south, north) + latitudePadding
+        )
+    }
+
     init(west: Double, south: Double, east: Double, north: Double) {
         self.west = west
         self.south = south
@@ -126,13 +146,68 @@ struct WatchTransitVehicle: Codable, Equatable, Hashable, Identifiable, Sendable
     var stops: [WatchTransitStop]
 
     func nextStop(at date: Date) -> WatchTransitStop? {
-        if let upcoming = stops.first(where: {
-            guard let arrival = $0.eventTime else { return false }
-            return arrival > date.addingTimeInterval(15)
-        }) {
-            return upcoming
+        // A call remains current until its departure, then immediately yields
+        // to the next one. Returning the last call after the run has finished
+        // is what made a 16:06 stop still read as "next" at 16:10.
+        let grace = date.addingTimeInterval(-15)
+        return stops.first {
+            guard let leaves = $0.departure ?? $0.arrival else { return false }
+            return leaves >= grace
         }
-        return stops.last
+    }
+
+    /// Recomputes the lightweight dot position from the calls already held in
+    /// memory. This performs no location or network work. The online and
+    /// offline snapshot builders use the same stop-to-stop interpolation.
+    func mapPosition(at date: Date) -> WatchCoordinate? {
+        let calls = stops.compactMap { stop -> (
+            coordinate: WatchCoordinate, arrival: Date, departure: Date
+        )? in
+            guard let coordinate = stop.coordinate, coordinate.isValid,
+                  let event = stop.arrival ?? stop.departure
+            else { return nil }
+            return (
+                coordinate,
+                stop.arrival ?? event,
+                stop.departure ?? event
+            )
+        }
+
+        guard let first = calls.first, let last = calls.last,
+              date >= first.arrival.addingTimeInterval(-5 * 60),
+              date <= last.departure.addingTimeInterval(2 * 60)
+        else { return nil }
+
+        if date <= first.departure { return first.coordinate }
+
+        for index in 0 ..< calls.count - 1 {
+            let current = calls[index]
+            let next = calls[index + 1]
+            if date <= current.departure { return current.coordinate }
+            if date <= next.arrival {
+                let duration = max(1, next.arrival.timeIntervalSince(current.departure))
+                let progress = min(
+                    1,
+                    max(0, date.timeIntervalSince(current.departure) / duration)
+                )
+                return WatchCoordinate(
+                    latitude: current.coordinate.latitude
+                        + (next.coordinate.latitude - current.coordinate.latitude) * progress,
+                    longitude: current.coordinate.longitude
+                        + (next.coordinate.longitude - current.coordinate.longitude) * progress
+                )
+            }
+        }
+
+        return last.coordinate
+    }
+
+    func positioned(at date: Date) -> WatchTransitVehicle? {
+        guard let coordinate = mapPosition(at: date) else { return nil }
+        var result = self
+        result.latitude = coordinate.latitude
+        result.longitude = coordinate.longitude
+        return result
     }
 }
 

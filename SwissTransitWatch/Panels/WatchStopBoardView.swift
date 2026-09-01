@@ -21,15 +21,9 @@ struct WatchStopBoardView: View {
                             Text(stop.name)
                                 .font(.headline)
                                 .lineLimit(2)
-                            if let platform = stop.displayPlatform {
-                                Text("Opened from platform \(platform)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                Text("Next departures")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
+                            Text("All departures")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                         Spacer(minLength: 0)
                     }
@@ -116,43 +110,83 @@ private struct WatchDepartureRow: View {
     private var displayPlatform: String? {
         guard let platform = departure.platform else { return nil }
         let cleaned = platform.trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? nil : cleaned
+        guard !cleaned.isEmpty else { return nil }
+
+        // The station board needs the track to walk to, not the sector of the
+        // platform where the train will stand: 12A-C -> 12, 4F-H -> 4. Keep
+        // letter-only bus/tram bays because the letter is their whole identity.
+        let digits = cleaned.prefix(while: \.isNumber)
+        guard !digits.isEmpty else { return cleaned }
+        var suffix = cleaned.dropFirst(digits.count)
+        if suffix.first == " " { suffix = suffix.dropFirst() }
+        guard let first = suffix.first, first.isUppercase,
+              suffix.allSatisfy({ $0.isUppercase || $0 == "-" || $0 == "\u{2013}" })
+        else { return cleaned }
+        return String(digits)
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 7) {
-            VStack(spacing: 3) {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
                 Text(departure.departure.formatted(date: .omitted, time: .shortened))
-                    .font(.caption.weight(.bold).monospacedDigit())
-                if let delay = departure.delayMinutes, delay > 0 {
-                    Text("+\(delay)")
-                        .font(.system(size: 9, weight: .bold).monospacedDigit())
-                        .foregroundStyle(.orange)
+                    .font(.headline.weight(.bold).monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+                    .frame(width: 49, alignment: .leading)
+
+                WatchDepartureLineBadge(line: displayLine, mode: departure.mode)
+                Spacer(minLength: 2)
+                if let platform = displayPlatform {
+                    Text(platform)
+                        .font(.caption2.weight(.bold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 3)
+                        .background(.white.opacity(0.12), in: Capsule())
                 }
             }
-            .frame(width: 40, alignment: .leading)
 
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 5) {
-                    WatchVehicleDot(mode: departure.mode, diameter: 6)
-                    Text(displayLine)
-                        .font(.caption.weight(.bold))
-                        .lineLimit(1)
+            if let delay = departure.delayMinutes, delay > 0 {
+                HStack(alignment: .top, spacing: 7) {
+                    Text("+\(delay)")
+                        .foregroundStyle(.orange)
+                        .font(.system(size: 9, weight: .bold).monospacedDigit())
+                        .frame(width: 49, height: 11, alignment: .leading)
+
+                    Text(departure.destination)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(2)
                 }
+            } else {
+                // With no delay there is no second time column to align. Give
+                // the destination the full card width, like the iOS board.
                 Text(departure.destination)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .lineLimit(2)
-            }
-            Spacer(minLength: 2)
-            if let platform = displayPlatform {
-                Text(platform)
-                    .font(.caption2.weight(.bold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 3)
-                    .background(.white.opacity(0.12), in: Capsule())
             }
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+private struct WatchDepartureLineBadge: View {
+    let line: String
+    let mode: String
+
+    var body: some View {
+        Text(line)
+            .font(.caption.weight(.bold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.65)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(
+                WatchModeStyle.color(for: mode),
+                in: RoundedRectangle(cornerRadius: 5)
+            )
+            .foregroundStyle(.white)
     }
 }

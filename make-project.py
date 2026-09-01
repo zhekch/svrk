@@ -69,7 +69,18 @@ RESOURCES = [
     # one (Settings has a share button for it) to carry what it has learned
     # into the next build.
     (f"{APP}/Resources/vehicle-layouts.json", "text.json"),
+    # The phone icon is target-local so changing it cannot alter the watch app.
+    (f"{APP}/Resources/AppIcon.icon", "folder.iconcomposer.icon"),
 ]
+WATCH_RESOURCES = [
+    # A sub-1 MB, pre-simplified derivative of the existing OSM railway graph.
+    # Keeping it in the app makes the overlay reliable offline without loading
+    # the 17 MB routing graph (and its much larger in-memory index) on the watch.
+    (f"{WATCH_APP}/Resources/watch-rail-overlay-v1.bin", "file"),
+    # A separate Icon Composer package, compiled only into the watch bundle.
+    (f"{WATCH_APP}/Resources/AppIcon_watch.icon", "folder.iconcomposer.icon"),
+]
+ALL_RESOURCES = RESOURCES + WATCH_RESOURCES
 
 PACKAGES = [
     ("TransitCore", "Packages/TransitCore"),
@@ -98,6 +109,9 @@ for path in WATCH_SOURCES:
 for path, _ in RESOURCES:
     w(f"\t\t{oid('bf:' + path)} /* {os.path.basename(path)} in Resources */ = "
       f"{{isa = PBXBuildFile; fileRef = {oid('fr:' + path)} /* {os.path.basename(path)} */; }};")
+for path, _ in WATCH_RESOURCES:
+    w(f"\t\t{oid('bf:watch:resource:' + path)} /* {os.path.basename(path)} in Resources */ = "
+      f"{{isa = PBXBuildFile; fileRef = {oid('fr:' + path)} /* {os.path.basename(path)} */; }};")
 for product, _ in PACKAGES:
     w(f"\t\t{oid('bf:pkg:' + product)} /* {product} in Frameworks */ = "
       f"{{isa = PBXBuildFile; productRef = {oid('prod:' + product)} /* {product} */; }};")
@@ -119,7 +133,7 @@ w(f"\t\t{oid('product:watch')} /* {WATCH_TARGET}.app */ = {{isa = PBXFileReferen
 for path in ALL_SOURCES:
     w(f"\t\t{oid('fr:' + path)} /* {os.path.basename(path)} */ = {{isa = PBXFileReference; "
       f"lastKnownFileType = sourcecode.swift; path = {os.path.basename(path)}; sourceTree = \"<group>\"; }};")
-for path, kind in RESOURCES:
+for path, kind in ALL_RESOURCES:
     key = "lastKnownFileType"
     w(f"\t\t{oid('fr:' + path)} /* {os.path.basename(path)} */ = {{isa = PBXFileReference; "
       f"{key} = {kind}; path = {os.path.basename(path)}; sourceTree = \"<group>\"; }};")
@@ -129,7 +143,7 @@ w("/* End PBXFileReference section */")
 by_dir: dict[str, list[str]] = {}
 for path in ALL_SOURCES:
     by_dir.setdefault(os.path.dirname(path), []).append(path)
-for path, _ in RESOURCES:
+for path, _ in ALL_RESOURCES:
     by_dir.setdefault(os.path.dirname(path), []).append(path)
 
 w("\n/* Begin PBXGroup section */")
@@ -235,6 +249,8 @@ w(f"\t\t{oid('phase:watch:resources')} /* Resources */ = {{")
 w("\t\t\tisa = PBXResourcesBuildPhase;")
 w("\t\t\tbuildActionMask = 2147483647;")
 w("\t\t\tfiles = (")
+for path, _ in WATCH_RESOURCES:
+    w(f"\t\t\t\t{oid('bf:watch:resource:' + path)} /* {os.path.basename(path)} in Resources */,")
 w("\t\t\t);")
 w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
 w("\t\t};")
@@ -444,6 +460,7 @@ TARGET_SETTINGS = {
     "TARGETED_DEVICE_FAMILY": '"1,2"',
 }
 WATCH_TARGET_SETTINGS = {
+    "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon_watch",
     "CODE_SIGN_STYLE": "Automatic",
     "CURRENT_PROJECT_VERSION": "6",
     "DEVELOPMENT_TEAM": "K83N2TZ5G3",
@@ -601,8 +618,12 @@ with open(os.path.join(schemes, f"{WATCH_TARGET}.xcscheme"), "w") as handle:
 """)
 
 print(f"wrote {project_dir}")
-print(f"  iOS: {len(IOS_SOURCES)} Swift sources, {len(RESOURCES)} resources, {len(PACKAGES)} packages")
 print(
-    f"  watchOS: {len(WATCH_SOURCES)} Swift sources, 0 resources, "
+    f"  iOS: {len(IOS_SOURCES)} Swift sources, "
+    f"{len(RESOURCES)} resources, {len(PACKAGES)} packages"
+)
+print(
+    f"  watchOS: {len(WATCH_SOURCES)} Swift sources, "
+    f"{len(WATCH_RESOURCES)} resources, "
     f"{len(WATCH_PACKAGES)} packages"
 )

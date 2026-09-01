@@ -116,27 +116,27 @@ actor WatchNationalTimetableService {
             throw WatchNationalArchiveFiles.ArchiveError.notInstalled
         }
 
-        let station = stop.stationID.map(TimetableStore.station(ofSlotRef:))
-        guard let station, !station.isEmpty else { return [] }
+        let group = Self.stationGroup(for: stop, register: stops)
+        guard !group.stations.isEmpty else { return [] }
         let nowStamp = Int(now.timeIntervalSince1970)
         let journeys = timetable.journeys(
-            callingAt: [station],
-            key: station,
+            callingAt: group.stations,
+            key: group.stations.sorted().joined(separator: "|"),
             from: nowStamp - 2 * 60,
             to: nowStamp + 6 * 60 * 60,
-            limit: 80,
+            limit: 120,
             place: { ref in stops.lookup(ref) }
         )
 
         return journeys.compactMap { journey in
             guard let call = journey.stops.first(where: {
                 guard let ref = $0.ref else { return false }
-                return TimetableStore.station(ofSlotRef: ref) == station
+                return group.stations.contains(TimetableStore.station(ofSlotRef: ref))
                     && $0.dep >= nowStamp - 2 * 60
             }) else { return nil }
             let line = journey.line.trimmingCharacters(in: .whitespacesAndNewlines)
             return WatchStationDeparture(
-                id: journey.id,
+                id: "\(journey.id)|\(call.dep)|\(call.ref ?? call.name)",
                 mode: journey.mode.rawValue,
                 line: line.isEmpty ? (journey.number ?? journey.mode.rawValue.capitalized) : line,
                 destination: journey.to ?? "—",
@@ -148,6 +148,110 @@ actor WatchNationalTimetableService {
         .sorted { $0.departure < $1.departure }
         .prefix(30)
         .map { $0 }
+    }
+
+    func station(near coordinate: WatchCoordinate) throws -> WatchTransitStop? {
+        if timetable == nil || stops == nil {
+            guard try installedInfo() != nil else {
+                throw WatchNationalArchiveFiles.ArchiveError.notInstalled
+            }
+        }
+        guard let stops, coordinate.isValid else { return nil }
+        let nearby = stops.near(
+            lon: coordinate.longitude,
+            lat: coordinate.latitude,
+            metres: 160
+        )
+        guard let station = nearby.min(by: { lhs, rhs in
+            Self.metres(
+                from: coordinate,
+                to: WatchCoordinate(latitude: lhs.lat, longitude: lhs.lon)
+            ) < Self.metres(
+                from: coordinate,
+                to: WatchCoordinate(latitude: rhs.lat, longitude: rhs.lon)
+            )
+        }) else { return nil }
+        return WatchTransitStop(
+            id: "offline-station|\(station.id)",
+            stationID: station.id,
+            name: station.name,
+            platform: nil,
+            arrival: nil,
+            departure: nil,
+            delayMinutes: nil,
+            coordinate: WatchCoordinate(latitude: station.lat, longitude: station.lon)
+        )
+    }
+
+    /// Resolve a tapped platform, vehicle call or Apple Maps POI to the whole
+    /// interchange. Nearby child names such as "Frutigen, Bahnhof" are folded
+    /// into "Frutigen", while unrelated city stops remain separate.
+    private static func stationGroup(
+        for stop: WatchTransitStop,
+        register: StopRegister
+    ) -> (name: String, stations: Set<String>) {
+        var stations = Set<String>()
+        if let reference = stop.stationID?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ), !reference.isEmpty {
+            stations.insert(TimetableStore.station(ofSlotRef: reference))
+        }
+
+        guard let coordinate = stop.coordinate, coordinate.isValid else {
+            return (stop.name, Set(stations.filter { !$0.isEmpty }))
+        }
+
+        let nearby = register.near(
+            lon: coordinate.longitude,
+            lat: coordinate.latitude,
+            metres: 250
+        )
+        let parent = nearby.filter {
+            partOfStation(stop.name, $0.name)
+        }.min { lhs, rhs in
+            if lhs.name.count != rhs.name.count { return lhs.name.count < rhs.name.count }
+            return metres(
+                from: coordinate,
+                to: WatchCoordinate(latitude: lhs.lat, longitude: lhs.lon)
+            ) < metres(
+                from: coordinate,
+                to: WatchCoordinate(latitude: rhs.lat, longitude: rhs.lon)
+            )
+        }
+        let name = parent?.name ?? stop.name
+        for registered in nearby where partOfStation(registered.name, name) {
+            stations.insert(TimetableStore.station(ofSlotRef: registered.id))
+        }
+        return (name, Set(stations.filter { !$0.isEmpty }))
+    }
+
+    private static func sameStop(_ lhs: String, _ rhs: String) -> Bool {
+        squash(lhs) == squash(rhs)
+    }
+
+    private static func squash(_ name: String) -> String {
+        name.folding(
+            options: [.diacriticInsensitive, .caseInsensitive],
+            locale: Locale(identifier: "en_US")
+        ).filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static func partOfStation(_ name: String, _ stationName: String) -> Bool {
+        sameStop(name, stationName)
+            || name.range(
+                of: "\(stationName), ",
+                options: [.anchored, .caseInsensitive]
+            ) != nil
+    }
+
+    private static func metres(
+        from lhs: WatchCoordinate,
+        to rhs: WatchCoordinate
+    ) -> Double {
+        let latitude = (lhs.latitude + rhs.latitude) * 0.5 * .pi / 180
+        let north = (rhs.latitude - lhs.latitude) * 111_320
+        let east = (rhs.longitude - lhs.longitude) * 111_320 * cos(latitude)
+        return hypot(north, east)
     }
 
     private func loadInstalledArchive() throws -> WatchNationalTimetableInfo {

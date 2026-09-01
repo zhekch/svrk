@@ -4,8 +4,9 @@ import TransitCore
 
 /// "RE1 to Brig" or "Bern · Platform 7" — the sheet, at its smallest.
 ///
-/// Deliberately the smallest thing that can carry that: a status dot and the
-/// name. The app has worked out something the person holding it
+/// Deliberately the smallest thing that can carry that: the name, plus a live
+/// pulse only where the answer is a moving service. The app has worked out
+/// something the person holding it
 /// already knows — they can see the train they are sitting in — so it has no
 /// business taking the screen to announce it. What it *does* know that they do
 /// not is where the train is going, how late it is and what it is made of, and
@@ -65,10 +66,12 @@ struct RidePill: View {
         // occupying the whole width the sheet has, and left-aligning it left a
         // hand-span of empty capsule to its right that read as a truncation.
         HStack(spacing: 8) {
-            Circle()
-                .fill(Color.red)
-                .frame(width: 10, height: 10)
-                .opacity(lit ? 1 : 0.42)
+            if showsLiveDot {
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 10, height: 10)
+                    .opacity(lit ? 1 : 0.42)
+            }
             offerText
         }
         .font(.title3)
@@ -77,11 +80,11 @@ struct RidePill: View {
         .lineLimit(1)
         .minimumScaleFactor(0.75)
         .padding(.horizontal, 20)
-        // Clear of the handle the sheet draws for itself, and pinned to the top
-        // of the detent so the row does not drift as the home indicator's inset
-        // comes and goes between devices.
-        .padding(.top, 18)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // The handle and home indicator belong to the sheet chrome. The offer
+        // itself occupies the remaining statement-sized space rather than
+        // being pinned under the handle, so both train and station names sit
+        // at the visual centre of the compact detent.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .contentShape(Rectangle())
         .onTapGesture { open() }
         // Enough motion to announce a new offer, then a static compositor for
@@ -101,7 +104,12 @@ struct RidePill: View {
         .accessibilityAction(named: dismissName) { dismiss() }
     }
 
-    private var shouldPulse: Bool { !reduceMotion && !lowPower }
+    private var showsLiveDot: Bool {
+        if case .ride = offer { return true }
+        return false
+    }
+
+    private var shouldPulse: Bool { showsLiveDot && !reduceMotion && !lowPower }
     private var pulseTaskID: String { "\(offer.id):\(shouldPulse)" }
 
     @MainActor private func pulse() async {

@@ -10,6 +10,8 @@ struct WatchHomeView: View {
             WatchTransitMap(model: model)
 
             VStack(spacing: 0) {
+                Spacer(minLength: 0)
+
                 HStack {
                     Button {
                         model.locate()
@@ -31,26 +33,130 @@ struct WatchHomeView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("Open menu")
                 }
-
-                Spacer(minLength: 0)
             }
             .padding(6)
         }
     }
 }
 
-/// Native MapKit with a flat, muted base map and one tiny circle per vehicle.
-/// It deliberately has no route geometry, model or animation layer. The blue
-/// marker comes from a single foreground location fix, not live tracking.
+/// Native MapKit with a flat, transit-focused base map and one tiny circle per vehicle.
+/// Only dots in the visible camera are recomputed, at a watch-friendly 0.2 Hz.
+/// The blue marker still comes from one foreground location fix, not tracking.
 struct WatchTransitMap: View {
     @Bindable var model: WatchTransitModel
     @State private var position: MapCameraPosition = .region(
         WatchViewport.switzerland.mapRegion
     )
     @State private var positionedFromSnapshot = false
+    @State private var railLines: [WatchRailOverlayLine] = []
+    @State private var railRequestRevision = 0
+    @State private var currentViewport = WatchViewport.switzerland
+    @State private var selectedNativeStation: WatchTransitStop?
+    @State private var isMapVisible = false
+
+    private var mapStops: [WatchMapStopTarget] {
+        let width = abs(currentViewport.east - currentViewport.west)
+        let height = abs(currentViewport.north - currentViewport.south)
+        let span = max(width, height)
+        guard span <= 0.85 else { return [] }
+
+        // Bus kerbs are far denser than rail/tram platforms. Keep them off the
+        // default view and reveal them only once the user is looking locally.
+        let showsBusPlatforms = span <= 0.08
+
+        var unique: [String: WatchMapStopTarget] = [:]
+        for vehicle in model.snapshot.vehicles {
+            if vehicle.mode.lowercased() == "bus", !showsBusPlatforms { continue }
+            for stop in vehicle.stops {
+                guard let coordinate = stop.coordinate,
+                      coordinate.isValid,
+                      currentViewport.contains(coordinate)
+                else { continue }
+
+                // One target per stop place, never one per platform or
+                // vehicle. Offline calls often carry a platform-level SLOID;
+                // fold it back to the owning station before deduplicating.
+                let reference = stop.stationID?.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                let key: String
+                if let reference, !reference.isEmpty {
+                    key = TimetableStore.station(ofSlotRef: reference)
+                } else {
+                    // A name is the best stop-place identity available in the
+                    // compact online payload. Platform and coordinate are
+                    // deliberately absent so sibling platforms collapse.
+                    key = stop.name.folding(
+                        options: [.diacriticInsensitive, .caseInsensitive],
+                        locale: Locale(identifier: "en_US")
+                    ).filter { $0.isLetter || $0.isNumber }
+                }
+                let candidate = WatchMapStopTarget(
+                    id: key,
+                    stop: stop,
+                    coordinate: coordinate,
+                    mode: vehicle.mode
+                )
+                if let held = unique[key] {
+                    if WatchModeStyle.priority(for: candidate.mode)
+                        > WatchModeStyle.priority(for: held.mode) {
+                        unique[key] = candidate
+                    }
+                } else {
+                    unique[key] = candidate
+                }
+            }
+        }
+
+        let center = currentViewport.center
+        return unique.values.sorted { lhs, rhs in
+            lhs.coordinate.distanceSquared(to: center)
+                < rhs.coordinate.distanceSquared(to: center)
+        }
+        .prefix(64)
+        .map { $0 }
+    }
 
     var body: some View {
-        Map(position: $position, interactionModes: [.pan, .zoom]) {
+        TimelineView(
+            .periodic(from: .now, by: WatchTransitPolicy.mapPositionInterval)
+        ) { timeline in
+            map(at: timeline.date)
+        }
+    }
+
+    private func map(at date: Date) -> some View {
+        let visibleVehicles = visibleVehicles(at: date)
+        return MapReader { proxy in
+            Map(position: $position, interactionModes: [.pan, .zoom]) {
+            ForEach(railLines) { line in
+                MapPolyline(coordinates: line.coordinates.map(\.mapCoordinate))
+                    .stroke(
+                        line.style.color.opacity(0.72),
+                        lineWidth: line.isDetailed ? 1.35 : 1
+                    )
+            }
+
+            ForEach(mapStops) { target in
+                Annotation("", coordinate: target.coordinate.mapCoordinate, anchor: .center) {
+                    NavigationLink(value: WatchRoute.station(target.stop)) {
+                        Circle()
+                            .fill(.black.opacity(0.8))
+                            .overlay {
+                                Circle().stroke(
+                                    WatchModeStyle.color(for: target.mode),
+                                    lineWidth: 1.5
+                                )
+                            }
+                            .frame(width: 7, height: 7)
+                            .frame(width: 30, height: 30)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Open \(target.stop.name) departures")
+                }
+            }
+
             if let location = model.userLocation {
                 Annotation(
                     "",
@@ -70,7 +176,7 @@ struct WatchTransitMap: View {
                 }
             }
 
-            ForEach(model.snapshot.vehicles) { vehicle in
+            ForEach(visibleVehicles) { vehicle in
                 Annotation(
                     "",
                     coordinate: CLLocationCoordinate2D(
@@ -88,37 +194,169 @@ struct WatchTransitMap: View {
                     .accessibilityLabel(vehicle.accessibilityName)
                 }
             }
-        }
-        .mapStyle(
-            .standard(
-                elevation: .flat,
-                emphasis: .muted,
-                pointsOfInterest: .excludingAll,
-                showsTraffic: false
+            }
+            .mapStyle(WatchMapStyle.transit)
+            .simultaneousGesture(
+                SpatialTapGesture().onEnded { tap in
+                    // Leave our own NavigationLink annotations alone. A tap on
+                    // the native basemap instead resolves the nearest transit
+                    // stop from the tapped coordinate.
+                    guard !hitsCustomAnnotation(
+                            tap.location,
+                            proxy: proxy,
+                            vehicles: visibleVehicles
+                          ),
+                          max(
+                            abs(currentViewport.east - currentViewport.west),
+                            abs(currentViewport.north - currentViewport.south)
+                          ) <= 0.30,
+                          let coordinate = proxy.convert(tap.location, from: .local)
+                    else { return }
+                    let point = WatchCoordinate(
+                        latitude: coordinate.latitude,
+                        longitude: coordinate.longitude
+                    )
+                    guard point.isValid else { return }
+                    Task {
+                        selectedNativeStation = await model.station(near: point)
+                    }
+                }
             )
-        )
-        .onAppear {
-            adoptSnapshotViewportIfNeeded()
+            .navigationDestination(item: $selectedNativeStation) { stop in
+                WatchStopBoardView(stop: stop, model: model)
+            }
+            .onAppear {
+                isMapVisible = true
+                adoptSnapshotViewportIfNeeded()
+                refreshRailOverlay(
+                    model.hasSnapshot ? model.snapshot.viewport : .switzerland
+                )
+            }
+            .onDisappear {
+                isMapVisible = false
+            }
+            .onChange(of: model.snapshot.generatedAt) { _, _ in
+                adoptSnapshotViewportIfNeeded()
+                refreshRailOverlay(currentViewport)
+            }
+            .onChange(of: date, initial: true) { _, date in
+                guard isMapVisible else { return }
+                model.refreshVisibleMapIfNeeded(at: date)
+            }
+            .onChange(of: model.locationFocusRevision) { _, _ in
+                guard let viewport = model.locationViewport else { return }
+                positionedFromSnapshot = true
+                currentViewport = viewport
+                position = .region(viewport.mapRegion)
+                model.updateViewport(viewport)
+                refreshRailOverlay(viewport)
+            }
+            .onMapCameraChange(frequency: .onEnd) { context in
+                let viewport = WatchViewport(mapRegion: context.region)
+                currentViewport = viewport
+                model.updateViewport(viewport)
+                refreshRailOverlay(viewport)
+            }
         }
-        .onChange(of: model.snapshot.generatedAt) { _, _ in
-            adoptSnapshotViewportIfNeeded()
+    }
+
+    private func visibleVehicles(at date: Date) -> [WatchTransitVehicle] {
+        let visibleArea = currentViewport.padded(by: 0.12)
+        return model.snapshot.vehicles.compactMap { vehicle in
+            // Reject routes whose stop bounds cannot touch the camera before
+            // doing even the tiny time interpolation.
+            guard route(vehicle, mayIntersect: visibleArea),
+                  let positioned = vehicle.positioned(at: date),
+                  visibleArea.contains(WatchCoordinate(
+                    latitude: positioned.latitude,
+                    longitude: positioned.longitude
+                  ))
+            else { return nil }
+            return positioned
         }
-        .onChange(of: model.locationFocusRevision) { _, _ in
-            guard let viewport = model.locationViewport else { return }
-            positionedFromSnapshot = true
-            position = .region(viewport.mapRegion)
-            model.updateViewport(viewport)
+    }
+
+    private func route(
+        _ vehicle: WatchTransitVehicle,
+        mayIntersect viewport: WatchViewport
+    ) -> Bool {
+        let coordinates = vehicle.stops.compactMap(\.coordinate).filter(\.isValid)
+        guard let first = coordinates.first else {
+            return viewport.contains(WatchCoordinate(
+                latitude: vehicle.latitude,
+                longitude: vehicle.longitude
+            ))
         }
-        .onMapCameraChange(frequency: .onEnd) { context in
-            model.updateViewport(WatchViewport(mapRegion: context.region))
+
+        var west = first.longitude
+        var east = first.longitude
+        var south = first.latitude
+        var north = first.latitude
+        for coordinate in coordinates.dropFirst() {
+            west = min(west, coordinate.longitude)
+            east = max(east, coordinate.longitude)
+            south = min(south, coordinate.latitude)
+            north = max(north, coordinate.latitude)
         }
+        return east >= min(viewport.west, viewport.east)
+            && west <= max(viewport.west, viewport.east)
+            && north >= min(viewport.south, viewport.north)
+            && south <= max(viewport.south, viewport.north)
+    }
+
+    private func hitsCustomAnnotation(
+        _ point: CGPoint,
+        proxy: MapProxy,
+        vehicles: [WatchTransitVehicle]
+    ) -> Bool {
+        for stop in mapStops {
+            if let target = proxy.convert(stop.coordinate.mapCoordinate, to: .local),
+               hypot(target.x - point.x, target.y - point.y) <= 18 {
+                return true
+            }
+        }
+        for vehicle in vehicles {
+            let coordinate = CLLocationCoordinate2D(
+                latitude: vehicle.latitude,
+                longitude: vehicle.longitude
+            )
+            if let target = proxy.convert(coordinate, to: .local),
+               hypot(target.x - point.x, target.y - point.y) <= 15 {
+                return true
+            }
+        }
+        return false
     }
 
     private func adoptSnapshotViewportIfNeeded() {
         guard !positionedFromSnapshot, model.hasSnapshot else { return }
         positionedFromSnapshot = true
+        currentViewport = model.snapshot.viewport
         position = .region(model.snapshot.viewport.mapRegion)
         model.updateViewport(model.snapshot.viewport)
+    }
+
+    private func refreshRailOverlay(_ viewport: WatchViewport) {
+        railRequestRevision &+= 1
+        let revision = railRequestRevision
+        Task {
+            let loaded = await WatchRailOverlayStore.shared.lines(in: viewport)
+            guard revision == railRequestRevision else { return }
+            railLines = loaded
+        }
+    }
+}
+
+enum WatchMapStyle {
+    /// MapKit does not expose the Maps app's Transit mode. Showing only public
+    /// transport POIs gives the watch its closest native, lightweight equivalent.
+    static var transit: MapStyle {
+        .standard(
+            elevation: .flat,
+            emphasis: .automatic,
+            pointsOfInterest: .including(.publicTransport),
+            showsTraffic: false
+        )
     }
 }
 
@@ -137,8 +375,8 @@ enum WatchModeStyle {
     static func color(for mode: String) -> Color {
         switch mode.lowercased() {
         case "train": return .red
-        case "tram": return .cyan
-        case "bus": return .green
+        case "tram": return Color(red: 0.20, green: 0.78, blue: 0.35)
+        case "bus": return Color(red: 0.04, green: 0.52, blue: 1.00)
         case "metro": return .purple
         case "boat": return .blue
         case "cable": return .yellow
@@ -155,6 +393,15 @@ enum WatchModeStyle {
         case "boat": return "ferry.fill"
         case "cable": return "cablecar.fill"
         default: return "circle.fill"
+        }
+    }
+
+    static func priority(for mode: String) -> Int {
+        switch mode.lowercased() {
+        case "train", "metro": return 3
+        case "tram", "boat", "cable": return 2
+        case "bus": return 1
+        default: return 0
         }
     }
 }
@@ -187,6 +434,26 @@ extension WatchViewport {
             north: region.center.latitude + halfLatitude
         )
     }
+}
+
+extension WatchCoordinate {
+    var mapCoordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+
+
+    func distanceSquared(to other: WatchCoordinate) -> Double {
+        let latitudeDistance = latitude - other.latitude
+        let longitudeDistance = longitude - other.longitude
+        return latitudeDistance * latitudeDistance + longitudeDistance * longitudeDistance
+    }
+}
+
+private struct WatchMapStopTarget: Identifiable {
+    var id: String
+    var stop: WatchTransitStop
+    var coordinate: WatchCoordinate
+    var mode: String
 }
 
 extension WatchTransitVehicle {

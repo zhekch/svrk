@@ -13,28 +13,50 @@ actor WatchStandaloneTransitService {
         for stop: WatchTransitStop,
         at now: Date = Date()
     ) async throws -> [WatchStationDeparture] {
-        let coordinate = stop.coordinate ?? WatchCoordinate(latitude: 0, longitude: 0)
-        let station = NearbyStation(
+        let fallback = NearbyStation(
             id: stop.stationID ?? "",
             name: stop.name,
-            coordinate: coordinate,
+            coordinate: stop.coordinate ?? WatchCoordinate(latitude: 0, longitude: 0),
             distance: 0,
             icon: nil
         )
-        let services = try await vehicles(at: station, now: now, includeUpcoming: true)
-        return services.compactMap { vehicle in
-            let call = vehicle.stops.first {
-                if let wanted = stop.stationID, let found = $0.stationID {
-                    return wanted == found
+        let group = (try? await stationGroup(for: stop))
+            ?? StationGroup(name: stop.name, stations: [fallback])
+
+        // One request per sibling stop, only while this full-screen board is
+        // open. This joins railway platforms to their forecourt bus/tram stop
+        // without turning map refreshes into broad station-board downloads.
+        let services = await withTaskGroup(of: [WatchTransitVehicle].self) { tasks in
+            for station in group.stations.prefix(6) {
+                tasks.addTask { [self] in
+                    (try? await vehicles(
+                        at: station,
+                        now: now,
+                        includeUpcoming: true
+                    )) ?? []
                 }
-                return Self.sameStop($0.name, stop.name)
+            }
+            var joined: [WatchTransitVehicle] = []
+            for await batch in tasks { joined.append(contentsOf: batch) }
+            return joined
+        }
+
+        let stationIDs = Set(group.stations.map(\.id).filter { !$0.isEmpty })
+        var unique: [String: WatchStationDeparture] = [:]
+        for vehicle in services {
+            let call = vehicle.stops.first {
+                if let found = $0.stationID, stationIDs.contains(found) {
+                    return true
+                }
+                return Self.partOfStation($0.name, group.name)
             }
             guard let call,
                   let departure = call.departure ?? call.arrival,
                   departure >= now.addingTimeInterval(-2 * 60)
-            else { return nil }
-            return WatchStationDeparture(
-                id: vehicle.id,
+            else { continue }
+            let id = "\(vehicle.id)|\(Int(departure.timeIntervalSince1970))"
+            unique[id] = WatchStationDeparture(
+                id: id,
                 mode: vehicle.mode,
                 line: vehicle.line,
                 destination: vehicle.displayDestination,
@@ -43,7 +65,26 @@ actor WatchStandaloneTransitService {
                 delayMinutes: call.delayMinutes ?? vehicle.delayMinutes
             )
         }
-        .sorted { $0.departure < $1.departure }
+        return unique.values.sorted { $0.departure < $1.departure }
+            .prefix(40)
+            .map { $0 }
+    }
+
+    func station(near coordinate: WatchCoordinate) async throws -> WatchTransitStop? {
+        guard coordinate.isValid else { return nil }
+        guard let station = try await stationCandidates(to: coordinate).first,
+              station.distance <= 160
+        else { return nil }
+        return WatchTransitStop(
+            id: "online-station|\(station.id)",
+            stationID: station.id,
+            name: station.name,
+            platform: nil,
+            arrival: nil,
+            departure: nil,
+            delayMinutes: nil,
+            coordinate: station.coordinate
+        )
     }
 
     func snapshot(
@@ -90,6 +131,29 @@ actor WatchStandaloneTransitService {
     }
 
     private func nearestStations(to coordinate: WatchCoordinate) async throws -> [NearbyStation] {
+        let candidates = try await stationCandidates(to: coordinate)
+
+        var selected: [NearbyStation] = []
+        var selectedIDs = Set<String>()
+        var icons = Set<String>()
+        for station in candidates {
+            let icon = station.icon ?? "unknown"
+            guard !icons.contains(icon) else { continue }
+            selected.append(station)
+            selectedIDs.insert(station.id)
+            icons.insert(icon)
+            if selected.count == 6 { return selected }
+        }
+        for station in candidates where !selectedIDs.contains(station.id) {
+            selected.append(station)
+            if selected.count == 6 { break }
+        }
+        return selected
+    }
+
+    private func stationCandidates(
+        to coordinate: WatchCoordinate
+    ) async throws -> [NearbyStation] {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("locations"),
             resolvingAgainstBaseURL: false
@@ -110,29 +174,59 @@ actor WatchStandaloneTransitService {
                 id: id,
                 name: station.name ?? "Nearby stop",
                 coordinate: point,
-                distance: station.distance ?? .greatestFiniteMagnitude,
+                distance: station.distance ?? Self.metres(from: coordinate, to: point),
                 icon: station.icon?.lowercased()
             )
         }.sorted { $0.distance < $1.distance }
 
         guard !candidates.isEmpty else { throw ServiceError.noNearbyStations }
+        return candidates
+    }
 
-        var selected: [NearbyStation] = []
-        var selectedIDs = Set<String>()
-        var icons = Set<String>()
-        for station in candidates {
-            let icon = station.icon ?? "unknown"
-            guard !icons.contains(icon) else { continue }
-            selected.append(station)
-            selectedIDs.insert(station.id)
-            icons.insert(icon)
-            if selected.count == 3 { return selected }
+    private func stationGroup(for stop: WatchTransitStop) async throws -> StationGroup {
+        guard let coordinate = stop.coordinate, coordinate.isValid else {
+            return StationGroup(
+                name: stop.name,
+                stations: [NearbyStation(
+                    id: stop.stationID ?? "",
+                    name: stop.name,
+                    coordinate: WatchCoordinate(latitude: 0, longitude: 0),
+                    distance: 0,
+                    icon: nil
+                )]
+            )
         }
-        for station in candidates where !selectedIDs.contains(station.id) {
-            selected.append(station)
-            if selected.count == 3 { break }
+
+        let candidates = try await stationCandidates(to: coordinate)
+        let close = candidates.filter { $0.distance <= 250 }
+        let parent = close.filter {
+            Self.partOfStation(stop.name, $0.name)
+        }.min { lhs, rhs in
+            if lhs.name.count != rhs.name.count { return lhs.name.count < rhs.name.count }
+            return lhs.distance < rhs.distance
         }
-        return selected
+        let name = parent?.name ?? stop.name
+        var stations = close.filter { Self.partOfStation($0.name, name) }
+
+        if !stations.contains(where: {
+            if let id = stop.stationID, !id.isEmpty { return $0.id == id }
+            return Self.sameStop($0.name, stop.name)
+        }) {
+            stations.append(NearbyStation(
+                id: stop.stationID ?? "",
+                name: stop.name,
+                coordinate: coordinate,
+                distance: 0,
+                icon: nil
+            ))
+        }
+
+        var seen = Set<String>()
+        stations = stations.filter {
+            let key = $0.id.isEmpty ? Self.squash($0.name) : $0.id
+            return seen.insert(key).inserted
+        }
+        return StationGroup(name: name, stations: stations)
     }
 
     private func vehicles(
@@ -320,12 +414,32 @@ actor WatchStandaloneTransitService {
     }
 
     private static func sameStop(_ lhs: String, _ rhs: String) -> Bool {
-        func normalized(_ value: String) -> String {
-            value.lowercased()
-                .split { $0 == "," || $0 == "." || $0.isWhitespace }
-                .joined(separator: " ")
-        }
-        return normalized(lhs) == normalized(rhs)
+        squash(lhs) == squash(rhs)
+    }
+
+    private static func squash(_ name: String) -> String {
+        name.folding(
+            options: [.diacriticInsensitive, .caseInsensitive],
+            locale: Locale(identifier: "en_US")
+        ).filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static func partOfStation(_ name: String, _ stationName: String) -> Bool {
+        sameStop(name, stationName)
+            || name.range(
+                of: "\(stationName), ",
+                options: [.anchored, .caseInsensitive]
+            ) != nil
+    }
+
+    private static func metres(
+        from lhs: WatchCoordinate,
+        to rhs: WatchCoordinate
+    ) -> Double {
+        let latitude = (lhs.latitude + rhs.latitude) * 0.5 * .pi / 180
+        let north = (rhs.latitude - lhs.latitude) * 111_320
+        let east = (rhs.longitude - lhs.longitude) * 111_320 * cos(latitude)
+        return hypot(north, east)
     }
 }
 
@@ -396,6 +510,11 @@ private extension WatchStandaloneTransitService {
         var coordinate: WatchCoordinate
         var distance: Double
         var icon: String?
+    }
+
+    struct StationGroup: Sendable {
+        var name: String
+        var stations: [NearbyStation]
     }
 
     struct TimedCall: Sendable {

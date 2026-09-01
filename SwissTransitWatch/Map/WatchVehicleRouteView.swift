@@ -4,6 +4,8 @@ import SwiftUI
 struct WatchVehicleRouteView: View {
     let vehicle: WatchTransitVehicle
     @State private var camera: MapCameraPosition
+    @State private var railLines: [WatchRailOverlayLine] = []
+    @State private var railRequestRevision = 0
 
     init(vehicle: WatchTransitVehicle) {
         self.vehicle = vehicle
@@ -23,17 +25,15 @@ struct WatchVehicleRouteView: View {
         }
     }
 
-    private var routeParts: (
+    private func routeParts(at now: Date) -> (
         travelled: [CLLocationCoordinate2D], ahead: [CLLocationCoordinate2D]
     ) {
         let stops = routeStops
         guard stops.count >= 2 else { return ([], stops.map(\.coordinate)) }
 
-        let now = Date()
-        let vehicleCoordinate = CLLocationCoordinate2D(
-            latitude: vehicle.latitude,
-            longitude: vehicle.longitude
-        )
+        let liveCoordinate = vehicle.mapPosition(at: now)
+            ?? WatchCoordinate(latitude: vehicle.latitude, longitude: vehicle.longitude)
+        let vehicleCoordinate = liveCoordinate.mapCoordinate
         let firstEvent = stops[0].stop.departure ?? stops[0].stop.eventTime
         if let firstEvent, now <= firstEvent {
             return ([stops[0].coordinate], stops.map(\.coordinate))
@@ -67,8 +67,26 @@ struct WatchVehicleRouteView: View {
     }
 
     var body: some View {
-        let parts = routeParts
-        Map(position: $camera, interactionModes: [.pan, .zoom]) {
+        TimelineView(
+            .periodic(from: .now, by: WatchTransitPolicy.mapPositionInterval)
+        ) { timeline in
+            routeMap(at: timeline.date)
+        }
+    }
+
+    private func routeMap(at now: Date) -> some View {
+        let parts = routeParts(at: now)
+        let liveCoordinate = vehicle.mapPosition(at: now)
+            ?? WatchCoordinate(latitude: vehicle.latitude, longitude: vehicle.longitude)
+        return Map(position: $camera, interactionModes: [.pan, .zoom]) {
+            ForEach(railLines) { line in
+                MapPolyline(coordinates: line.coordinates.map(\.mapCoordinate))
+                    .stroke(
+                        line.style.color.opacity(0.72),
+                        lineWidth: line.isDetailed ? 1.35 : 1
+                    )
+            }
+
             if parts.travelled.count >= 2 {
                 MapPolyline(coordinates: parts.travelled)
                     .stroke(
@@ -105,10 +123,7 @@ struct WatchVehicleRouteView: View {
                         anchor: .center
                     ) {
                         NavigationLink(
-                            value: WatchRoute.station(
-                                vehicleID: vehicle.id,
-                                stopID: stop.id
-                            )
+                            value: WatchRoute.station(stop)
                         ) {
                             Circle()
                                 .fill(index == 0 || index == vehicle.stops.count - 1 ? .white : .secondary)
@@ -117,7 +132,8 @@ struct WatchVehicleRouteView: View {
                                     width: index == 0 || index == vehicle.stops.count - 1 ? 7 : 5,
                                     height: index == 0 || index == vehicle.stops.count - 1 ? 7 : 5
                                 )
-                                .frame(width: 22, height: 22)
+                                .frame(width: 32, height: 32)
+                                .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(stop.name)
@@ -127,10 +143,7 @@ struct WatchVehicleRouteView: View {
 
             Annotation(
                 "",
-                coordinate: CLLocationCoordinate2D(
-                    latitude: vehicle.latitude,
-                    longitude: vehicle.longitude
-                ),
+                coordinate: liveCoordinate.mapCoordinate,
                 anchor: .center
             ) {
                 WatchVehicleDot(mode: vehicle.mode, diameter: 10)
@@ -138,15 +151,25 @@ struct WatchVehicleRouteView: View {
                     .accessibilityLabel(vehicle.accessibilityName)
             }
         }
-        .mapStyle(
-            .standard(
-                elevation: .flat,
-                emphasis: .muted,
-                pointsOfInterest: .excludingAll,
-                showsTraffic: false
-            )
-        )
+        .mapStyle(WatchMapStyle.transit)
+        .task {
+            refreshRailOverlay(Self.region(for: vehicle))
+        }
+        .onMapCameraChange(frequency: .onEnd) { context in
+            refreshRailOverlay(context.region)
+        }
         .navigationTitle(vehicle.displayLine)
+    }
+
+    private func refreshRailOverlay(_ region: MKCoordinateRegion) {
+        railRequestRevision &+= 1
+        let revision = railRequestRevision
+        let viewport = WatchViewport(mapRegion: region)
+        Task {
+            let loaded = await WatchRailOverlayStore.shared.lines(in: viewport)
+            guard revision == railRequestRevision else { return }
+            railLines = loaded
+        }
     }
 
     private static func region(for vehicle: WatchTransitVehicle) -> MKCoordinateRegion {

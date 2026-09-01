@@ -815,7 +815,10 @@ private struct SheetPullObserver: UIViewRepresentable {
     final class ObservationView: UIView {
         var active = false {
             didSet {
-                if !active { openedThisPull = false }
+                if !active {
+                    openedThisPull = false
+                    beganInsideSheet = false
+                }
             }
         }
         var pulledUp: () -> Void = {}
@@ -823,6 +826,13 @@ private struct SheetPullObserver: UIViewRepresentable {
 
         private var pans: [UIPanGestureRecognizer] = []
         private var openedThisPull = false
+        /// Background interaction lets the map receive gestures while the
+        /// compact sheet is up. Its pinch also changes the centroid of UIKit's
+        /// presentation pan, so observing translation alone can mistake map
+        /// zooming for a pull on the sheet and swap the compact offer for a
+        /// full board at the 100-point detent. A real sheet pull begins inside
+        /// this sheet and uses one finger; the map zoom does neither.
+        private var beganInsideSheet = false
         private var installationQueued = false
 
         override func didMoveToWindow() {
@@ -865,9 +875,12 @@ private struct SheetPullObserver: UIViewRepresentable {
             switch pan.state {
             case .began:
                 openedThisPull = false
+                beganInsideSheet = pan.numberOfTouches == 1
+                    && bounds.contains(pan.location(in: self))
             case .changed:
                 let movement = pan.translation(in: window)
-                guard !openedThisPull,
+                guard beganInsideSheet, pan.numberOfTouches == 1,
+                      !openedThisPull,
                       movement.y < -12,
                       abs(movement.y) > abs(movement.x)
                 else { return }
@@ -876,6 +889,7 @@ private struct SheetPullObserver: UIViewRepresentable {
             case .ended, .cancelled, .failed:
                 if openedThisPull { ended() }
                 openedThisPull = false
+                beganInsideSheet = false
             default:
                 break
             }
@@ -887,6 +901,7 @@ private struct SheetPullObserver: UIViewRepresentable {
             }
             pans.removeAll()
             openedThisPull = false
+            beganInsideSheet = false
         }
     }
 }

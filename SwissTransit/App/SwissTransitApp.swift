@@ -33,11 +33,12 @@ struct SwissTransitApp: App {
             case .active:
                 model.resume()
             case .inactive:
-                // Stop producers immediately for Control Center, app switching
-                // and the first half of a background transition. Persistence
-                // waits for `.background`, so that ordinary active → inactive
-                // → background sequence does not write the same caches twice.
-                model.suspend()
+                // A system surface can cover the app without sending it to the
+                // background. On current iOS that includes the full-screen
+                // screenshot preview. Pause only presentation here: tearing
+                // down geometry and network producers for that transient cover
+                // made dismissing every screenshot a cold resume.
+                model.pausePresentation()
             case .background:
                 model.suspend()
                 Task { await model.persist() }

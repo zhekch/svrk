@@ -51,6 +51,7 @@
 		EEBF3400E78A0B228E803120 /* SwissTransitWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B6DAC6F97359E5E9E0E757D /* SwissTransitWatchApp.swift */; };
 		49A907D864FF0446125A6477 /* WatchContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE2B06152D09216C88B3E3BF /* WatchContentView.swift */; };
 		5F9AD9CAA15807FB343390CC /* WatchTransitModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CA3A0C07AE4B75A97A05EC9 /* WatchTransitModel.swift */; };
+		560C582815094304F33D9596 /* WatchRailOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59A3BC3CC76ED20165B0892D /* WatchRailOverlay.swift */; };
 		2A3228E8DDC17ECEEBE01F28 /* WatchTransitMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E3F141F35F630823137C694 /* WatchTransitMap.swift */; };
 		69542F123196BB679319ED55 /* WatchVehicleRouteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E5275DF9CD7DFF264447FC5 /* WatchVehicleRouteView.swift */; };
 		111375342D791F3108200C37 /* WatchTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D96FBA17B6AD22A23EC5B97 /* WatchTransport.swift */; };
@@ -64,6 +65,9 @@
 		920290C280F129D8C2C25CE6 /* Data in Resources */ = {isa = PBXBuildFile; fileRef = EF6A92AD61B8A60A5F98005B /* Data */; };
 		C30D1A4A179523B02CDF3F09 /* Secrets.plist in Resources */ = {isa = PBXBuildFile; fileRef = 97C5CB36F6ADCDB569944079 /* Secrets.plist */; };
 		708FF730AB8623F3D81F53FE /* vehicle-layouts.json in Resources */ = {isa = PBXBuildFile; fileRef = 04D1C4DD73304D87FBBBCFAE /* vehicle-layouts.json */; };
+		7F43E72CBADCFCFA124E59FA /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = BB4CB169143CF8DC12E4F7AC /* AppIcon.icon */; };
+		F35A49C12E04F2DF298F3A1E /* watch-rail-overlay-v1.bin in Resources */ = {isa = PBXBuildFile; fileRef = 9F8B25DC0F41FE0366B82AB1 /* watch-rail-overlay-v1.bin */; };
+		3EE55B3B17D83A60BDB76D6A /* AppIcon_watch.icon in Resources */ = {isa = PBXBuildFile; fileRef = 29B13ABC9982AD26E0858400 /* AppIcon_watch.icon */; };
 		2DD28A442559D1925A31F14E /* TransitCore in Frameworks */ = {isa = PBXBuildFile; productRef = 0A33270A1B6C3D4E1C3694F5 /* TransitCore */; };
 		69B1D9C22586A02F4E3E34BE /* MapboxMaps in Frameworks */ = {isa = PBXBuildFile; productRef = 15EAC762680A41F8EE13792E /* MapboxMaps */; };
 		179EC3D0FB6AB45BEE7E67A9 /* SwissTransit Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 03944FB4BD4F601B7757F914 /* SwissTransit Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -117,6 +121,7 @@
 		1B6DAC6F97359E5E9E0E757D /* SwissTransitWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwissTransitWatchApp.swift; sourceTree = "<group>"; };
 		BE2B06152D09216C88B3E3BF /* WatchContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchContentView.swift; sourceTree = "<group>"; };
 		4CA3A0C07AE4B75A97A05EC9 /* WatchTransitModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchTransitModel.swift; sourceTree = "<group>"; };
+		59A3BC3CC76ED20165B0892D /* WatchRailOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchRailOverlay.swift; sourceTree = "<group>"; };
 		5E3F141F35F630823137C694 /* WatchTransitMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchTransitMap.swift; sourceTree = "<group>"; };
 		6E5275DF9CD7DFF264447FC5 /* WatchVehicleRouteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchVehicleRouteView.swift; sourceTree = "<group>"; };
 		9D96FBA17B6AD22A23EC5B97 /* WatchTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchTransport.swift; sourceTree = "<group>"; };
@@ -130,6 +135,9 @@
 		EF6A92AD61B8A60A5F98005B /* Data */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Data; sourceTree = "<group>"; };
 		97C5CB36F6ADCDB569944079 /* Secrets.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Secrets.plist; sourceTree = "<group>"; };
 		04D1C4DD73304D87FBBBCFAE /* vehicle-layouts.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = vehicle-layouts.json; sourceTree = "<group>"; };
+		BB4CB169143CF8DC12E4F7AC /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon.icon; sourceTree = "<group>"; };
+		9F8B25DC0F41FE0366B82AB1 /* watch-rail-overlay-v1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = watch-rail-overlay-v1.bin; sourceTree = "<group>"; };
+		29B13ABC9982AD26E0858400 /* AppIcon_watch.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon_watch.icon; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -244,6 +252,7 @@
 		957D2FEFF6F4A67CA70FEA92 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
+				BB4CB169143CF8DC12E4F7AC /* AppIcon.icon */,
 				EF6A92AD61B8A60A5F98005B /* Data */,
 				97C5CB36F6ADCDB569944079 /* Secrets.plist */,
 				04D1C4DD73304D87FBBBCFAE /* vehicle-layouts.json */,
@@ -258,6 +267,7 @@
 				7DF6B61AD38CC8ECBFBD4CBD /* Map */,
 				3B434776E94B3C6C54183852 /* Models */,
 				F5E77935AC9B10B2C779A07C /* Panels */,
+				91D10153484FFCB7F68E5EB6 /* Resources */,
 				AE456B57E17EB8D16DA63FA6 /* Services */,
 				5612C9D6A40B42CB85270E33 /* UI */,
 			);
@@ -277,6 +287,7 @@
 		7DF6B61AD38CC8ECBFBD4CBD /* Map */ = {
 			isa = PBXGroup;
 			children = (
+				59A3BC3CC76ED20165B0892D /* WatchRailOverlay.swift */,
 				5E3F141F35F630823137C694 /* WatchTransitMap.swift */,
 				6E5275DF9CD7DFF264447FC5 /* WatchVehicleRouteView.swift */,
 			);
@@ -299,6 +310,15 @@
 				88B77BEEE23E4195625900AE /* WatchVehicleViews.swift */,
 			);
 			path = Panels;
+			sourceTree = "<group>";
+		};
+		91D10153484FFCB7F68E5EB6 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				29B13ABC9982AD26E0858400 /* AppIcon_watch.icon */,
+				9F8B25DC0F41FE0366B82AB1 /* watch-rail-overlay-v1.bin */,
+			);
+			path = Resources;
 			sourceTree = "<group>";
 		};
 		AE456B57E17EB8D16DA63FA6 /* Services */ = {
@@ -378,6 +398,7 @@
 				EEBF3400E78A0B228E803120 /* SwissTransitWatchApp.swift in Sources */,
 				49A907D864FF0446125A6477 /* WatchContentView.swift in Sources */,
 				5F9AD9CAA15807FB343390CC /* WatchTransitModel.swift in Sources */,
+				560C582815094304F33D9596 /* WatchRailOverlay.swift in Sources */,
 				2A3228E8DDC17ECEEBE01F28 /* WatchTransitMap.swift in Sources */,
 				69542F123196BB679319ED55 /* WatchVehicleRouteView.swift in Sources */,
 				111375342D791F3108200C37 /* WatchTransport.swift in Sources */,
@@ -401,6 +422,7 @@
 				920290C280F129D8C2C25CE6 /* Data in Resources */,
 				C30D1A4A179523B02CDF3F09 /* Secrets.plist in Resources */,
 				708FF730AB8623F3D81F53FE /* vehicle-layouts.json in Resources */,
+				7F43E72CBADCFCFA124E59FA /* AppIcon.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -408,6 +430,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F35A49C12E04F2DF298F3A1E /* watch-rail-overlay-v1.bin in Resources */,
+				3EE55B3B17D83A60BDB76D6A /* AppIcon_watch.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -651,6 +675,7 @@
 		A0E3C62DC6D5E8781BDDCB2B /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon_watch;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = K83N2TZ5G3;
@@ -676,6 +701,7 @@
 		D918C5040C85B0AF817B171C /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon_watch;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = K83N2TZ5G3;
