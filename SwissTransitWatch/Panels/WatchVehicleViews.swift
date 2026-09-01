@@ -3,6 +3,7 @@ import SwiftUI
 
 struct WatchVehicleDetailView: View {
     let vehicle: WatchTransitVehicle
+    let routeValue: WatchRoute
 
     private var canShowRoute: Bool {
         vehicle.stops.lazy.compactMap(\.coordinate).filter(\.isValid).prefix(2).count == 2
@@ -32,7 +33,7 @@ struct WatchVehicleDetailView: View {
                 }
 
                 if canShowRoute {
-                    NavigationLink(value: WatchRoute.vehicleRoute(vehicle.id)) {
+                    NavigationLink(value: routeValue) {
                         WatchGlassActionLabel(
                             title: "Show route",
                             systemName: "map.fill",
@@ -259,3 +260,12 @@ extension WatchTransitVehicle {
         return origin
     }
 }
+
+#if DEBUG
+#Preview("Train") {
+    WatchVehicleDetailView(
+        vehicle: WatchPreviewData.train,
+        routeValue: .vehicleRoute(WatchPreviewData.train.id)
+    )
+}
+#endif

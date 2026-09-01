@@ -8,54 +8,23 @@ struct WatchMenuView: View {
         ScrollView {
             LazyVStack(spacing: 7) {
                 destination(.status, title: "Status", symbol: "gauge.with.dots.needle.50percent", tint: .green)
-                destination(.about, title: "About", symbol: "info.circle.fill", tint: .blue)
 
-                WatchGlassCard {
-                    VStack(spacing: 0) {
-                        Button {
-                            model.locate()
-                        } label: {
-                            WatchMenuActionRow(
-                                title: model.isLocating ? "Locating…" : "My location",
-                                symbol: "location.fill",
-                                tint: .blue,
-                                isBusy: model.isLocating
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(model.isLocating)
 
-                        Divider().opacity(0.4)
-
-                        Button {
-                            model.refresh()
-                        } label: {
-                            WatchMenuActionRow(
-                                title: model.isRefreshing ? "Refreshing…" : "Refresh now",
-                                symbol: "arrow.clockwise",
-                                tint: .cyan,
-                                isBusy: model.isRefreshing
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(model.isRefreshing)
-                    }
-                }
 
                 WatchGlassCard {
                     VStack(alignment: .leading, spacing: 7) {
-                        Label("Full offline", systemImage: "square.and.arrow.down.fill")
+                        Label("Timetable", systemImage: "square.and.arrow.down.fill")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
 
                         Text(model.fullTimetableStatus)
                             .font(.caption.weight(.semibold))
                         if let validity = model.fullTimetableValidity {
-                            Text("Valid to \(validity)")
+                            Text("Valid until \(validity)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         } else {
-                            Text("About 124 MB · all Switzerland")
+                            Text("~124 MB")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -65,8 +34,8 @@ struct WatchMenuView: View {
                         } label: {
                             WatchGlassActionLabel(
                                 title: model.nationalTimetableInfo == nil
-                                    ? "Download everything"
-                                    : "Update download",
+                                    ? "Download"
+                                    : "Update",
                                 systemName: "arrow.down.circle",
                                 tint: .blue
                             )
@@ -75,6 +44,7 @@ struct WatchMenuView: View {
                         .disabled(model.isDownloadingFullTimetable)
                     }
                 }
+                destination(.about, title: "About", symbol: "info.circle.fill", tint: .blue)
 
                 if let error = model.lastError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -156,13 +126,7 @@ struct WatchStatusView: View {
                                 ? (model.isSnapshotStale ? "Needs refresh" : "Ready")
                                 : "No cache"
                         )
-                        Divider().opacity(0.4)
-                        WatchStatusRow(
-                            title: "Data",
-                            value: model.nationalTimetableInfo == nil
-                                ? "Direct on watch"
-                                : "Full offline"
-                        )
+
                         Divider().opacity(0.4)
                         WatchStatusRow(title: "Location", value: model.locationStatusText)
                         Divider().opacity(0.4)
@@ -176,60 +140,6 @@ struct WatchStatusView: View {
                     }
                 }
 
-                if model.hasSnapshot {
-                    WatchGlassCard {
-                        VStack(spacing: 7) {
-                            WatchStatusRow(
-                                title: "Saved",
-                                value: model.snapshot.generatedAt.formatted(
-                                    date: .omitted,
-                                    time: .shortened
-                                )
-                            )
-                            if let sourceDate = model.snapshot.sourceUpdatedAt {
-                                Divider().opacity(0.4)
-                                WatchStatusRow(
-                                    title: "Source",
-                                    value: sourceDate.formatted(
-                                        date: .omitted,
-                                        time: .shortened
-                                    )
-                                )
-                            }
-                        }
-                    }
-                }
-
-                Button {
-                    model.locate()
-                } label: {
-                    WatchGlassActionLabel(
-                        title: model.isLocating ? "Locating…" : "My location",
-                        systemName: "location.fill",
-                        tint: .blue
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.isLocating)
-
-                Button {
-                    model.refresh()
-                } label: {
-                    WatchGlassActionLabel(
-                        title: model.isRefreshing ? "Refreshing…" : "Refresh",
-                        systemName: "arrow.clockwise",
-                        tint: .cyan
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.isRefreshing)
-
-                if let error = model.lastError {
-                    Text(error)
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                        .padding(.horizontal, 8)
-                }
             }
             .padding(.horizontal, 6)
             .padding(.bottom, 12)
@@ -287,3 +197,216 @@ struct WatchAboutView: View {
         .navigationTitle("About")
     }
 }
+
+#if DEBUG
+@MainActor
+enum WatchPreviewData {
+    static let zurichHB = WatchTransitStop(
+        id: "8503000",
+        stationID: "8503000",
+        name: "Zürich HB",
+        platform: "9",
+        arrival: nil,
+        departure: nil,
+        delayMinutes: nil,
+        coordinate: WatchCoordinate(latitude: 47.37818, longitude: 8.54019)
+    )
+
+    static var train: WatchTransitVehicle {
+        return WatchTransitVehicle(
+            id: "preview-ic5",
+            mode: "train",
+            line: "IC 5",
+            destination: "St. Gallen",
+            origin: "Lausanne",
+            operatorName: "SBB CFF FFS",
+            delayMinutes: 3,
+            latitude: 47.4300,
+            longitude: 8.5510,
+            stops: [
+                timedStop(
+                    id: "8503000",
+                    name: "Zürich HB",
+                    platform: "9",
+                    minutes: -4,
+                    latitude: 47.37818,
+                    longitude: 8.54019,
+                    delay: 3
+                ),
+                timedStop(
+                    id: "8503006",
+                    name: "Zürich Oerlikon",
+                    platform: "4",
+                    minutes: 4,
+                    latitude: 47.41153,
+                    longitude: 8.54414,
+                    delay: 3
+                ),
+                timedStop(
+                    id: "8503016",
+                    name: "Zürich Flughafen",
+                    platform: "2",
+                    minutes: 12,
+                    latitude: 47.45042,
+                    longitude: 8.56242,
+                    delay: 3
+                ),
+                timedStop(
+                    id: "8506000",
+                    name: "Winterthur",
+                    platform: "3",
+                    minutes: 25,
+                    latitude: 47.50012,
+                    longitude: 8.72414,
+                    delay: 3
+                ),
+            ]
+        )
+    }
+
+    static var stationDepartures: [WatchStationDeparture] {
+        let now = Date()
+        let previewTrain = train
+        return [
+            WatchStationDeparture(
+                id: "preview-ic5-board",
+                mode: "train",
+                line: "IC 5",
+                destination: "St. Gallen",
+                origin: "Lausanne",
+                arrival: now.addingTimeInterval(3 * 60),
+                departure: now.addingTimeInterval(4 * 60),
+                platform: "9A-C",
+                delayMinutes: 3,
+                vehicle: previewTrain,
+                originates: false,
+                terminates: false,
+                typicalIntervalMinutes: 60
+            ),
+            WatchStationDeparture(
+                id: "preview-s11-1",
+                mode: "train",
+                line: "S 11",
+                destination: "Seuzach",
+                origin: "Aarau",
+                arrival: now.addingTimeInterval(7 * 60),
+                departure: now.addingTimeInterval(8 * 60),
+                platform: "41/42",
+                delayMinutes: nil,
+                vehicle: nil,
+                originates: false,
+                terminates: false,
+                typicalIntervalMinutes: 30
+            ),
+            WatchStationDeparture(
+                id: "preview-ir75",
+                mode: "train",
+                line: "IR 75",
+                destination: "Konstanz",
+                origin: "Luzern",
+                arrival: now.addingTimeInterval(15 * 60),
+                departure: now.addingTimeInterval(16 * 60),
+                platform: "11",
+                delayMinutes: nil,
+                vehicle: nil,
+                originates: false,
+                terminates: false,
+                typicalIntervalMinutes: 60
+            ),
+            WatchStationDeparture(
+                id: "preview-s11-2",
+                mode: "train",
+                line: "S 11",
+                destination: "Seuzach",
+                origin: "Aarau",
+                arrival: now.addingTimeInterval(37 * 60),
+                departure: now.addingTimeInterval(38 * 60),
+                platform: "41/42",
+                delayMinutes: nil,
+                vehicle: nil,
+                originates: false,
+                terminates: false,
+                typicalIntervalMinutes: 30
+            ),
+            WatchStationDeparture(
+                id: "preview-s11-3",
+                mode: "train",
+                line: "S 11",
+                destination: "Seuzach",
+                origin: "Aarau",
+                arrival: now.addingTimeInterval(67 * 60),
+                departure: now.addingTimeInterval(68 * 60),
+                platform: "41/42",
+                delayMinutes: nil,
+                vehicle: nil,
+                originates: false,
+                terminates: false,
+                typicalIntervalMinutes: 30
+            ),
+        ]
+    }
+
+    static var departureGroup: WatchDepartureGroup {
+        WatchDepartureGroup(
+            id: "preview-s11-group",
+            departures: stationDepartures.filter { $0.line == "S 11" },
+            showing: .departure
+        )
+    }
+
+    static var snapshot: WatchTransitSnapshot {
+        let previewTrain = train
+        return WatchTransitSnapshot(
+            generatedAt: Date().addingTimeInterval(-2 * 60),
+            sourceUpdatedAt: Date().addingTimeInterval(-3 * 60),
+            viewport: .near(
+                WatchCoordinate(latitude: previewTrain.latitude, longitude: previewTrain.longitude)
+            ),
+            vehicles: [previewTrain]
+        )
+    }
+
+    static func model() -> WatchTransitModel {
+        let model = WatchTransitModel()
+        model.installPreview(snapshot: snapshot)
+        return model
+    }
+
+    private static func timedStop(
+        id: String,
+        name: String,
+        platform: String,
+        minutes: Int,
+        latitude: Double,
+        longitude: Double,
+        delay: Int
+    ) -> WatchTransitStop {
+        let event = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        return WatchTransitStop(
+            id: id,
+            stationID: id,
+            name: name,
+            platform: platform,
+            arrival: event.addingTimeInterval(-45),
+            departure: event,
+            delayMinutes: delay,
+            coordinate: WatchCoordinate(latitude: latitude, longitude: longitude)
+        )
+    }
+}
+
+/// Canvas-only host for the watch menu. The model deliberately never enters
+/// foreground, so previewing its rows cannot request location or the network.
+@MainActor
+private struct WatchMenuPreviewHost: View {
+    @State private var model = WatchPreviewData.model()
+
+    var body: some View {
+        WatchMenuView(model: model)
+    }
+}
+
+#Preview("Menu") {
+    WatchMenuPreviewHost()
+}
+#endif

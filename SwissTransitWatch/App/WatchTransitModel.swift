@@ -81,9 +81,8 @@ final class WatchTransitModel: NSObject {
 
     var fullTimetableStatus: String {
         if isDownloadingFullTimetable { return "Downloading…" }
-        guard let nationalTimetableInfo else { return "Not downloaded" }
-        let megabytes = max(1, nationalTimetableInfo.byteCount / 1_000_000)
-        return "Downloaded · \(megabytes) MB"
+        guard nationalTimetableInfo != nil else { return "Not downloaded" }
+        return "Downloaded"
     }
 
     var fullTimetableValidity: String? {
@@ -240,6 +239,18 @@ final class WatchTransitModel: NSObject {
         return try await onlineService.stationBoard(for: stop, at: now)
     }
 
+    /// Reads close-range stop markers from the installed stop register. If the
+    /// optional archive is absent, use one small nearby-stations request so a
+    /// rural stop is not dependent on an active vehicle being in the snapshot.
+    func mapStops(in viewport: WatchViewport) async -> [WatchTransitStop] {
+        let now = Date()
+        if let info = try? await nationalService.installedInfo(),
+           (info.validFrom ... info.validUntil).contains(now) {
+            return (try? await nationalService.mapStops(in: viewport)) ?? []
+        }
+        return (try? await onlineService.mapStops(in: viewport)) ?? []
+    }
+
     /// Resolves a tap on a native Apple Maps transit label. This is a one-shot
     /// lookup; it starts no map, location or board polling.
     func station(near coordinate: WatchCoordinate) async -> WatchTransitStop? {
@@ -252,6 +263,15 @@ final class WatchTransitModel: NSObject {
         }
         return try? await onlineService.station(near: coordinate)
     }
+
+    #if DEBUG
+    /// Installs deterministic, in-memory data for Canvas without starting any
+    /// of the model's foreground location or refresh work.
+    func installPreview(snapshot previewSnapshot: WatchTransitSnapshot) {
+        snapshot = Self.validated(snapshot: previewSnapshot)
+        currentViewport = snapshot.viewport
+    }
+    #endif
 
     private func requestSingleLocation() {
         guard isForeground else { return }
@@ -413,6 +433,11 @@ final class WatchTransitModel: NSObject {
         var snapshot = snapshot
         snapshot.vehicles = Array(snapshot.vehicles.lazy.filter {
             WatchCoordinate(latitude: $0.latitude, longitude: $0.longitude).isValid
+        }.sorted { lhs, rhs in
+            let lhsPriority = WatchModeRenderPriority.value(for: lhs.mode)
+            let rhsPriority = WatchModeRenderPriority.value(for: rhs.mode)
+            if lhsPriority != rhsPriority { return lhsPriority > rhsPriority }
+            return lhs.id < rhs.id
         }.prefix(160))
         return snapshot
     }

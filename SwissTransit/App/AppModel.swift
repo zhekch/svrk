@@ -9,6 +9,10 @@ import TransitCore
 enum Selection: Equatable {
     case none
     case vehicle(String)
+    /// A departure offered by a board but not presently represented by a map
+    /// vehicle. The time distinguishes a recurring trip on adjacent days and
+    /// identifies the stop-time row the reader tapped.
+    case service(String, departure: Timestamp)
     case station(StationBoard)
     case platform(PlatformBoard)
     case track([RelationStore.LineOnWay])
@@ -569,6 +573,10 @@ final class AppModel {
         case let .vehicle(id):
             guard let vehicle = await fleet.journey(id: id, at: clock.nowSeconds()) else { return }
             onFocus?(Coord(lon: vehicle.lon, lat: vehicle.lat), max(zoom, 14))
+        case .service:
+            // A scheduled service has no honest current point to centre on and
+            // no map vehicle to follow.
+            return
         case let .station(board):
             onFocus?(Coord(lon: board.lon, lat: board.lat), max(zoom, 14))
         case let .platform(board):
@@ -1005,8 +1013,12 @@ final class AppModel {
     /// Consume the debug start, so it applies once rather than fighting the user
     /// for the camera on every frame.
     func takeDebugStart() -> DebugStart? {
-        defer { debugStart = nil }
-        return debugStart
+        // Do not publish a mutation when there is nothing to consume. This is
+        // called from `updateUIView`; writing nil over nil invalidates that view
+        // again and turns a lifecycle redraw into a permanent feedback loop.
+        guard let start = debugStart else { return nil }
+        debugStart = nil
+        return start
     }
 
     // MARK: - Pretending to be on board
@@ -2915,6 +2927,7 @@ final class AppModel {
                 ? $0.id < $1.id
                 : $0.mode.drawOrder < $1.mode.drawOrder
         }
+        found = collapsedPointVehicles(found, selectedID: frame.selectedID)
         // What the next interval is paced off. See `pace`.
         var fastest = 0.0
         for vehicle in found where vehicle.speed > fastest { fastest = vehicle.speed }
@@ -3151,6 +3164,12 @@ final class AppModel {
                 expected: panelSelection, generation: panelGeneration
             )
             guard !backgroundWorkSuspended, !Task.isCancelled else { return }
+        } else if case let .service(id, departure) = panelSelection {
+            await loadVehicle(
+                id: id, at: now, boardDeparture: departure,
+                expected: panelSelection, generation: panelGeneration
+            )
+            guard !backgroundWorkSuspended, !Task.isCancelled else { return }
         }
 
         // A second frame only if one of them actually produced something. Each
@@ -3268,6 +3287,56 @@ final class AppModel {
     /// in frames. A dropped frame must not slow the change down.
     private var lastEmergeStep: TimeInterval?
 
+    private struct PointVehicleKey: Hashable {
+        var mode: Mode
+        var line: String
+        var operatorName: String
+        var lon: Int
+        var lat: Int
+    }
+
+    /// Co-located runs of a service with no drawable route are one map object.
+    ///
+    /// An elevator may have a timetable row every few minutes and every one of
+    /// those rows can be alive during the terminus hold. They all occupy the
+    /// same point and no picture can distinguish them, so retain one dot — or
+    /// the selected one, if the reader already picked a particular run.
+    private func collapsedPointVehicles(
+        _ candidates: [VehicleSnapshot], selectedID: String?
+    ) -> [VehicleSnapshot] {
+        var result: [VehicleSnapshot] = []
+        result.reserveCapacity(candidates.count)
+        var representative: [PointVehicleKey: Int] = [:]
+
+        for vehicle in candidates {
+            guard !VehicleShape.hasDrawableRoute(
+                vehicle, vehicleLength: 0
+            ) else {
+                result.append(vehicle)
+                continue
+            }
+
+            // A hundred-thousandth of a degree is roughly a metre here. The
+            // lift rows in question are exactly co-located; rounding only
+            // absorbs harmless coordinate noise without merging neighbouring
+            // platforms or two different service numbers.
+            let key = PointVehicleKey(
+                mode: vehicle.mode,
+                line: vehicle.line,
+                operatorName: vehicle.operatorName ?? "",
+                lon: Int((vehicle.lon * 100_000).rounded()),
+                lat: Int((vehicle.lat * 100_000).rounded())
+            )
+            if let index = representative[key] {
+                if vehicle.id == selectedID { result[index] = vehicle }
+            } else {
+                representative[key] = result.count
+                result.append(vehicle)
+            }
+        }
+        return result
+    }
+
     private func rebuildShapes(_ candidates: [VehicleSnapshot], for frame: TickFrame) {
         guard frame.shapesPossible else {
             if !vehicleShapes.isEmpty { vehicleShapes = []; shapesByID = [:] }
@@ -3322,14 +3391,22 @@ final class AppModel {
         for vehicle in candidates {
             if built.count >= Self.shapeLimit { break }
             let layout = layouts.layout(for: vehicle, modeColour: vehicle.mode.hex)
+            // With no meaningful line behind the point there is nowhere honest
+            // to put a body. Leave the dot in place; the point collapse above
+            // has already reduced identical elevator runs to one of those.
+            guard VehicleShape.hasDrawableRoute(
+                vehicle, vehicleLength: layout.length
+            ) else {
+                stillEmerging[vehicle.id] = 0
+                continue
+            }
             // The decision, taken on the same two numbers the footprint takes
             // it on, before anything is built: this vehicle is long enough on
             // screen to be drawn, or it is a dot.
             let threshold = VehicleShape.emergeAt(
                 bodies: layout.units.count, hanging: Cableway.hangs(vehicle)
             )
-            let floor = vehicle.id == selectedID ? threshold * 0.6 : threshold
-            let target: Double = layout.length / frame.metresPerPoint >= floor ? 1 : 0
+            let target: Double = layout.length / frame.metresPerPoint >= threshold ? 1 : 0
             // A vehicle seen for the first time snaps. Panning onto a station
             // full of trains is not fifty vehicles arriving; they were already
             // there, and animating them in is the map inventing an event.
@@ -3564,7 +3641,7 @@ final class AppModel {
                   !Task.isCancelled else { return }
             vehicleDisruptions = []
             stopDisruptions = found
-        case .vehicle:
+        case .vehicle, .service:
             guard let vehicle = departingVehicle ?? selectedVehicle else {
                 vehicleDisruptions = []
                 stopDisruptions = []
@@ -3709,6 +3786,27 @@ final class AppModel {
                 id: id, at: clock.nowSeconds(),
                 expected: expected, generation: generation
             )
+        case let .service(id, departure):
+            await loadVehicle(
+                id: id, at: clock.nowSeconds(), boardDeparture: departure,
+                expected: expected, generation: generation
+            )
+            guard selectionIsCurrent(expected, generation: generation),
+                  !Task.isCancelled else { return }
+            if let geometry = await fleet.boardJourneyGeometry(
+                id: id, departure: departure
+            ) {
+                guard selectionIsCurrent(expected, generation: generation),
+                      !Task.isCancelled else { return }
+                setSelectedGeometry(geometry)
+                // Keep the Source section in step with the line on the map.
+                // The timetable card was published before the route build so
+                // the sheet remained interactive while this task suspended.
+                if var vehicle = selectedVehicle {
+                    vehicle.geometry = geometry
+                    selectedVehicle = vehicle
+                }
+            }
         }
         guard selectionIsCurrent(expected, generation: generation),
               !Task.isCancelled else { return }
@@ -3724,9 +3822,12 @@ final class AppModel {
     private var panelReadAt = Date.distantPast
 
     private func loadVehicle(
-        id: String, at now: Timestamp, expected: Selection, generation: UInt64
+        id: String, at now: Timestamp, boardDeparture: Timestamp? = nil,
+        expected: Selection, generation: UInt64
     ) async {
-        let found = await fleet.journey(id: id, at: now)
+        let found = await fleet.journey(
+            id: id, at: now, boardDeparture: boardDeparture
+        )
         guard selectionIsCurrent(expected, generation: generation),
               !Task.isCancelled else { return }
         let departing = await outgoing(of: found, at: now)
@@ -3764,6 +3865,12 @@ final class AppModel {
         panelReadAt = Date()
         selectedVehicle = found
         departingVehicle = departing
+        // A scheduled page is a timetable, not a live vehicle. Starting the
+        // formation and occupancy requests here made sections appear while the
+        // user was pulling the sheet open, changing its layout mid-gesture.
+        // Selection cleanup already cleared those values; leave the card stable
+        // while the route worker fills in the map independently.
+        guard boardDeparture == nil else { return }
         loadFormation(
             of: departing ?? found, arriving: found,
             expected: expected, generation: generation
@@ -4457,10 +4564,16 @@ final class AppModel {
         // and after that the drawn position is the only one the finger can aim
         // at — a plate nudged 40 px up a forecourt has to answer where it is.
         let plateReach = footprint == nil
-            ? max(20, metresPerPoint * 16)
+            // Keep the hit target the size it is on screen. A 20-metre floor
+            // becomes roughly a hundred points at platform zoom, so aiming at
+            // Stop A also collected Stop B across the street and opened a
+            // picker for two visibly separate plates. Ground distance therefore
+            // has no minimum here: sixteen points stays sixteen points at every
+            // zoom, which is the marker the person can actually see and aim at.
+            ? metresPerPoint * 16
             : metresPerPoint * Self.underFingerPoints
 
-        let best = await bestTap(
+        var best = await bestTap(
             lon: lon, lat: lat, at: now, reach: reach, plateReach: plateReach,
             metresPerPoint: metresPerPoint, footprint: footprint,
             stationShapes: stationShapes, stopDots: stopDots, solidTaps: solidTaps
@@ -4509,6 +4622,15 @@ final class AppModel {
                 platformShapes: platformShapes, stationShapes: stationShapes,
                 stopDots: stopDots, solidTaps: solidTaps
             )
+            // A codeless forecourt marker can be the same interchange as the
+            // railway station beside it. Once the choice list has folded that
+            // redundant marker into its parent, make the single-answer path
+            // choose the same parent too; otherwise the list would be correct
+            // but a direct tap would still open the duplicate stop board.
+            if case let .platform(board) = best,
+               let parent = Self.parentStation(for: board, among: options) {
+                best = parent.selection
+            }
             // A vehicle the ranking is already sure about is not an ambiguity.
             //
             // Standing at a platform, a train is inside the drawn slab, inside
@@ -4643,10 +4765,26 @@ final class AppModel {
         ) { $0.dotDrawn(at: zoom) }
         for place in places {
             guard let board = await fleet.stationBoard(placeId: place.id, at: now) else { continue }
+            // `stationBoard` may promote a forecourt stop such as
+            // “Mülenen, Bahnhof” to its railway parent. Describe the board we
+            // are actually offering, not the child row that led us to it.
+            let rail = await fleet.stopPlaces.place(id: board.id)?.rail ?? place.rail
             add(.station(
-                board, rail: place.rail,
+                board, rail: rail,
                 distance: Geo.flatMetres(place.lon, place.lat, lon, lat)
             ))
+        }
+
+        // A codeless stop named as part of a railway station is the station's
+        // bus/tram side, not a second place. Fold only marker points here:
+        // coded/assigned Stop A/B rows and drawn platform areas remain
+        // individually selectable.
+        let gathered = out
+        out.removeAll { choice in
+            guard choice.kind == .marker,
+                  case let .platform(board) = choice.selection
+            else { return false }
+            return Self.parentStation(for: board, among: gathered) != nil
         }
 
         // The rails are deliberately not offered.
@@ -4658,6 +4796,30 @@ final class AppModel {
         // lines run here" is still the answer to a tap on bare track, where it
         // is the only answer there is; see the end of `bestTap`.
         return out
+    }
+
+    /// The railway station that fully contains a generic codeless stop marker.
+    ///
+    /// This is deliberately narrower than proximity. A named or generated bay
+    /// is useful on its own and a drawn platform is a physical target; only an
+    /// unlabelled point whose name is the station or a comma-child of it is
+    /// redundant.
+    private static func parentStation(
+        for stop: PlatformBoard, among choices: [TapChoice]
+    ) -> TapChoice? {
+        guard !stop.rail, !stop.stationOnly,
+              stop.code?.isEmpty != false, stop.assigned?.isEmpty != false
+        else { return nil }
+
+        return choices.first { choice in
+            guard choice.rail == true,
+                  case let .station(station) = choice.selection,
+                  Geo.flatMetres(stop.lon, stop.lat, station.lon, station.lat) <= 250
+            else { return false }
+            return Fleet.isGenericStationStop(
+                stop.name, stationName: station.name
+            )
+        }
     }
 
     /// The one thing a tap would open if it had to choose, in the order a
@@ -4939,8 +5101,12 @@ final class AppModel {
         return best
     }
 
-    func select(journey id: String) async {
-        push(.vehicle(id))
+    func select(journey entry: BoardEntry) async {
+        if entry.running {
+            push(.vehicle(entry.id))
+        } else {
+            push(.service(entry.id, departure: entry.departure))
+        }
     }
 
     // MARK: - Search

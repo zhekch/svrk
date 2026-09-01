@@ -23,6 +23,9 @@ struct VehiclePanel: View {
     /// The working this vehicle arrived on, where the panel is showing the one
     /// it leaves as instead. Nil whenever the two are the same thing.
     var arrivedAs: VehicleSnapshot?
+    /// The stop-time row that opened a scheduled (not currently running)
+    /// service. Nil for an actual vehicle selected on the map.
+    var boardDeparture: Timestamp? = nil
 
     /// Which half of a splitting train the stop list is following. Nil until
     /// the reader picks one, which is what makes the first direction the
@@ -537,7 +540,28 @@ struct VehiclePanel: View {
             if let ahead = model.vehicleLoad?.ahead(of: vehicle.index, in: vehicle.stops) {
                 OccupancySummary(occupancy: ahead)
             }
-            if !vehicle.moving, vehicle.stops.indices.contains(vehicle.index) {
+            if let index = boardDepartureIndex {
+                let stop = vehicle.stops[index]
+                block(
+                    caption: "Departure",
+                    trailing: nil,
+                    stop: stop,
+                    detail: "departs \(Format.time(stop.dep)) · \(when(stop.dep))",
+                    side: nil
+                )
+                if index + 1 < vehicle.stops.count {
+                    Divider()
+                    let next = vehicle.stops[index + 1]
+                    block(
+                        caption: index + 1 == vehicle.stops.count - 1
+                            ? "Terminal stop" : "Next stop",
+                        trailing: nil,
+                        stop: next,
+                        detail: "arrives \(Format.time(next.arr)) · \(when(next.arr))",
+                        side: vehicle.platformSide(at: index + 1)
+                    )
+                }
+            } else if !vehicle.moving, vehicle.stops.indices.contains(vehicle.index) {
                 block(
                     caption: atTerminus ? "Terminal stop" : "Currently at",
                     trailing: nil,
@@ -546,7 +570,7 @@ struct VehiclePanel: View {
                     side: nil
                 )
             }
-            if let next = nextIndex {
+            if boardDepartureIndex == nil, let next = nextIndex {
                 if !vehicle.moving { Divider() }
                 let stop = vehicle.stops[next]
                 block(
@@ -652,6 +676,14 @@ struct VehiclePanel: View {
 
     private var atTerminus: Bool { vehicle.index == vehicle.stops.count - 1 }
 
+    /// Match the board row by its published departure, not by name: one
+    /// journey may call at two stops with similar names, while this timestamp
+    /// is the exact value the board was built from.
+    private var boardDepartureIndex: Int? {
+        guard let boardDeparture else { return nil }
+        return vehicle.stops.firstIndex { $0.dep == boardDeparture }
+    }
+
     private var nextIndex: Int? {
         // Standing at call `i` or running the leg out of it, the stop ahead is
         // the same one either way.
@@ -709,8 +741,16 @@ struct VehiclePanel: View {
 
         VStack(alignment: .leading, spacing: 8) {
             if geometry == nil {
-                Text("No data yet.")
+                if boardDeparture != nil {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading mapped route…")
+                    }
                     .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("No data yet.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             } else {
                 sourceRow("Mapped OSM route", mapped, total, .green,
                           "Full detail available.")

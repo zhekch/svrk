@@ -121,9 +121,24 @@ enum RouteNaming {
     /// couple of words of it — so a name that happens to contain a colon for
     /// some other reason is left exactly as it was mapped.
     static func trim(_ headline: String, ref: String) -> String {
-        guard !ref.isEmpty, let colon = headline.firstIndex(of: ":") else { return headline }
+        let withoutRef: String
+        guard !ref.isEmpty, let colon = headline.firstIndex(of: ":") else {
+            return arrows(in: headline)
+        }
         let prefix = headline[..<colon]
-        guard prefix.hasSuffix(ref), prefix.count <= ref.count + 14 else { return headline }
-        return headline[headline.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        guard prefix.hasSuffix(ref), prefix.count <= ref.count + 14 else {
+            return arrows(in: headline)
+        }
+        withoutRef = headline[headline.index(after: colon)...]
+            .trimmingCharacters(in: .whitespaces)
+        return arrows(in: withoutRef)
+    }
+
+    /// OSM route names commonly carry the ASCII `=>`. Use the actual arrow the
+    /// rest of the app uses, without changing either endpoint's spelling.
+    private static func arrows(in headline: String) -> String {
+        headline
+            .replacingOccurrences(of: " => ", with: " → ")
+            .replacingOccurrences(of: "=>", with: " → ")
     }
 }

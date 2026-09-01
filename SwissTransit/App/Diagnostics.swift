@@ -171,7 +171,7 @@ enum DeviceLoad {
 }
 
 extension ProcessInfo.ThermalState {
-    /// The one word worth printing.
+    /// The actual thermal state, kept distinct from Energy Impact.
     var label: String {
         switch self {
         case .nominal: return "nominal"
@@ -182,7 +182,5 @@ extension ProcessInfo.ThermalState {
         }
     }
 }
-
-
 
 

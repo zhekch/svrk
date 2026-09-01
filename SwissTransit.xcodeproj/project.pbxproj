@@ -46,6 +46,9 @@
 		18EA3E1BC506EF35FC61ED43 /* Categories.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D5A92B05DB618B547561542 /* Categories.swift */; };
 		889680FE86C4AED19018D73F /* Geo.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7640F4595360916BF45E5FD /* Geo.swift */; };
 		F364AEAB76BB53E60F6EEF5D /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEFDCCD653802AD416ED233C /* Models.swift */; };
+		81CD92F9512DC12DC089E343 /* RelationProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA42B46C9B8E020BCAD660ED /* RelationProjection.swift */; };
+		1BD69DABB3D063C7D6429AA2 /* RelationSpatialIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E415E0D37AC4AD480A9C465 /* RelationSpatialIndex.swift */; };
+		9490C4713027109CCB362622 /* RouteRelations.swift in Sources */ = {isa = PBXBuildFile; fileRef = B603640D10AE76447427D65C /* RouteRelations.swift */; };
 		08073C66F8617724306D730D /* StopRegister.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61887D3D15ED8FA1028A5280 /* StopRegister.swift */; };
 		68002424A5A3D2C252750077 /* TimetableStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C8099F83A9F74E77FC357BE /* TimetableStore.swift */; };
 		EEBF3400E78A0B228E803120 /* SwissTransitWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B6DAC6F97359E5E9E0E757D /* SwissTransitWatchApp.swift */; };
@@ -62,11 +65,13 @@
 		453FB663362F27D1AF24B3C9 /* WatchStandaloneTransitService.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEC142B64362A360940FE329 /* WatchStandaloneTransitService.swift */; };
 		4AF815186929EA32281D445D /* WatchTimetableDownloadCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C33DAD4E3AE765A0E247DF47 /* WatchTimetableDownloadCoordinator.swift */; };
 		16AA35E6670366D8578309DA /* WatchGlass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0526C7E6501F3343753A88E1 /* WatchGlass.swift */; };
+		824B1634F5313DAB26C4BC86 /* LifecycleUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 766FD886A3CE62B7DBA01859 /* LifecycleUITests.swift */; };
 		920290C280F129D8C2C25CE6 /* Data in Resources */ = {isa = PBXBuildFile; fileRef = EF6A92AD61B8A60A5F98005B /* Data */; };
 		C30D1A4A179523B02CDF3F09 /* Secrets.plist in Resources */ = {isa = PBXBuildFile; fileRef = 97C5CB36F6ADCDB569944079 /* Secrets.plist */; };
 		708FF730AB8623F3D81F53FE /* vehicle-layouts.json in Resources */ = {isa = PBXBuildFile; fileRef = 04D1C4DD73304D87FBBBCFAE /* vehicle-layouts.json */; };
 		7F43E72CBADCFCFA124E59FA /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = BB4CB169143CF8DC12E4F7AC /* AppIcon.icon */; };
 		F35A49C12E04F2DF298F3A1E /* watch-rail-overlay-v1.bin in Resources */ = {isa = PBXBuildFile; fileRef = 9F8B25DC0F41FE0366B82AB1 /* watch-rail-overlay-v1.bin */; };
+		B1783B068839788062F28737 /* watch-route-relations-v1.bin in Resources */ = {isa = PBXBuildFile; fileRef = D81E2920C44C1EEAECF3468F /* watch-route-relations-v1.bin */; };
 		3EE55B3B17D83A60BDB76D6A /* AppIcon_watch.icon in Resources */ = {isa = PBXBuildFile; fileRef = 29B13ABC9982AD26E0858400 /* AppIcon_watch.icon */; };
 		2DD28A442559D1925A31F14E /* TransitCore in Frameworks */ = {isa = PBXBuildFile; productRef = 0A33270A1B6C3D4E1C3694F5 /* TransitCore */; };
 		69B1D9C22586A02F4E3E34BE /* MapboxMaps in Frameworks */ = {isa = PBXBuildFile; productRef = 15EAC762680A41F8EE13792E /* MapboxMaps */; };
@@ -76,10 +81,14 @@
 /* Begin PBXFileReference section */
 		F5BF48AA40CAD7891EB709FC /* SwissTransit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "SwissTransit.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		03944FB4BD4F601B7757F914 /* SwissTransit Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "SwissTransit Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		75E3460212AE712D1981DC6A /* SwissTransitUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "SwissTransitUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		5FA255E68EA33299CBCDEC2E /* BinaryFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BinaryFormat.swift; sourceTree = "<group>"; };
 		8D5A92B05DB618B547561542 /* Categories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Categories.swift; sourceTree = "<group>"; };
 		D7640F4595360916BF45E5FD /* Geo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Geo.swift; sourceTree = "<group>"; };
 		FEFDCCD653802AD416ED233C /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		BA42B46C9B8E020BCAD660ED /* RelationProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelationProjection.swift; sourceTree = "<group>"; };
+		4E415E0D37AC4AD480A9C465 /* RelationSpatialIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelationSpatialIndex.swift; sourceTree = "<group>"; };
+		B603640D10AE76447427D65C /* RouteRelations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RouteRelations.swift; sourceTree = "<group>"; };
 		61887D3D15ED8FA1028A5280 /* StopRegister.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StopRegister.swift; sourceTree = "<group>"; };
 		2C8099F83A9F74E77FC357BE /* TimetableStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimetableStore.swift; sourceTree = "<group>"; };
 		D6223C1C4535557E6BA0AF02 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
@@ -118,6 +127,7 @@
 		CF57F2A510CA3728BF0D922C /* TimeControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimeControl.swift; sourceTree = "<group>"; };
 		BC5D8B8869C32CD8E33FE186 /* VehiclePanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VehiclePanel.swift; sourceTree = "<group>"; };
 		78327B8ACDA7D4F70ECCBA31 /* Wagon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wagon.swift; sourceTree = "<group>"; };
+		766FD886A3CE62B7DBA01859 /* LifecycleUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LifecycleUITests.swift; sourceTree = "<group>"; };
 		1B6DAC6F97359E5E9E0E757D /* SwissTransitWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwissTransitWatchApp.swift; sourceTree = "<group>"; };
 		BE2B06152D09216C88B3E3BF /* WatchContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchContentView.swift; sourceTree = "<group>"; };
 		4CA3A0C07AE4B75A97A05EC9 /* WatchTransitModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchTransitModel.swift; sourceTree = "<group>"; };
@@ -137,6 +147,7 @@
 		04D1C4DD73304D87FBBBCFAE /* vehicle-layouts.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = vehicle-layouts.json; sourceTree = "<group>"; };
 		BB4CB169143CF8DC12E4F7AC /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		9F8B25DC0F41FE0366B82AB1 /* watch-rail-overlay-v1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = watch-rail-overlay-v1.bin; sourceTree = "<group>"; };
+		D81E2920C44C1EEAECF3468F /* watch-route-relations-v1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = watch-route-relations-v1.bin; sourceTree = "<group>"; };
 		29B13ABC9982AD26E0858400 /* AppIcon_watch.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon_watch.icon; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -146,6 +157,7 @@
 			children = (
 				F83198916078C3FCC7D65554 /* SwissTransit */,
 				3035376EB0F8A4963CC7531A /* SwissTransitWatch */,
+				15CC100B87E0418BD5F55F7D /* SwissTransitUITests */,
 				0787C76F3A184E304B7195A6 /* Watch Archive Core */,
 				547D009064F7C3F13BEF3460 /* Products */,
 			);
@@ -156,6 +168,7 @@
 			children = (
 				F5BF48AA40CAD7891EB709FC /* SwissTransit.app */,
 				03944FB4BD4F601B7757F914 /* SwissTransit Watch App.app */,
+				75E3460212AE712D1981DC6A /* SwissTransitUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -167,6 +180,9 @@
 				8D5A92B05DB618B547561542 /* Categories.swift */,
 				D7640F4595360916BF45E5FD /* Geo.swift */,
 				FEFDCCD653802AD416ED233C /* Models.swift */,
+				BA42B46C9B8E020BCAD660ED /* RelationProjection.swift */,
+				4E415E0D37AC4AD480A9C465 /* RelationSpatialIndex.swift */,
+				B603640D10AE76447427D65C /* RouteRelations.swift */,
 				61887D3D15ED8FA1028A5280 /* StopRegister.swift */,
 				2C8099F83A9F74E77FC357BE /* TimetableStore.swift */,
 			);
@@ -317,6 +333,7 @@
 			children = (
 				29B13ABC9982AD26E0858400 /* AppIcon_watch.icon */,
 				9F8B25DC0F41FE0366B82AB1 /* watch-rail-overlay-v1.bin */,
+				D81E2920C44C1EEAECF3468F /* watch-route-relations-v1.bin */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -337,6 +354,14 @@
 				0526C7E6501F3343753A88E1 /* WatchGlass.swift */,
 			);
 			path = UI;
+			sourceTree = "<group>";
+		};
+		15CC100B87E0418BD5F55F7D /* SwissTransitUITests */ = {
+			isa = PBXGroup;
+			children = (
+				766FD886A3CE62B7DBA01859 /* LifecycleUITests.swift */,
+			);
+			path = SwissTransitUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -393,6 +418,9 @@
 				18EA3E1BC506EF35FC61ED43 /* Categories.swift in Sources */,
 				889680FE86C4AED19018D73F /* Geo.swift in Sources */,
 				F364AEAB76BB53E60F6EEF5D /* Models.swift in Sources */,
+				81CD92F9512DC12DC089E343 /* RelationProjection.swift in Sources */,
+				1BD69DABB3D063C7D6429AA2 /* RelationSpatialIndex.swift in Sources */,
+				9490C4713027109CCB362622 /* RouteRelations.swift in Sources */,
 				08073C66F8617724306D730D /* StopRegister.swift in Sources */,
 				68002424A5A3D2C252750077 /* TimetableStore.swift in Sources */,
 				EEBF3400E78A0B228E803120 /* SwissTransitWatchApp.swift in Sources */,
@@ -409,6 +437,14 @@
 				453FB663362F27D1AF24B3C9 /* WatchStandaloneTransitService.swift in Sources */,
 				4AF815186929EA32281D445D /* WatchTimetableDownloadCoordinator.swift in Sources */,
 				16AA35E6670366D8578309DA /* WatchGlass.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		14250B688B2FD6B027A0AD37 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				824B1634F5313DAB26C4BC86 /* LifecycleUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -431,6 +467,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				F35A49C12E04F2DF298F3A1E /* watch-rail-overlay-v1.bin in Resources */,
+				B1783B068839788062F28737 /* watch-route-relations-v1.bin in Resources */,
 				3EE55B3B17D83A60BDB76D6A /* AppIcon_watch.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -454,6 +491,12 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		1BD52BC98AED3E3501435521 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = ();
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXContainerItemProxy section */
@@ -463,6 +506,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 09548E47F9D3F622CA83E0F9;
 			remoteInfo = "SwissTransit Watch App";
+		};
+		6E06E538347A2721F543D326 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 46F86FAA6BBF9AC94A7E4595 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 42AEFBAE01D2DFD981F7DA7D;
+			remoteInfo = SwissTransit;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -520,6 +570,23 @@
 			productReference = 03944FB4BD4F601B7757F914 /* SwissTransit Watch App.app */;
 			productType = "com.apple.product-type.application";
 		};
+		7265A96C8621447C08D51C0B /* SwissTransitUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DB6C8C091E749C9955ED98E7;
+			buildPhases = (
+				14250B688B2FD6B027A0AD37 /* Sources */,
+				1BD52BC98AED3E3501435521 /* Frameworks */,
+			);
+			buildRules = ();
+			dependencies = (
+				0628BCB4DA02CE5A5D90C304 /* PBXTargetDependency */,
+			);
+			name = SwissTransitUITests;
+			packageProductDependencies = ();
+			productName = SwissTransitUITests;
+			productReference = 75E3460212AE712D1981DC6A /* SwissTransitUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXTargetDependency section */
@@ -527,6 +594,11 @@
 			isa = PBXTargetDependency;
 			target = 09548E47F9D3F622CA83E0F9 /* SwissTransit Watch App */;
 			targetProxy = 30B83BA5BA9280D4379AEEF3 /* PBXContainerItemProxy */;
+		};
+		0628BCB4DA02CE5A5D90C304 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 42AEFBAE01D2DFD981F7DA7D /* SwissTransit */;
+			targetProxy = 6E06E538347A2721F543D326 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -540,6 +612,7 @@
 				TargetAttributes = {
 					42AEFBAE01D2DFD981F7DA7D = { CreatedOnToolsVersion = 27.0; };
 					09548E47F9D3F622CA83E0F9 = { CreatedOnToolsVersion = 27.0; };
+					7265A96C8621447C08D51C0B = { CreatedOnToolsVersion = 27.0; TestTargetID = 42AEFBAE01D2DFD981F7DA7D; };
 				};
 			};
 			buildConfigurationList = AE883439A53704486338BDB1;
@@ -558,6 +631,7 @@
 			targets = (
 				42AEFBAE01D2DFD981F7DA7D /* SwissTransit */,
 				09548E47F9D3F622CA83E0F9 /* SwissTransit Watch App */,
+				7265A96C8621447C08D51C0B /* SwissTransitUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -724,6 +798,34 @@
 			};
 			name = Release;
 		};
+		0FEBA931BE6512A65064DDAC /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = K83N2TZ5G3;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kexts.swisstransit.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = SwissTransit;
+			};
+			name = Debug;
+		};
+		695898FFE5AEA34ACD64D9FA /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = K83N2TZ5G3;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kexts.swisstransit.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = SwissTransit;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -750,6 +852,15 @@
 			buildConfigurations = (
 				A0E3C62DC6D5E8781BDDCB2B /* Debug */,
 				D918C5040C85B0AF817B171C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		DB6C8C091E749C9955ED98E7 /* Build configuration list for PBXNativeTarget "SwissTransitUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0FEBA931BE6512A65064DDAC /* Debug */,
+				695898FFE5AEA34ACD64D9FA /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

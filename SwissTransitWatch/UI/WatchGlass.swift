@@ -1,4 +1,13 @@
+import Foundation
 import SwiftUI
+
+enum WatchPreviewRuntime {
+    static var isRunning: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
+            || environment["XCODE_RUNNING_FOR_PLAYGROUNDS"] == "1"
+    }
+}
 
 /// One compatibility point for the watch UI. watchOS 26 gets native Liquid
 /// Glass; older watches retain the same layout with a lightweight material.

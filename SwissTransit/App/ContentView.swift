@@ -986,7 +986,7 @@ private struct FrameReadout: View {
                 String(format: "%.0f%% · %.0f MB", stats.load.cpuPercent, stats.load.memoryMB),
                 warn: stats.load.cpuPercent > 140
             )
-            row("power", power, warn: stats.load.thermal != .nominal)
+            row("thermal state", thermal, warn: stats.load.thermal != .nominal)
             if !stats.selected.isEmpty {
                 row("open", stats.selected, warn: stats.selected.hasSuffix("chord"))
             }
@@ -999,17 +999,10 @@ private struct FrameReadout: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// iOS publishes no instantaneous power draw, so this is the evidence it
-    /// does give: whether the phone has begun throttling itself, whether low
-    /// power mode is on, and where the battery stands.
-    ///
-    /// The three are unrelated measurements and the row used to read like one.
-    /// `serious · 41%` looks as though 41% is a quantity of seriousness; it is
-    /// the battery, and the word beside it is `ProcessInfo.thermalState` —
-    /// nominal, fair, serious or critical — which is how hot the phone is and
-    /// therefore how hard iOS is throttling the processors under this app. The
-    /// battery is labelled now so the two cannot be read as one figure.
-    private var power: String {
+    /// The live power-related facts iOS exposes to the running app. Battery
+    /// charge and Low Power Mode are named so neither reads as part of the
+    /// categorical thermal state.
+    private var thermal: String {
         var parts = [stats.load.thermal.label]
         if stats.load.lowPower { parts.append("low-power") }
         if let battery = stats.load.batteryPercent {
@@ -1027,7 +1020,7 @@ private struct FrameReadout: View {
         HStack(spacing: 6) {
             Text(name)
                 .foregroundStyle(.white.opacity(0.45))
-                .frame(width: 52, alignment: .leading)
+                .frame(width: 82, alignment: .leading)
             Text(value).foregroundStyle(warn ? Color.orange : .white.opacity(0.92))
         }
     }

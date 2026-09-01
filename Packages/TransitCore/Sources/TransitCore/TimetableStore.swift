@@ -1,5 +1,23 @@
 import Foundation
 
+/// A dominant scheduled headway for one advertised service at one station.
+/// It is derived from packed integers without expanding the day's journeys.
+public struct TimetableCadence: Sendable, Equatable {
+    public var mode: Mode
+    public var line: String
+    /// The first different station after the board stop. This stays stable when
+    /// a late service short-turns at Spiez instead of continuing to Bern.
+    public var direction: String
+    public var minutes: Int
+
+    public init(mode: Mode, line: String, direction: String, minutes: Int) {
+        self.mode = mode
+        self.line = line
+        self.direction = direction
+        self.minutes = minutes
+    }
+}
+
 /// The national timetable, read in place.
 ///
 /// The app used to learn what was running by downloading the country: SIRI-ET
@@ -411,6 +429,7 @@ public final class TimetableStore: @unchecked Sendable {
     private var stationOfSlot: [Int32] = []
     private var stationSlots: [String: Int32] = [:]
     private var patternsByKey: [String: [Int32]] = [:]
+    private var cadencesByKey: [String: [TimetableCadence]] = [:]
 
     private func prepareStations() {
         guard stationOfSlot.count != stopCount else { return }
@@ -673,6 +692,171 @@ public final class TimetableStore: @unchecked Sendable {
             line: string(field(0)), headsign: string(field(1)), agency: string(field(2)),
             mode: raw < modes.count ? modes[raw] : .other
         )
+    }
+
+    /// The usual daytime interval for each service calling at a station.
+    ///
+    /// A future-only board cannot infer this at the evening transition: an
+    /// hourly route with calls at 21:30 and 23:01 appears to run every 91
+    /// minutes. This query instead considers the current day's 06:00–22:00
+    /// service. It walks only packed trip/class integers for the station's
+    /// already-indexed patterns, creates no `Journey` or `Call` objects, and is
+    /// cached per station and service day.
+    public func departureCadences(
+        callingAt stations: Set<String>,
+        key: String? = nil,
+        accepting: ((String) -> Bool)? = nil,
+        on date: Date,
+        zone: TimeZone = TimeZone(identifier: "Europe/Zurich") ?? .current
+    ) -> [TimetableCadence] {
+        guard isReady, !stations.isEmpty,
+              let dayZero = Self.dayStart(date, zone: zone)
+        else { return [] }
+        let dayIndex = Self.daysSince1970(date, zone: zone) - feedStart
+        guard dayIndex >= 0, dayIndex < dayCount else { return [] }
+        let stationKey = key ?? stations.sorted().joined(separator: "|")
+        let cacheKey = "\(stationKey)|\(dayIndex)|\(zone.identifier)"
+        if let cached = cadencesByKey[cacheKey] { return cached }
+
+        let wanted = patterns(
+            callingAt: stations,
+            key: stationKey,
+            accepting: accepting
+        )
+        guard !wanted.isEmpty else {
+            cadencesByKey[cacheKey] = []
+            return []
+        }
+        prepareTripsByPattern()
+        prepareStations()
+
+        let stationIDs = Set(stations.compactMap { stationSlots[$0] })
+        guard !stationIDs.isEmpty else {
+            cadencesByKey[cacheKey] = []
+            return []
+        }
+
+        struct ServiceKey: Hashable {
+            var mode: Mode
+            var line: String
+            var direction: String
+        }
+        let previousProbe = Date(
+            timeIntervalSince1970: TimeInterval(dayZero - 60 * 60)
+        )
+        let previousZero = Self.dayStart(previousProbe, zone: zone)
+        let previousIndex = Self.daysSince1970(previousProbe, zone: zone) - feedStart
+        let serviceDays = [(zero: dayZero, index: dayIndex)] + (previousZero.map {
+            [(zero: $0, index: previousIndex)]
+        } ?? [])
+        let opens = dayZero + 6 * 60 * 60
+        let closes = dayZero + 22 * 60 * 60
+        var departures: [ServiceKey: Set<Timestamp>] = [:]
+
+        for rawPattern in wanted {
+            let pattern = Int(rawPattern)
+            guard pattern >= 0, pattern < patternCount else { continue }
+            let indexAt = patternIndexAt + pattern * 8
+            let callsOffset = Int(bytes.loadUnaligned(
+                fromByteOffset: indexAt,
+                as: UInt32.self
+            ))
+            let callCount = Int(bytes.loadUnaligned(
+                fromByteOffset: indexAt + 4,
+                as: UInt32.self
+            ))
+            var departureOffset: Int?
+            var acceptedCall: Int?
+            for call in 0 ..< callCount {
+                let at = patternCallsAt + callsOffset + call * Self.callStride
+                let slot = Int(bytes.loadUnaligned(
+                    fromByteOffset: at,
+                    as: UInt32.self
+                ))
+                guard slot >= 0, slot < stationOfSlot.count,
+                      stationIDs.contains(stationOfSlot[slot]),
+                      accepting?(stopRef(slot)) ?? true
+                else { continue }
+                departureOffset = Int(bytes.loadUnaligned(
+                    fromByteOffset: at + 6,
+                    as: UInt16.self
+                ))
+                acceptedCall = call
+                break
+            }
+            guard let departureOffset, let acceptedCall else { continue }
+            var direction: String?
+            for call in (acceptedCall + 1) ..< callCount {
+                let at = patternCallsAt + callsOffset + call * Self.callStride
+                let slot = Int(bytes.loadUnaligned(
+                    fromByteOffset: at,
+                    as: UInt32.self
+                ))
+                guard slot >= 0, slot < stationOfSlot.count,
+                      !stationIDs.contains(stationOfSlot[slot])
+                else { continue }
+                let station = Self.station(ofSlotRef: stopRef(slot))
+                if !station.isEmpty { direction = station }
+                break
+            }
+            guard let direction else { continue }
+
+            for tripSlot in Int(patternTripsAt[pattern])
+                ..< Int(patternTripsAt[pattern + 1]) {
+                let row = Int(patternTrips[tripSlot])
+                let record = trip(row)
+                guard record.klass >= 0, record.klass < classCount else { continue }
+                let info = klass(record.klass)
+                let trimmedLine = info.line?.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ) ?? ""
+                let service = ServiceKey(
+                    mode: info.mode,
+                    line: trimmedLine.isEmpty
+                        ? (string(record.number) ?? info.mode.rawValue.capitalized)
+                        : trimmedLine,
+                    direction: direction
+                )
+                for serviceDay in serviceDays {
+                    guard serviceDay.index >= 0, serviceDay.index < dayCount,
+                          runs(service: record.service, onDay: serviceDay.index)
+                    else { continue }
+                    let departure = serviceDay.zero
+                        + Timestamp(record.start + departureOffset) * 60
+                    guard departure >= opens, departure <= closes else { continue }
+                    departures[service, default: []].insert(departure)
+                }
+            }
+        }
+
+        var result: [TimetableCadence] = []
+        result.reserveCapacity(departures.count)
+        for (service, times) in departures {
+            let ordered = times.sorted()
+            guard ordered.count >= 3 else { continue }
+            let gaps = zip(ordered, ordered.dropFirst()).compactMap { earlier, later -> Int? in
+                let minutes = (later - earlier) / 60
+                return (3 ... 180).contains(minutes) ? minutes : nil
+            }
+            guard gaps.count >= 2 else { continue }
+            var buckets: [Int: Int] = [:]
+            for gap in gaps {
+                let rounded = max(5, Int((Double(gap) / 5).rounded()) * 5)
+                buckets[rounded, default: 0] += 1
+            }
+            guard let winner = buckets.max(by: { lhs, rhs in
+                lhs.value == rhs.value ? lhs.key > rhs.key : lhs.value < rhs.value
+            }), winner.value >= 2, winner.value * 2 >= gaps.count
+            else { continue }
+            result.append(TimetableCadence(
+                mode: service.mode,
+                line: service.line,
+                direction: service.direction,
+                minutes: winner.key
+            ))
+        }
+        cadencesByKey[cacheKey] = result
+        return result
     }
 
     /// Rebuild the OJP journey reference from its interned prefix and packed

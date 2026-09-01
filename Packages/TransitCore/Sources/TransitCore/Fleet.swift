@@ -324,6 +324,33 @@ public actor Fleet {
     private var chainedRevision = -1
     private var chained: [String: Journey] = [:]
 
+    /// Timetabled runs a departure board has actually offered to the reader.
+    ///
+    /// The map expands only the small window in which a vehicle can be drawn,
+    /// while a board deliberately reads a day ahead. Those later `Journey`
+    /// objects used to be reduced to `BoardEntry` values and then discarded,
+    /// so tapping tomorrow's departure could only ask the live fleet for it
+    /// and inevitably got "not running". This is a bounded presentation cache,
+    /// not another fleet: none of these journeys is returned by a map query.
+    private struct BoardJourneyKey: Hashable {
+        var id: String
+        var departure: Timestamp
+    }
+    private var boardJourneys: [BoardJourneyKey: Journey] = [:]
+    private var boardJourneyOrder: [BoardJourneyKey] = []
+    private static let boardJourneyLimit = 1_024
+
+    private func rememberBoardJourney(_ journey: Journey, departure: Timestamp) {
+        let key = BoardJourneyKey(id: journey.id, departure: departure)
+        if boardJourneys[key] == nil { boardJourneyOrder.append(key) }
+        boardJourneys[key] = journey
+
+        let overflow = boardJourneyOrder.count - Self.boardJourneyLimit
+        guard overflow > 0 else { return }
+        for old in boardJourneyOrder.prefix(overflow) { boardJourneys.removeValue(forKey: old) }
+        boardJourneyOrder.removeFirst(overflow)
+    }
+
     /// A broad one-minute time index for the draw/refinement queries.
     ///
     /// The final lifetime check remains second-precise. This only avoids asking
@@ -3005,24 +3032,35 @@ public actor Fleet {
         let wasActive = finishGeometryRequest(request)
         guard wasActive, !geometryBackgroundSuspended,
               generation == geometryWorkerGeneration,
-              let built = request.draft.geometry,
-              let journey = fleetByID()[request.key.id],
-              Self.callFingerprint(journey.stops) == request.key.fingerprint
+              let built = request.draft.geometry
         else { return }
-        // A slower corridor job must never replace a refined result that arrived
-        // while it was running.
-        if let current = journey.geometry, current.refined && !built.refined { return }
 
-        journey.geometry = built
-        journey.legsFromRoute = request.draft.legsFromRoute
-        journey.legsFromGraph = request.draft.legsFromGraph
         geometryUse += 1
-        builtGeometry[journey.id] = BuiltGeometry(
+        builtGeometry[request.key.id] = BuiltGeometry(
             fingerprint: request.key.fingerprint, geometry: built,
             fromRoute: request.draft.legsFromRoute,
             fromGraph: request.draft.legsFromGraph, usedAt: geometryUse
         )
         evictGeometryIfNeeded()
+
+        // Install into every retained instance of this run. A departure board
+        // can hold a journey outside the map's live window, so it is not
+        // necessarily present in `fleetByID`; discarding that worker result is
+        // what previously left scheduled-service pages with only stop chords.
+        func install(into journey: Journey) {
+            guard Self.callFingerprint(journey.stops) == request.key.fingerprint else { return }
+            // A slower corridor job must never replace a refined result that
+            // arrived while it was running.
+            if let current = journey.geometry, current.refined && !built.refined { return }
+            journey.geometry = built
+            journey.legsFromRoute = request.draft.legsFromRoute
+            journey.legsFromGraph = request.draft.legsFromGraph
+        }
+
+        if let live = fleetByID()[request.key.id] { install(into: live) }
+        for (key, listed) in boardJourneys where key.id == request.key.id {
+            install(into: listed)
+        }
     }
 
     /// Remove exactly this incarnation of a request. A cancelled worker may
@@ -3297,8 +3335,20 @@ public actor Fleet {
         return mirrored[id]
     }
 
-    public func journey(id: String, at now: Timestamp) -> VehicleSnapshot? {
-        guard let journey = drawnJourney(id) else { return nil }
+    public func journey(
+        id: String, at now: Timestamp, boardDeparture: Timestamp? = nil
+    ) -> VehicleSnapshot? {
+        let listed = boardDeparture.flatMap {
+            boardJourneys[BoardJourneyKey(id: id, departure: $0)]
+        }
+        guard let journey = listed ?? drawnJourney(id) else { return nil }
+        if listed != nil {
+            // A future departure is outside the map fleet, but its route is no
+            // less real. Restore a cached path immediately or queue the normal
+            // relation/rail-graph builder on its utility worker. Never invent a
+            // stop-to-stop chord merely because the train has not started yet.
+            _ = prepareGeometryInBackground(for: journey, refined: true)
+        }
         // `refined: false`, and that one word is the whole of the fix for a
         // vehicle that jumped when it was tapped.
         //
@@ -3320,7 +3370,7 @@ public actor Fleet {
         // — which a drawn vehicle always already does — makes this a read
         // rather than a write, and the panel now opens on the vehicle where the
         // map is drawing it.
-        // No attach at all, and that is the point.
+        // No attach at all for a live map journey, and that is the point.
         //
         // `refined: false` was not enough: a vehicle the draw loop skipped has
         // no path yet — `alignToTrack` gives up on everything that is not a
@@ -3329,10 +3379,10 @@ public actor Fleet {
         // chord it was drawn on. The tap has to be a read or it will always
         // move something.
         //
-        // So the panel opens on the journey exactly as the map has it. Whatever
-        // geometry it has is what the map drew it with; whatever it lacks, the
-        // draw loop and `refineDrawn` supply within a frame or two, and the
-        // vehicle moves then — ambiently, not under the reader's finger.
+        // So a live panel opens on the journey exactly as the map has it.
+        // Whatever geometry it has is what the map drew it with; whatever it
+        // lacks, the draw loop and `refineDrawn` supply within a frame or two,
+        // and the vehicle moves then — ambiently, not under the reader's finger.
         let position = Positioning.position(of: journey, at: now)
 
         return VehicleSnapshot(
@@ -3358,6 +3408,42 @@ public actor Fleet {
             layover: journey.layover, onTrack: position?.onTrack ?? false,
             extra: journey.extra, journeyRef: journey.journeyRef
         )
+    }
+
+    /// Wait for the real mapped path of a service retained by a departure
+    /// board. The synchronous route matcher stays on the utility worker; this
+    /// actor only waits for its token and installs the immutable result.
+    ///
+    /// The service page is already visible while this suspends. Returning nil
+    /// leaves the map without a line rather than substituting geometry known to
+    /// be false.
+    public func boardJourneyGeometry(
+        id: String, departure: Timestamp
+    ) async -> JourneyGeometry? {
+        guard let journey = boardJourneys[
+            BoardJourneyKey(id: id, departure: departure)
+        ] else { return nil }
+
+        while !Task.isCancelled, !geometryBackgroundSuspended {
+            if restoreGeometry(to: journey, refined: true) {
+                return journey.geometry
+            }
+            let result = enqueueGeometryBuild(for: journey, refined: true, urgent: true)
+            if let token = result.token {
+                await waitForGeometryBuilds([token])
+                continue
+            }
+            switch result {
+            case .full:
+                guard await waitForGeometryQueueCapacity() else { return nil }
+            case .suspended, .invalid:
+                return nil
+            case .enqueued, .pending:
+                // Both carry a token and are handled above.
+                return nil
+            }
+        }
+        return nil
     }
 
     /// Where a vehicle ends up once a correction in flight has been walked off,
@@ -3499,6 +3585,76 @@ public actor Fleet {
         sameStop(name, stationName) || name.hasPrefix("\(stationName), ")
     }
 
+    /// Whether a stop name is merely the generic forecourt name of a station.
+    ///
+    /// This is intentionally narrower than `partOfStation`: `Bern, Bahnhof`
+    /// is the bus side of Bern station, while `Bern, Welle 7` and `Bern,
+    /// Schanzenstrasse` are individually useful places and must survive.
+    public static func isGenericStationStop(
+        _ name: String, stationName: String
+    ) -> Bool {
+        func folded(_ value: String) -> String {
+            value.folding(
+                options: [.diacriticInsensitive, .caseInsensitive],
+                locale: Locale(identifier: "de_CH")
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let child = folded(name), parent = folded(stationName)
+        if child == parent { return true }
+        guard child.hasPrefix("\(parent),") else { return false }
+        let suffix = child.dropFirst(parent.count + 1)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ["bahnhof", "gare", "station", "stazione", "staziun"].contains(suffix)
+    }
+
+    /// Whether `candidate` is the whole interchange that contains `place`.
+    /// Kept as a pure predicate so the conservative boundary is testable
+    /// without loading the national stop register.
+    static func isStationParent(_ candidate: StopPlace, of place: StopPlace) -> Bool {
+        guard candidate.id != place.id,
+              Geo.flatMetres(
+                  place.lon, place.lat, candidate.lon, candidate.lat
+              ) <= Self.stationSpread
+        else { return false }
+        if Self.sameStop(place.name, candidate.name) { return true }
+        return candidate.rail && Self.isGenericStationStop(
+            place.name, stationName: candidate.name
+        )
+    }
+
+    /// The whole interchange a stop-place row belongs to.
+    ///
+    /// The national register commonly publishes a railway station and its
+    /// forecourt as separate places: `Mülenen` and `Mülenen, Bahnhof`. Opening
+    /// the first already gathers the second's buses in `board`; opening the
+    /// second used to stay bus-only because the prefix relation is directional.
+    /// Resolve that relation once, before any station board is built, so taps,
+    /// search, nearby-live and route-stop links all agree on the same place.
+    ///
+    /// A comma alone is not enough to merge two stops. Prefix children are
+    /// folded only into a nearby *railway* parent. Equivalent names such as
+    /// `Spiez Schiffstation` and `Spiez, Schiffstation` may merge without one,
+    /// because their letters and digits identify the same named place. Kerb
+    /// and platform boards never pass through this function, so Stop A/B and
+    /// Platform 1/2 remain individually selectable.
+    private func canonicalStationPlace(
+        _ place: StopPlace, among supplied: [StopPlace]? = nil
+    ) -> StopPlace {
+        let nearby = supplied ?? stopPlaces.nearby(
+            lon: place.lon, lat: place.lat,
+            within: Self.stationSpread, limit: 200
+        )
+        let parents = nearby.filter { Self.isStationParent($0, of: place) }
+        return parents.min { a, b in
+            if a.rail != b.rail { return a.rail && !b.rail }
+            if a.name.count != b.name.count { return a.name.count < b.name.count }
+            let aDistance = Geo.flatMetres(place.lon, place.lat, a.lon, a.lat)
+            let bDistance = Geo.flatMetres(place.lon, place.lat, b.lon, b.lat)
+            if aDistance != bDistance { return aDistance < bDistance }
+            return a.id < b.id
+        } ?? place
+    }
+
     /// The name the stop register holds for a UIC number.
     ///
     /// For the places another interface names by number alone — the formation
@@ -3517,7 +3673,11 @@ public actor Fleet {
 
     public func stationBoard(placeId: String, at now: Timestamp, limit: Int = 60) -> StationBoard? {
         guard let place = stopPlaces.place(id: placeId) else { return nil }
-        return board(name: place.name, id: place.id, lon: place.lon, lat: place.lat, at: now, limit: limit)
+        let station = canonicalStationPlace(place)
+        return board(
+            name: station.name, id: station.id, lon: station.lon, lat: station.lat,
+            at: now, limit: limit
+        )
     }
 
     /// Whether the coordinate is close enough to transit to justify a more
@@ -3532,7 +3692,7 @@ public actor Fleet {
 
     public func stationBoard(near lon: Double, lat: Double, at now: Timestamp, limit: Int = 60) -> StationBoard? {
         guard let place = stopPlaces.nearest(lon: lon, lat: lat, within: 300) else { return nil }
-        return board(name: place.name, id: place.id, lon: place.lon, lat: place.lat, at: now, limit: limit)
+        return stationBoard(placeId: place.id, at: now, limit: limit)
     }
 
     /// The stop a stationary, accurately located phone can honestly claim.
@@ -3558,29 +3718,12 @@ public actor Fleet {
             lon: lon, lat: lat, within: placeReach, limit: 80
         )
 
-        /// Prefer the encompassing railway station or shorter interchange name
-        /// when the register has separate place ids for its modes.
-        func canonical(_ place: StopPlace) -> StopPlace {
-            let parents = places.filter { candidate in
-                candidate.id != place.id
-                    && Self.partOfStation(place.name, candidate.name)
-                    && Geo.flatMetres(
-                        place.lon, place.lat, candidate.lon, candidate.lat
-                    ) <= Self.stationSpread
-            }
-            return parents.min { a, b in
-                if a.rail != b.rail { return a.rail && !b.rail }
-                if a.name.count != b.name.count { return a.name.count < b.name.count }
-                return a.id < b.id
-            } ?? place
-        }
-
         var groupPlace: [String: StopPlace] = [:]
         var groupStops: [String: [RegisteredStop]] = [:]
         var groupDistance: [String: Double] = [:]
 
         func include(_ place: StopPlace, distance: Double) {
-            let parent = canonical(place)
+            let parent = canonicalStationPlace(place, among: places)
             groupPlace[parent.id] = parent
             groupDistance[parent.id] = min(groupDistance[parent.id] ?? .infinity, distance)
         }
@@ -3598,7 +3741,7 @@ public actor Fleet {
         for stop in register.near(lon: lon, lat: lat, metres: stopReach) {
             let station = StopRegister.stationOf(stop.id)
             guard let place = stopPlaces.place(id: station) else { continue }
-            let parent = canonical(place)
+            let parent = canonicalStationPlace(place, among: places)
             let distance = Geo.flatMetres(stop.lon, stop.lat, lon, lat)
             include(place, distance: distance)
             groupStops[parent.id, default: []].append(stop)
@@ -3767,6 +3910,7 @@ public actor Fleet {
                 originates: index == 0,
                 running: Positioning.position(of: journey, at: now) != nil
             ))
+            rememberBoardJourney(journey, departure: stop.dep)
         }
 
         // The national feed first, and the mirror's own sightings only if it
@@ -3967,6 +4111,28 @@ public actor Fleet {
         let drawn = hidingDrawnTracks ? platforms.coveredTracks() : []
 
         var rows = register.within(bbox, limit: drawn.isEmpty ? limit : .max)
+        // One indexed viewport query, rather than a nearby-place query for
+        // every marker. A large city can put hundreds of kerbs in this method;
+        // the filtering must stay insignificant beside laying them out.
+        let railPlaces = stopPlaces.within(
+            bbox.padded(byMetres: Self.stationSpread),
+            railOnly: true, limit: .max
+        )
+        // A generic, unlabelled forecourt point is already represented by the
+        // railway station dot and its combined board. Drawing it again created
+        // the stray square beside Bern and Wichtrach and made one place answer
+        // as two choices. Real platform/stop codes and generated A/B sides are
+        // retained; so are codeless stops that are not simply “…, Bahnhof”.
+        rows.removeAll { stop in
+            guard stop.platform == nil, stop.assigned == nil else { return false }
+            return railPlaces.contains { place in
+                Geo.flatMetres(stop.lon, stop.lat, place.lon, place.lat)
+                    <= Self.stationSpread
+                    && Self.isGenericStationStop(
+                        stop.name, stationName: place.name
+                    )
+            }
+        }
         if !drawn.isEmpty {
             rows = rows.filter { stop in
                 // Matched by track, not by exact code, so the sector rows go
@@ -4025,6 +4191,7 @@ public actor Fleet {
                     terminates: i == journey.stops.count - 1, originates: i == 0,
                     running: Positioning.position(of: journey, at: now) != nil
                 ))
+                rememberBoardJourney(journey, departure: stop.dep)
                 return
             }
         }
@@ -4144,8 +4311,7 @@ public actor Fleet {
     public func stationBoard(osmId: String, at now: Timestamp, limit: Int = 60) -> StationBoard? {
         guard let uic = platforms.station(for: osmId) else { return nil }
         if let place = stopPlaces.place(id: uic) {
-            return board(name: place.name, id: place.id, lon: place.lon, lat: place.lat,
-                         at: now, limit: limit)
+            return stationBoard(placeId: place.id, at: now, limit: limit)
         }
         // A station abroad is in neither the drawn stop places nor the Swiss
         // numbering — Milano Centrale is a UIC and nothing else — but the

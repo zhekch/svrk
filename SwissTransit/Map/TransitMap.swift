@@ -3362,8 +3362,6 @@ final class MapCoordinator: NSObject {
     private enum Chip {
         static let plate = "platform-plate"
         static let plateActive = "platform-plate-active"
-        static let pole = "platform-pole"
-        static let poleActive = "platform-pole-active"
     }
 
     /// A stretchable rounded rectangle, used as the plate behind a code.
@@ -3409,16 +3407,6 @@ final class MapCoordinator: NSObject {
             (Chip.plateActive,
              UIColor(red: 1.0, green: 0.84, blue: 0.04, alpha: 0.22),
              UIColor(red: 1.0, green: 0.84, blue: 0.04, alpha: 1.0)),
-            // A stop with no code gets its own marker rather than a shrunk
-            // plate. The plate is near-black by design — it is a background for
-            // pale text — and shrunk to a few points on a dark basemap it is
-            // invisible. Pale fill, dark outline: legible on its own terms.
-            (Chip.pole,
-             UIColor(red: 0.81, green: 0.84, blue: 0.89, alpha: 0.92),
-             UIColor(red: 0.04, green: 0.05, blue: 0.06, alpha: 0.9)),
-            (Chip.poleActive,
-             UIColor(red: 1.0, green: 0.84, blue: 0.04, alpha: 1.0),
-             UIColor(red: 0.04, green: 0.05, blue: 0.06, alpha: 0.9)),
         ]
 
         for (id, fill, stroke) in chips {
@@ -3442,7 +3430,7 @@ final class MapCoordinator: NSObject {
         leaders.minZoom = Self.plateMinZoom
         try addLayer(leaders, to: style)
 
-        try addLayer(poleLayer(id: "\(ID.platforms)-pole", image: Chip.pole, selectedOnly: false), to: style)
+        try addLayer(stopMarkerLayer(id: "\(ID.platforms)-pole", highlighted: false), to: style)
         try addLayer(plateLayer(id: "\(ID.platforms)-plate", image: Chip.plate, highlighted: false), to: style)
 
         // Selection is the same marker in the highlight colour, drawn over the
@@ -3451,21 +3439,29 @@ final class MapCoordinator: NSObject {
         // look like, and being separate geometry it would still draw when the
         // plate under it had been decluttered elsewhere — a hoop hanging over a
         // building with nothing in it.
-        try addLayer(poleLayer(id: "\(ID.platforms)-pole-selected", image: Chip.poleActive, selectedOnly: true), to: style)
+        try addLayer(stopMarkerLayer(id: "\(ID.platforms)-pole-selected", highlighted: true), to: style)
         try addLayer(plateLayer(id: "\(ID.platforms)-plate-selected", image: Chip.plateActive, highlighted: true), to: style)
     }
 
-    /// A kerb with nothing to label: a small marker that says only *here*.
-    private func poleLayer(id: String, image: String, selectedOnly: Bool) -> SymbolLayer {
-        var layer = SymbolLayer(id: id, source: ID.platforms)
-        layer.iconImage = .constant(.name(image))
-        layer.iconSize = .constant(0.34)
-        layer.iconAllowOverlap = .constant(true)
-        layer.iconIgnorePlacement = .constant(true)
-        layer.iconPadding = .constant(1)
+    /// A kerb with nothing to label: the same point language as every other
+    /// stop on the map. Rectangles are reserved for codes printed inside them.
+    private func stopMarkerLayer(id: String, highlighted: Bool) -> CircleLayer {
+        var layer = CircleLayer(id: id, source: ID.platforms)
+        layer.circleRadius = .expression(
+            Exp(.interpolate) { Exp(.linear); Exp(.zoom); 16; 5.0; 18; 6.2 }
+        )
+        layer.circleColor = .constant(StyleColor(
+            highlighted
+                ? UIColor(red: 1.0, green: 0.84, blue: 0.04, alpha: 1.0)
+                : UIColor(red: 0.81, green: 0.84, blue: 0.89, alpha: 0.92)
+        ))
+        layer.circleStrokeWidth = .constant(highlighted ? 2.0 : 1.4)
+        layer.circleStrokeColor = .constant(StyleColor(
+            UIColor(red: 0.04, green: 0.05, blue: 0.06, alpha: 0.9)
+        ))
         layer.minZoom = Self.plateMinZoom
         let codeless = Exp(.not) { Exp(.has) { "code" } }
-        layer.filter = selectedOnly
+        layer.filter = highlighted
             ? Exp(.all) { codeless; Exp(.eq) { Exp(.get) { "id" }; "__none__" } }
             : codeless
         return layer

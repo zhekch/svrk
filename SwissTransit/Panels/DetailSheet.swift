@@ -18,7 +18,7 @@ struct DetailSheet: View {
                 switch model.selection {
                 case .none:
                     ContentUnavailableView("Nothing selected", systemImage: "hand.tap")
-                case .vehicle:
+                case .vehicle, .service:
                     if let vehicle = model.selectedVehicle {
                         // A train standing at its terminus is shown as the
                         // working it leaves as, not the one it arrived on — that
@@ -27,7 +27,13 @@ struct DetailSheet: View {
                         VehiclePanel(
                             model: model,
                             vehicle: model.departingVehicle ?? vehicle,
-                            arrivedAs: model.departingVehicle == nil ? nil : vehicle
+                            arrivedAs: model.departingVehicle == nil ? nil : vehicle,
+                            boardDeparture: {
+                                if case let .service(_, departure) = model.selection {
+                                    return departure
+                                }
+                                return nil
+                            }()
                         )
                     } else if model.selectedVehicleMissing {
                         // Asked for, and there is no such vehicle. Nearly

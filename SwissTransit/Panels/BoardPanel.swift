@@ -321,13 +321,13 @@ struct BoardPanel: View {
                 toggle: { toggle(group.id) }
             )
             .contentShape(Rectangle())
-            .onTapGesture { Task { await model.select(journey: group.first.id) } }
+            .onTapGesture { Task { await model.select(journey: group.first) } }
 
             if expanded.contains(group.id) {
                 ForEach(group.following) { entry in
                     FollowingRow(entry: entry, now: now, showing: showing)
                         .contentShape(Rectangle())
-                        .onTapGesture { Task { await model.select(journey: entry.id) } }
+                        .onTapGesture { Task { await model.select(journey: entry) } }
                 }
             }
         }
@@ -400,10 +400,13 @@ struct ModeChips: View {
                         }
                     } label: {
                         HStack(spacing: 5) {
-                            Circle()
-                                .fill(mode.color)
-                                .frame(width: 7, height: 7)
+                            Image(systemName: mode.symbol)
+                                .font(.caption2.weight(.semibold))
+                                .symbolRenderingMode(.monochrome)
+                                .foregroundStyle(mode.color)
+                                .frame(width: 13, height: 13)
                                 .opacity(on ? 1 : 0.45)
+                                .accessibilityHidden(true)
                             Text(mode.label)
                                 .font(.caption.weight(.medium))
                             Text("\(count(mode))")
@@ -634,41 +637,42 @@ struct TrackPanel: View {
 
     var body: some View {
         List {
-            Section {
-                Text("Lines on this track.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            // Tappable for the same reason the serving rows are: the row says
-            // a line uses this track and names where it runs between, and the
-            // relation it was read out of can say the rest.
-            ForEach(lines, id: \.id) { line in
-                Button {
-                    Task { await model.openRoute(relation: line.id) }
-                } label: {
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 8) {
-                            Text(line.ref ?? "—")
-                                .font(.caption.weight(.bold))
-                                .padding(.horizontal, 6).padding(.vertical, 3)
-                                .background(Color.secondary.opacity(0.22), in: RoundedRectangle(cornerRadius: 5))
-                            Text(line.mode.replacingOccurrences(of: "_", with: " "))
-                                .font(.caption2).foregroundStyle(.secondary)
-                            Spacer()
-                            Text("\(line.stops) stops")
-                                .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
+            Section("Lines on this track") {
+                // Tappable for the same reason the serving rows are: the row
+                // says a line uses this track and names where it runs between,
+                // and the relation it was read out of can say the rest.
+                ForEach(lines, id: \.id) { line in
+                    let mode = Mode(osmRoute: line.mode)
+                    let ref = line.ref ?? ""
+                    let route = RouteNaming.trim(
+                        line.name ?? "\(line.from ?? "?") → \(line.to ?? "?")",
+                        ref: ref
+                    )
+                    Button {
+                        Task { await model.openRoute(relation: line.id) }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 8) {
+                                LineBadge(line: ref.isEmpty ? "—" : ref, mode: mode)
+                                Text(line.mode.replacingOccurrences(of: "_", with: " "))
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                Spacer()
+                                Text("\(line.stops) stops")
+                                    .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Text(route)
+                                .font(.callout).lineLimit(2).foregroundStyle(.primary)
+                            if let operatorName = line.operatorName {
+                                Text(operatorName).font(.caption2).foregroundStyle(.tertiary)
+                            }
                         }
-                        Text(line.name ?? "\(line.from ?? "?") → \(line.to ?? "?")")
-                            .font(.callout).lineLimit(2).foregroundStyle(.primary)
-                        if let operatorName = line.operatorName {
-                            Text(operatorName).font(.caption2).foregroundStyle(.tertiary)
-                        }
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
         }
         .listStyle(.insetGrouped)

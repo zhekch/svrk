@@ -60,8 +60,34 @@ actor WatchRailOverlayStore {
         guard let archive = loadIfNeeded() else { return [] }
         let width = abs(viewport.east - viewport.west)
         let height = abs(viewport.north - viewport.south)
-        let detailed = max(width, height) <= 0.85
-        let level: UInt8 = detailed ? 1 : 0
+        let span = max(width, height)
+
+        // SwiftUI Map creates a separate renderer for every custom polyline.
+        // Keep the watch layer deliberately sparse; Apple's basemap still
+        // supplies geographic context underneath it. The 12 m corridor band
+        // is only worthwhile once the camera reaches city scale.
+        let policy: (
+            level: UInt8,
+            lineLimit: Int,
+            pointLimit: Int,
+            simplifyMetres: Double
+        )
+        switch span {
+        case 1.0...:
+            policy = (0, 32, 500, 150)
+        case 0.35 ..< 1.0:
+            policy = (0, 48, 800, 150)
+        case 0.14 ..< 0.35:
+            policy = (0, 72, 1_200, 150)
+        case 0.05 ..< 0.14:
+            policy = (1, 96, 1_800, 55)
+        case 0.015 ..< 0.05:
+            policy = (1, 120, 2_600, 25)
+        default:
+            policy = (1, 140, 3_200, 10)
+        }
+        let detailed = policy.level == 1
+        let level = policy.level
         guard let entries = archive.bands[level] else { return [] }
 
         let west = BinaryFormat.encode(min(viewport.west, viewport.east))
@@ -74,26 +100,31 @@ actor WatchRailOverlayStore {
         }
 
         // A dense station throat can contain thousands of tiny OSM ways. Keep
-        // the meaningful transit classes and longer runs first so one wrist
-        // view never turns into thousands of MapKit overlays.
-        let limit = detailed ? 1_400 : 1_100
-        if visible.count > limit {
-            visible.sort {
-                let lhsPriority = Self.priority($0.style)
-                let rhsPriority = Self.priority($1.style)
-                if lhsPriority != rhsPriority { return lhsPriority > rhsPriority }
-                return $0.extent > $1.extent
-            }
-            visible.removeLast(visible.count - limit)
+        // meaningful transit classes and longer runs first, with both overlay
+        // and vertex limits so a single complex line cannot consume the frame.
+        visible.sort {
+            let lhsPriority = Self.priority($0.style)
+            let rhsPriority = Self.priority($1.style)
+            if lhsPriority != rhsPriority { return lhsPriority > rhsPriority }
+            return $0.extent > $1.extent
+        }
+        var selected: [Entry] = []
+        selected.reserveCapacity(min(visible.count, policy.lineLimit))
+        var selectedPoints = 0
+        for entry in visible {
+            guard selected.count < policy.lineLimit else { break }
+            guard selectedPoints + entry.pointCount <= policy.pointLimit else { continue }
+            selected.append(entry)
+            selectedPoints += entry.pointCount
         }
 
-        return visible.compactMap { entry in
+        return selected.compactMap { entry in
             let pointBytes = entry.pointCount * 8
             guard entry.pointsOffset >= 0,
                   entry.pointsOffset + pointBytes <= archive.file.buffer.count
             else { return nil }
-            var coordinates: [WatchCoordinate] = []
-            coordinates.reserveCapacity(entry.pointCount)
+            var raw: [Coord] = []
+            raw.reserveCapacity(entry.pointCount)
             for index in 0 ..< entry.pointCount {
                 let offset = entry.pointsOffset + index * 8
                 let lon = Int32(littleEndian: archive.file.buffer.loadUnaligned(
@@ -104,12 +135,19 @@ actor WatchRailOverlayStore {
                     fromByteOffset: offset + 4,
                     as: Int32.self
                 ))
-                coordinates.append(
-                    WatchCoordinate(
-                        latitude: BinaryFormat.decode(lat),
-                        longitude: BinaryFormat.decode(lon)
+                raw.append(
+                    Coord(
+                        lon: BinaryFormat.decode(lon),
+                        lat: BinaryFormat.decode(lat)
                     )
                 )
+            }
+            let simplified = detailed
+                ? Geo.simplify(raw, toleranceMetres: policy.simplifyMetres)
+                : raw
+            guard simplified.count >= 2 else { return nil }
+            let coordinates = simplified.map {
+                WatchCoordinate(latitude: $0.lat, longitude: $0.lon)
             }
             return WatchRailOverlayLine(
                 id: entry.id,
@@ -190,5 +228,135 @@ actor WatchRailOverlayStore {
         case .heavy, .narrow: return 2
         case .other: return 1
         }
+    }
+}
+
+struct WatchVehicleRouteGeometry: Sendable {
+    /// One optional OSM path for every pair of consecutive timetable calls.
+    /// Nil means that particular leg still uses its inexpensive chord fallback.
+    var legs: [[WatchCoordinate]?]
+}
+
+/// Matches only the vehicles the current camera can see against a simplified,
+/// memory-mapped copy of the same OSM route relations used by the iOS app.
+/// The archive includes rail, road and ferry services but no way-id index, so
+/// it is about a quarter of the full relation store and pages in on demand.
+actor WatchRouteGeometryStore {
+    static let shared = WatchRouteGeometryStore()
+
+    private var relations: RelationStore?
+    private var didTryLoading = false
+    private var cache: [String: WatchVehicleRouteGeometry] = [:]
+    private var misses = Set<String>()
+    private var cacheOrder: [String] = []
+
+    func geometries(
+        for vehicles: [WatchTransitVehicle]
+    ) -> [String: WatchVehicleRouteGeometry] {
+        guard loadIfNeeded() != nil else { return [:] }
+        var result: [String: WatchVehicleRouteGeometry] = [:]
+        for vehicle in vehicles {
+            if let geometry = geometry(for: vehicle) {
+                result[vehicle.id] = geometry
+            }
+        }
+        return result
+    }
+
+    func geometry(
+        for vehicle: WatchTransitVehicle
+    ) -> WatchVehicleRouteGeometry? {
+        guard let relations = loadIfNeeded(), vehicle.stops.count >= 2,
+              let mode = Mode(rawValue: vehicle.mode.lowercased())
+        else { return nil }
+
+        let key = cacheKey(for: vehicle)
+        if let cached = cache[key] { return cached }
+        if misses.contains(key) { return nil }
+
+        let calls = vehicle.stops.compactMap { stop -> Call? in
+            guard let coordinate = stop.coordinate, coordinate.isValid else { return nil }
+            let arrival = Int((stop.arrival ?? stop.departure ?? .distantPast).timeIntervalSince1970)
+            let departure = Int((stop.departure ?? stop.arrival ?? .distantPast).timeIntervalSince1970)
+            return Call(
+                key: stop.id,
+                ref: stop.stationID,
+                name: stop.name,
+                lat: coordinate.latitude,
+                lon: coordinate.longitude,
+                platform: stop.platform,
+                arr: arrival,
+                dep: departure,
+                delay: stop.delayMinutes
+            )
+        }
+        guard calls.count == vehicle.stops.count,
+              let matched = relations.legPaths(RelationStore.MatchProbe(
+                mode: mode,
+                line: vehicle.line,
+                number: vehicle.line,
+                category: nil,
+                stops: calls
+              ))
+        else {
+            misses.insert(key)
+            trimCacheIfNeeded()
+            return nil
+        }
+
+        let geometry = WatchVehicleRouteGeometry(
+            legs: matched.legs.map { leg in
+                leg.map { path in
+                    // Relation member order can contain a short trip to the
+                    // end of an OSM way and back. Clean each matched leg once
+                    // while filling the cache; map frames only interpolate the
+                    // already-clean coordinates.
+                    var cleaned = Geo.withoutSpurs(path)
+                    cleaned = Geo.withoutFolds(cleaned)
+                    cleaned = Geo.withoutEndStubs(cleaned)
+                    return cleaned.map {
+                        WatchCoordinate(latitude: $0.lat, longitude: $0.lon)
+                    }
+                }
+            }
+        )
+        cache[key] = geometry
+        cacheOrder.append(key)
+        trimCacheIfNeeded()
+        return geometry
+    }
+
+    private func loadIfNeeded() -> RelationStore? {
+        if let relations { return relations }
+        guard !didTryLoading else { return nil }
+        didTryLoading = true
+        guard let url = Bundle.main.url(
+            forResource: "watch-route-relations-v1",
+            withExtension: "bin"
+        ) else { return nil }
+
+        let loaded = RelationStore()
+        guard (try? loaded.load(url)) != nil else { return nil }
+        relations = loaded
+        return loaded
+    }
+
+    private func cacheKey(for vehicle: WatchTransitVehicle) -> String {
+        let stops = vehicle.stops.map { stop in
+            if let stationID = stop.stationID, !stationID.isEmpty { return stationID }
+            return stop.name.folding(
+                options: [.diacriticInsensitive, .caseInsensitive],
+                locale: Locale(identifier: "en_US")
+            )
+        }.joined(separator: ">")
+        return "\(vehicle.mode)|\(vehicle.line)|\(stops)"
+    }
+
+    private func trimCacheIfNeeded() {
+        let limit = 96
+        while cacheOrder.count > limit {
+            cache.removeValue(forKey: cacheOrder.removeFirst())
+        }
+        if misses.count > limit { misses.removeAll(keepingCapacity: true) }
     }
 }

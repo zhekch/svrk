@@ -6,14 +6,8 @@
     {
       "layers" : [
         {
-          "glass-specializations" : [
-            {
-              "appearance" : "light",
-              "value" : false
-            }
-          ],
-          "image-name" : "Frame-over.png",
-          "name" : "Frame-over",
+          "image-name" : "Frame-over2.png",
+          "name" : "Frame-over2",
           "position" : {
             "scale" : 1.25,
             "translation-in-points" : [

@@ -2,6 +2,11 @@ import Foundation
 
 /// Small online fallback used until the full national archive is installed.
 actor WatchStandaloneTransitService {
+    private enum StationboardKind: String, CaseIterable, Sendable {
+        case departure
+        case arrival
+    }
+
     private let baseURL = URL(string: "https://transport.opendata.ch/v1")!
     private let session: URLSession
 
@@ -28,12 +33,15 @@ actor WatchStandaloneTransitService {
         // without turning map refreshes into broad station-board downloads.
         let services = await withTaskGroup(of: [WatchTransitVehicle].self) { tasks in
             for station in group.stations.prefix(6) {
-                tasks.addTask { [self] in
-                    (try? await vehicles(
-                        at: station,
-                        now: now,
-                        includeUpcoming: true
-                    )) ?? []
+                for kind in StationboardKind.allCases {
+                    tasks.addTask { [self] in
+                        (try? await vehicles(
+                            at: station,
+                            now: now,
+                            includeUpcoming: true,
+                            boardKind: kind
+                        )) ?? []
+                    }
                 }
             }
             var joined: [WatchTransitVehicle] = []
@@ -44,15 +52,19 @@ actor WatchStandaloneTransitService {
         let stationIDs = Set(group.stations.map(\.id).filter { !$0.isEmpty })
         var unique: [String: WatchStationDeparture] = [:]
         for vehicle in services {
-            let call = vehicle.stops.first {
+            guard let callIndex = vehicle.stops.firstIndex(where: {
                 if let found = $0.stationID, stationIDs.contains(found) {
                     return true
                 }
-                return Self.partOfStation($0.name, group.name)
-            }
-            guard let call,
+                return WatchStopPlaceIdentity.belongsToInterchange(
+                    $0.name,
+                    parent: group.name
+                )
+            }) else { continue }
+            let call = vehicle.stops[callIndex]
+            guard let arrival = call.arrival ?? call.departure,
                   let departure = call.departure ?? call.arrival,
-                  departure >= now.addingTimeInterval(-2 * 60)
+                  max(arrival, departure) >= now.addingTimeInterval(-2 * 60)
             else { continue }
             let id = "\(vehicle.id)|\(Int(departure.timeIntervalSince1970))"
             unique[id] = WatchStationDeparture(
@@ -60,9 +72,14 @@ actor WatchStandaloneTransitService {
                 mode: vehicle.mode,
                 line: vehicle.line,
                 destination: vehicle.displayDestination,
+                origin: vehicle.origin,
+                arrival: arrival,
                 departure: departure,
                 platform: call.displayPlatform,
-                delayMinutes: call.delayMinutes ?? vehicle.delayMinutes
+                delayMinutes: call.delayMinutes ?? vehicle.delayMinutes,
+                vehicle: vehicle,
+                originates: callIndex == vehicle.stops.startIndex,
+                terminates: callIndex == vehicle.stops.index(before: vehicle.stops.endIndex)
             )
         }
         return unique.values.sorted { $0.departure < $1.departure }
@@ -85,6 +102,31 @@ actor WatchStandaloneTransitService {
             delayMinutes: nil,
             coordinate: station.coordinate
         )
+    }
+
+    /// One close-range marker per nearby stop place. This is used only after a
+    /// local-scale camera gesture settles and only when the full offline stop
+    /// register has not been installed.
+    func mapStops(in viewport: WatchViewport, limit: Int = 48) async throws
+        -> [WatchTransitStop] {
+        let candidates = try await stationCandidates(to: viewport.center)
+        let coverage = viewport.padded(by: 0.35)
+        return candidates.filter {
+            coverage.contains($0.coordinate)
+        }
+        .prefix(limit)
+        .map { station in
+            WatchTransitStop(
+                id: "online-map-stop|\(station.id)",
+                stationID: station.id,
+                name: station.name,
+                platform: nil,
+                arrival: nil,
+                departure: nil,
+                delayMinutes: nil,
+                coordinate: station.coordinate
+            )
+        }
     }
 
     func snapshot(
@@ -115,7 +157,9 @@ actor WatchStandaloneTransitService {
         }
 
         let dots = unique.values.sorted { lhs, rhs in
-            if lhs.mode != rhs.mode { return lhs.mode < rhs.mode }
+            let lhsPriority = WatchModeRenderPriority.value(for: lhs.mode)
+            let rhsPriority = WatchModeRenderPriority.value(for: rhs.mode)
+            if lhsPriority != rhsPriority { return lhsPriority > rhsPriority }
             if lhs.line != rhs.line {
                 return lhs.line.localizedStandardCompare(rhs.line) == .orderedAscending
             }
@@ -200,13 +244,17 @@ actor WatchStandaloneTransitService {
         let candidates = try await stationCandidates(to: coordinate)
         let close = candidates.filter { $0.distance <= 250 }
         let parent = close.filter {
-            Self.partOfStation(stop.name, $0.name)
+            Self.sameStop(stop.name, $0.name)
+                || (Self.isRailStation($0)
+                    && WatchStopPlaceIdentity.isGenericChild(stop.name, of: $0.name))
         }.min { lhs, rhs in
             if lhs.name.count != rhs.name.count { return lhs.name.count < rhs.name.count }
             return lhs.distance < rhs.distance
         }
         let name = parent?.name ?? stop.name
-        var stations = close.filter { Self.partOfStation($0.name, name) }
+        var stations = close.filter {
+            WatchStopPlaceIdentity.belongsToInterchange($0.name, parent: name)
+        }
 
         if !stations.contains(where: {
             if let id = stop.stationID, !id.isEmpty { return $0.id == id }
@@ -232,7 +280,8 @@ actor WatchStandaloneTransitService {
     private func vehicles(
         at station: NearbyStation,
         now: Date,
-        includeUpcoming: Bool = false
+        includeUpcoming: Bool = false,
+        boardKind: StationboardKind = .departure
     ) async throws -> [WatchTransitVehicle] {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("stationboard"),
@@ -245,7 +294,7 @@ actor WatchStandaloneTransitService {
             ),
             URLQueryItem(name: "limit", value: "24"),
             URLQueryItem(name: "datetime", value: Self.queryDate(now.addingTimeInterval(-45 * 60))),
-            URLQueryItem(name: "type", value: "departure"),
+            URLQueryItem(name: "type", value: boardKind.rawValue),
         ]
         for field in [
             "stationboard/name",
@@ -414,7 +463,7 @@ actor WatchStandaloneTransitService {
     }
 
     private static func sameStop(_ lhs: String, _ rhs: String) -> Bool {
-        squash(lhs) == squash(rhs)
+        WatchStopPlaceIdentity.sameName(lhs, rhs)
     }
 
     private static func squash(_ name: String) -> String {
@@ -424,12 +473,9 @@ actor WatchStandaloneTransitService {
         ).filter { $0.isLetter || $0.isNumber }
     }
 
-    private static func partOfStation(_ name: String, _ stationName: String) -> Bool {
-        sameStop(name, stationName)
-            || name.range(
-                of: "\(stationName), ",
-                options: [.anchored, .caseInsensitive]
-            ) != nil
+    private static func isRailStation(_ station: NearbyStation) -> Bool {
+        guard let icon = station.icon?.lowercased() else { return false }
+        return icon.contains("train") || icon.contains("rail")
     }
 
     private static func metres(

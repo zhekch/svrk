@@ -18,6 +18,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 APP = "SwissTransit"
 WATCH_APP = "SwissTransitWatch"
 WATCH_TARGET = "SwissTransit Watch App"
+UI_TESTS = "SwissTransitUITests"
+UI_TEST_TARGET = "SwissTransitUITests"
 BUNDLE_ID = "com.kexts.swisstransit"
 DEPLOYMENT = "17.0"
 WATCH_DEPLOYMENT = "10.0"
@@ -39,7 +41,7 @@ def swift_sources(directory: str) -> list[str]:
 
 
 IOS_SOURCES = swift_sources(APP)
-# Only the packed-file reader is shared with the phone. Compile these six
+# Only the packed-file reader and route matcher are shared with the phone. Compile these
 # dependency-free files directly into the watch executable instead of linking
 # the full TransitCore package, whose formation, disruption, geometry and
 # vehicle-model services have no place on a watch.
@@ -49,11 +51,15 @@ WATCH_CORE_SOURCES = [
     f"{WATCH_CORE_ROOT}/Categories.swift",
     f"{WATCH_CORE_ROOT}/Geo.swift",
     f"{WATCH_CORE_ROOT}/Models.swift",
+    f"{WATCH_CORE_ROOT}/RelationProjection.swift",
+    f"{WATCH_CORE_ROOT}/RelationSpatialIndex.swift",
+    f"{WATCH_CORE_ROOT}/RouteRelations.swift",
     f"{WATCH_CORE_ROOT}/StopRegister.swift",
     f"{WATCH_CORE_ROOT}/TimetableStore.swift",
 ]
 WATCH_SOURCES = sorted(swift_sources(WATCH_APP) + WATCH_CORE_SOURCES)
-ALL_SOURCES = sorted(set(IOS_SOURCES + WATCH_SOURCES))
+UI_TEST_SOURCES = swift_sources(UI_TESTS)
+ALL_SOURCES = sorted(set(IOS_SOURCES + WATCH_SOURCES + UI_TEST_SOURCES))
 if not IOS_SOURCES:
     sys.exit("no Swift sources found")
 
@@ -77,6 +83,10 @@ WATCH_RESOURCES = [
     # Keeping it in the app makes the overlay reliable offline without loading
     # the 17 MB routing graph (and its much larger in-memory index) on the watch.
     (f"{WATCH_APP}/Resources/watch-rail-overlay-v1.bin", "file"),
+    # Ordered OSM service paths, simplified to watch resolution and stripped of
+    # way ids. Memory-mapped on demand so visible vehicles can follow train,
+    # tram, bus and ferry routes without MapKit routing requests.
+    (f"{WATCH_APP}/Resources/watch-route-relations-v1.bin", "file"),
     # A separate Icon Composer package, compiled only into the watch bundle.
     (f"{WATCH_APP}/Resources/AppIcon_watch.icon", "folder.iconcomposer.icon"),
 ]
@@ -106,6 +116,9 @@ for path in IOS_SOURCES:
 for path in WATCH_SOURCES:
     w(f"\t\t{oid('bf:watch:' + path)} /* {os.path.basename(path)} in Sources */ = "
       f"{{isa = PBXBuildFile; fileRef = {oid('fr:' + path)} /* {os.path.basename(path)} */; }};")
+for path in UI_TEST_SOURCES:
+    w(f"\t\t{oid('bf:ui-test:' + path)} /* {os.path.basename(path)} in Sources */ = "
+      f"{{isa = PBXBuildFile; fileRef = {oid('fr:' + path)} /* {os.path.basename(path)} */; }};")
 for path, _ in RESOURCES:
     w(f"\t\t{oid('bf:' + path)} /* {os.path.basename(path)} in Resources */ = "
       f"{{isa = PBXBuildFile; fileRef = {oid('fr:' + path)} /* {os.path.basename(path)} */; }};")
@@ -130,6 +143,9 @@ w(f"\t\t{oid('product')} /* {APP}.app */ = {{isa = PBXFileReference; explicitFil
 w(f"\t\t{oid('product:watch')} /* {WATCH_TARGET}.app */ = {{isa = PBXFileReference; "
   f'explicitFileType = wrapper.application; includeInIndex = 0; path = "{WATCH_TARGET}.app"; '
   'sourceTree = BUILT_PRODUCTS_DIR; };')
+w(f"\t\t{oid('product:ui-tests')} /* {UI_TEST_TARGET}.xctest */ = {{isa = PBXFileReference; "
+  f'explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "{UI_TEST_TARGET}.xctest"; '
+  'sourceTree = BUILT_PRODUCTS_DIR; };')
 for path in ALL_SOURCES:
     w(f"\t\t{oid('fr:' + path)} /* {os.path.basename(path)} */ = {{isa = PBXFileReference; "
       f"lastKnownFileType = sourcecode.swift; path = {os.path.basename(path)}; sourceTree = \"<group>\"; }};")
@@ -152,6 +168,7 @@ w("\n/* Begin PBXGroup section */")
 children = [
     f"\t\t\t\t{oid('group:' + APP)} /* {APP} */,",
     f"\t\t\t\t{oid('group:' + WATCH_APP)} /* {WATCH_APP} */,",
+    f"\t\t\t\t{oid('group:' + UI_TESTS)} /* {UI_TESTS} */,",
     f"\t\t\t\t{oid('group:watch-core')} /* Watch Archive Core */,",
     f"\t\t\t\t{oid('group:products')} /* Products */,",
 ]
@@ -168,6 +185,7 @@ w("\t\t\tisa = PBXGroup;")
 w("\t\t\tchildren = (")
 w(f"\t\t\t\t{oid('product')} /* {APP}.app */,")
 w(f"\t\t\t\t{oid('product:watch')} /* {WATCH_TARGET}.app */,")
+w(f"\t\t\t\t{oid('product:ui-tests')} /* {UI_TEST_TARGET}.xctest */,")
 w("\t\t\t);")
 w("\t\t\tname = Products;")
 w("\t\t\tsourceTree = \"<group>\";")
@@ -184,7 +202,7 @@ w("\t\t\tsourceTree = \"<group>\";")
 w("\t\t};")
 
 # One group per directory under each application source root.
-for source_root in (APP, WATCH_APP):
+for source_root in (APP, WATCH_APP, UI_TESTS):
     subdirs = sorted(
         d for d in by_dir
         if d != source_root and d.startswith(source_root + os.sep)
@@ -233,6 +251,15 @@ for path in WATCH_SOURCES:
 w("\t\t\t);")
 w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
 w("\t\t};")
+w(f"\t\t{oid('phase:ui-tests:sources')} /* Sources */ = {{")
+w("\t\t\tisa = PBXSourcesBuildPhase;")
+w("\t\t\tbuildActionMask = 2147483647;")
+w("\t\t\tfiles = (")
+for path in UI_TEST_SOURCES:
+    w(f"\t\t\t\t{oid('bf:ui-test:' + path)} /* {os.path.basename(path)} in Sources */,")
+w("\t\t\t);")
+w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
+w("\t\t};")
 w("/* End PBXSourcesBuildPhase section */")
 
 w("\n/* Begin PBXResourcesBuildPhase section */")
@@ -275,6 +302,12 @@ for product in WATCH_PACKAGES:
 w("\t\t\t);")
 w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
 w("\t\t};")
+w(f"\t\t{oid('phase:ui-tests:frameworks')} /* Frameworks */ = {{")
+w("\t\t\tisa = PBXFrameworksBuildPhase;")
+w("\t\t\tbuildActionMask = 2147483647;")
+w("\t\t\tfiles = ();")
+w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
+w("\t\t};")
 w("/* End PBXFrameworksBuildPhase section */")
 
 # The companion app owns installation. Its Watch/ directory contains this
@@ -286,6 +319,13 @@ w(f"\t\t\tcontainerPortal = {oid('project')} /* Project object */;")
 w("\t\t\tproxyType = 1;")
 w(f"\t\t\tremoteGlobalIDString = {oid('target:watch')};")
 w(f"\t\t\tremoteInfo = \"{WATCH_TARGET}\";")
+w("\t\t};")
+w(f"\t\t{oid('proxy:ui-tests:app')} /* PBXContainerItemProxy */ = {{")
+w("\t\t\tisa = PBXContainerItemProxy;")
+w(f"\t\t\tcontainerPortal = {oid('project')} /* Project object */;")
+w("\t\t\tproxyType = 1;")
+w(f"\t\t\tremoteGlobalIDString = {oid('target')};")
+w(f"\t\t\tremoteInfo = {APP};")
 w("\t\t};")
 w("/* End PBXContainerItemProxy section */")
 
@@ -346,6 +386,23 @@ w(f"\t\t\tproductName = \"{WATCH_TARGET}\";")
 w(f"\t\t\tproductReference = {oid('product:watch')} /* {WATCH_TARGET}.app */;")
 w("\t\t\tproductType = \"com.apple.product-type.application\";")
 w("\t\t};")
+w(f"\t\t{oid('target:ui-tests')} /* {UI_TEST_TARGET} */ = {{")
+w("\t\t\tisa = PBXNativeTarget;")
+w(f"\t\t\tbuildConfigurationList = {oid('conflist:ui-tests')};")
+w("\t\t\tbuildPhases = (")
+w(f"\t\t\t\t{oid('phase:ui-tests:sources')} /* Sources */,")
+w(f"\t\t\t\t{oid('phase:ui-tests:frameworks')} /* Frameworks */,")
+w("\t\t\t);")
+w("\t\t\tbuildRules = ();")
+w("\t\t\tdependencies = (")
+w(f"\t\t\t\t{oid('dependency:ui-tests:app')} /* PBXTargetDependency */,")
+w("\t\t\t);")
+w(f"\t\t\tname = {UI_TEST_TARGET};")
+w("\t\t\tpackageProductDependencies = ();")
+w(f"\t\t\tproductName = {UI_TEST_TARGET};")
+w(f"\t\t\tproductReference = {oid('product:ui-tests')} /* {UI_TEST_TARGET}.xctest */;")
+w("\t\t\tproductType = \"com.apple.product-type.bundle.ui-testing\";")
+w("\t\t};")
 w("/* End PBXNativeTarget section */")
 
 w("\n/* Begin PBXTargetDependency section */")
@@ -353,6 +410,11 @@ w(f"\t\t{oid('dependency:watch')} /* PBXTargetDependency */ = {{")
 w("\t\t\tisa = PBXTargetDependency;")
 w(f"\t\t\ttarget = {oid('target:watch')} /* {WATCH_TARGET} */;")
 w(f"\t\t\ttargetProxy = {oid('proxy:watch')} /* PBXContainerItemProxy */;")
+w("\t\t};")
+w(f"\t\t{oid('dependency:ui-tests:app')} /* PBXTargetDependency */ = {{")
+w("\t\t\tisa = PBXTargetDependency;")
+w(f"\t\t\ttarget = {oid('target')} /* {APP} */;")
+w(f"\t\t\ttargetProxy = {oid('proxy:ui-tests:app')} /* PBXContainerItemProxy */;")
 w("\t\t};")
 w("/* End PBXTargetDependency section */")
 
@@ -367,6 +429,7 @@ w("\t\t\t\tLastUpgradeCheck = 2700;")
 w("\t\t\t\tTargetAttributes = {")
 w(f"\t\t\t\t\t{oid('target')} = {{ CreatedOnToolsVersion = 27.0; }};")
 w(f"\t\t\t\t\t{oid('target:watch')} = {{ CreatedOnToolsVersion = 27.0; }};")
+w(f"\t\t\t\t\t{oid('target:ui-tests')} = {{ CreatedOnToolsVersion = 27.0; TestTargetID = {oid('target')}; }};")
 w("\t\t\t\t};")
 w("\t\t\t};")
 w(f"\t\t\tbuildConfigurationList = {oid('conflist:project')};")
@@ -385,6 +448,7 @@ w("\t\t\tprojectRoot = \"\";")
 w("\t\t\ttargets = (")
 w(f"\t\t\t\t{oid('target')} /* {APP} */,")
 w(f"\t\t\t\t{oid('target:watch')} /* {WATCH_TARGET} */,")
+w(f"\t\t\t\t{oid('target:ui-tests')} /* {UI_TEST_TARGET} */,")
 w("\t\t\t);")
 w("\t\t};")
 w("/* End PBXProject section */")
@@ -484,6 +548,16 @@ WATCH_TARGET_SETTINGS = {
     "TARGETED_DEVICE_FAMILY": "4",
     "WATCHOS_DEPLOYMENT_TARGET": WATCH_DEPLOYMENT,
 }
+UI_TEST_TARGET_SETTINGS = {
+    "CODE_SIGN_STYLE": "Automatic",
+    "DEVELOPMENT_TEAM": "K83N2TZ5G3",
+    "GENERATE_INFOPLIST_FILE": "YES",
+    "PRODUCT_BUNDLE_IDENTIFIER": f"{BUNDLE_ID}.uitests",
+    "PRODUCT_NAME": '"$(TARGET_NAME)"',
+    "SWIFT_VERSION": "5.0",
+    "TARGETED_DEVICE_FAMILY": '"1,2"',
+    "TEST_TARGET_NAME": APP,
+}
 
 def config(key, name, settings):
     w(f"\t\t{oid(key)} /* {name} */ = {{")
@@ -502,6 +576,8 @@ config("conf:target:debug", "Debug", TARGET_SETTINGS)
 config("conf:target:release", "Release", TARGET_SETTINGS)
 config("conf:watch:debug", "Debug", WATCH_TARGET_SETTINGS)
 config("conf:watch:release", "Release", WATCH_TARGET_SETTINGS)
+config("conf:ui-tests:debug", "Debug", UI_TEST_TARGET_SETTINGS)
+config("conf:ui-tests:release", "Release", UI_TEST_TARGET_SETTINGS)
 w("/* End XCBuildConfiguration section */")
 
 def conflist(key, debug, release, name):
@@ -521,6 +597,10 @@ conflist("conflist:target", "conf:target:debug", "conf:target:release", "PBXNati
 conflist(
     "conflist:watch", "conf:watch:debug", "conf:watch:release",
     f'PBXNativeTarget "{WATCH_TARGET}"'
+)
+conflist(
+    "conflist:ui-tests", "conf:ui-tests:debug", "conf:ui-tests:release",
+    f'PBXNativeTarget "{UI_TEST_TARGET}"'
 )
 w("/* End XCConfigurationList section */")
 
@@ -550,9 +630,29 @@ with open(os.path.join(schemes, f"{APP}.xcscheme"), "w") as handle:
                ReferencedContainer = "container:{APP}.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry buildForTesting = "YES" buildForRunning = "NO" buildForProfiling = "NO" buildForArchiving = "NO" buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "{oid('target:ui-tests')}"
+               BuildableName = "{UI_TEST_TARGET}.xctest"
+               BlueprintName = "{UI_TEST_TARGET}"
+               ReferencedContainer = "container:{APP}.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv = "YES" shouldAutocreateTestPlan = "YES">
+      <Testables>
+         <TestableReference skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "{oid('target:ui-tests')}"
+               BuildableName = "{UI_TEST_TARGET}.xctest"
+               BlueprintName = "{UI_TEST_TARGET}"
+               ReferencedContainer = "container:{APP}.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+      </Testables>
    </TestAction>
    <LaunchAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" launchStyle = "0" useCustomWorkingDirectory = "NO" ignoresPersistentStateOnLaunch = "NO" debugDocumentVersioning = "YES" debugServiceExtension = "internal" allowLocationSimulation = "YES">
       <BuildableProductRunnable runnableDebuggingMode = "0">

@@ -47,6 +47,10 @@ struct TapChoice: Identifiable {
     let subtitle: String?
     let symbol: String
     let tint: Color
+    /// The infrastructure mode where this choice is a stop or station.
+    /// Vehicles have no value; keeping it explicit avoids inferring railway
+    /// status from an icon or from whichever departures happen to be listed.
+    let rail: Bool?
     /// Metres from the tap to whatever was drawn. What the list is sorted by.
     let distance: Double
 }
@@ -84,6 +88,7 @@ extension TapChoice {
             subtitle: snapshot.to.map { "to \($0)" },
             symbol: snapshot.mode.symbol,
             tint: snapshot.mode.color,
+            rail: nil,
             distance: distance
         )
     }
@@ -97,6 +102,7 @@ extension TapChoice {
             subtitle: rail ? "Station" : "Stop",
             symbol: rail ? "building.columns.fill" : "mappin.circle.fill",
             tint: .secondary,
+            rail: rail,
             distance: distance
         )
     }
@@ -120,6 +126,7 @@ extension TapChoice {
             subtitle: subtitle,
             symbol: "signpost.right.fill",
             tint: .secondary,
+            rail: board.rail,
             distance: distance
         )
     }

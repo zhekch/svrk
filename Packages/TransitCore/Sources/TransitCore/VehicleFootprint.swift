@@ -156,13 +156,11 @@ public struct VehicleFootprint: Sendable, Equatable {
     /// Whether to draw the selection ring round it.
     ///
     /// Not the same question as `selected`, and separating them is the point.
-    /// `selected` also decides that a vehicle turns from a dot into a drawing
-    /// sooner than its neighbours — somebody who has tapped a train is looking
-    /// at *that* train — and that must hold for as long as it is the selection.
-    /// The ring is a different job: it answers "which one did I tap", and once
+    /// Selection identifies the vehicle whose details are open; it must not
+    /// change the zoom at which that vehicle turns from a dot into a drawing.
+    /// The ring is a separate visual answer to "which one did I tap", and once
     /// the map is holding the vehicle in the middle of the screen and moving
-    /// with it, the answer is obvious and the ring is just a yellow line
-    /// between the reader and the train. See `AppModel.rebuildShapes`.
+    /// with it, that ring can be omitted. See `AppModel.rebuildShapes`.
     public var ringed: Bool
     /// Whether this vehicle is at street level rather than on the railway.
     ///
@@ -286,6 +284,33 @@ public enum VehicleShape {
     /// almost on top of it, and on a busy gondola line that means a string of
     /// dots long after the rope and stations have become the picture.
     public static let hangingVehiclePoints = 1.0
+
+    /// A path shorter than this is a location, not a route worth laying a
+    /// vehicle body along.
+    ///
+    /// Vertical and inclined lifts are commonly filed as cable services. Their
+    /// two stops can share one coordinate, or differ by only the width of the
+    /// building, and the ordinary no-path fallback extrapolates a twelve-metre
+    /// funicular car behind that point. Several timetable runs then become a
+    /// fan of invented cars. Keep those services as point markers instead.
+    public static let shortestDrawableRouteMetres = 30.0
+
+    /// Whether the map has enough honest route to replace this vehicle's dot
+    /// with its full footprint.
+    public static func hasDrawableRoute(
+        _ vehicle: VehicleSnapshot, vehicleLength: Double
+    ) -> Bool {
+        // ASC is the feed's ascenseur/inclined-lift product. Its movement is
+        // chiefly vertical, which a ground route cannot describe honestly even
+        // when the two entrances happen to have distinct coordinates.
+        if vehicle.mode == .cable,
+           vehicle.category?.trimmingCharacters(in: .whitespacesAndNewlines)
+               .uppercased() == "ASC" {
+            return false
+        }
+        guard let path = vehicle.geometry?.path, path.count >= 2 else { return false }
+        return Geo.length(of: path) >= max(shortestDrawableRouteMetres, vehicleLength)
+    }
 
     /// Where the change from dot to vehicle begins for a given layout.
     public static func emergeAt(bodies: Int) -> Double {
@@ -450,14 +475,9 @@ public enum VehicleShape {
         let rasterScale = max(1, pixelsPerPoint)
 
         let lengthPoints = total / metresPerPoint
-        // The selected vehicle is drawn as a shape a little sooner than the
-        // rest of them. Somebody who has tapped a train is looking at *that*
-        // train, and the formation panel beside the map is already describing
-        // the thing the dot is refusing to show.
         let threshold = emergeAt(
             bodies: layout.units.count, hanging: Cableway.hangs(vehicle)
         )
-        let floor = selected ? threshold * 0.6 : threshold
         // Told, or worked out here. Told is the normal case and the one that
         // animates: the caller keeps a per-vehicle clock and hands in where
         // this vehicle has got to, which is also what lets a vehicle that has
@@ -465,7 +485,7 @@ public enum VehicleShape {
         // a second it takes to leave. Worked out is the fallback for callers
         // with no clock — the tests, and the single-shape rewrite the followed
         // vehicle gets — and there it is the plain answer, in or out.
-        let emergence = emerged ?? (lengthPoints >= floor ? 1 : 0)
+        let emergence = emerged ?? (lengthPoints >= threshold ? 1 : 0)
         guard emergence > 0 else { return nil }
 
         // Hung behind the position, not centred on it.

@@ -5,16 +5,7 @@
   "groups" : [
     {
       "layers" : [
-        {
-          "glass-specializations" : [
-            {
-              "appearance" : "light",
-              "value" : false
-            }
-          ],
-          "image-name" : "Frame-over.png",
-          "name" : "Frame-over"
-        }
+
       ],
       "shadow" : {
         "kind" : "neutral",
@@ -27,6 +18,19 @@
     },
     {
       "layers" : [
+        {
+          "glass-specializations" : [
+            {
+              "value" : true
+            },
+            {
+              "appearance" : "light",
+              "value" : true
+            }
+          ],
+          "image-name" : "Frame-over2.png",
+          "name" : "Frame-over2"
+        },
         {
           "fill" : {
             "solid" : "srgb:1.00000,1.00000,1.00000,1.00000"

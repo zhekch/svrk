@@ -87,7 +87,9 @@ actor WatchNationalTimetableService {
                 visibleRegion.contains(lon: $0.longitude, lat: $0.latitude)
             }
             .sorted { lhs, rhs in
-                if lhs.mode != rhs.mode { return lhs.mode < rhs.mode }
+                let lhsPriority = WatchModeRenderPriority.value(for: lhs.mode)
+                let rhsPriority = WatchModeRenderPriority.value(for: rhs.mode)
+                if lhsPriority != rhsPriority { return lhsPriority > rhsPriority }
                 if lhs.line != rhs.line {
                     return lhs.line.localizedStandardCompare(rhs.line) == .orderedAscending
                 }
@@ -101,6 +103,78 @@ actor WatchNationalTimetableService {
             viewport: viewport,
             vehicles: Array(vehicles)
         )
+    }
+
+    /// Stop-place markers for a close watch viewport, independent of whether a
+    /// vehicle serving them happens to be active or survives the dot budget.
+    /// The packed register stores platform/kerb rows, so fold them to their
+    /// parent SLOID and average the child coordinates into one tappable point.
+    func mapStops(
+        in viewport: WatchViewport,
+        limit: Int = 96
+    ) throws -> [WatchTransitStop] {
+        if stops == nil {
+            guard try installedInfo() != nil else {
+                throw WatchNationalArchiveFiles.ArchiveError.notInstalled
+            }
+        }
+        guard let stops else {
+            throw WatchNationalArchiveFiles.ArchiveError.notInstalled
+        }
+
+        struct PlaceAccumulator {
+            var id: String
+            var name: String
+            var longitude = 0.0
+            var latitude = 0.0
+            var count = 0
+        }
+
+        let region = BBox(
+            west: min(viewport.west, viewport.east),
+            south: min(viewport.south, viewport.north),
+            east: max(viewport.west, viewport.east),
+            north: max(viewport.south, viewport.north)
+        )
+        var places: [String: PlaceAccumulator] = [:]
+        for registered in stops.within(region, limit: .max) {
+            let station = TimetableStore.station(ofSlotRef: registered.id)
+            guard !station.isEmpty else { continue }
+            var place = places[station] ?? PlaceAccumulator(
+                id: station,
+                name: registered.name
+            )
+            place.longitude += registered.lon
+            place.latitude += registered.lat
+            place.count += 1
+            places[station] = place
+        }
+
+        let center = viewport.center
+        return places.values.compactMap { place -> WatchTransitStop? in
+            guard place.count > 0 else { return nil }
+            let coordinate = WatchCoordinate(
+                latitude: place.latitude / Double(place.count),
+                longitude: place.longitude / Double(place.count)
+            )
+            guard coordinate.isValid else { return nil }
+            return WatchTransitStop(
+                id: "offline-map-stop|\(place.id)",
+                stationID: place.id,
+                name: place.name,
+                platform: nil,
+                arrival: nil,
+                departure: nil,
+                delayMinutes: nil,
+                coordinate: coordinate
+            )
+        }
+        .sorted {
+            guard let lhs = $0.coordinate, let rhs = $1.coordinate else { return false }
+            return lhs.distanceSquared(to: center) < rhs.distanceSquared(to: center)
+        }
+        .prefix(limit)
+        .map { $0 }
     }
 
     func stationBoard(
@@ -119,35 +193,96 @@ actor WatchNationalTimetableService {
         let group = Self.stationGroup(for: stop, register: stops)
         guard !group.stations.isEmpty else { return [] }
         let nowStamp = Int(now.timeIntervalSince1970)
+        let boardKey = group.stations.sorted().joined(separator: "|")
         let journeys = timetable.journeys(
             callingAt: group.stations,
-            key: group.stations.sorted().joined(separator: "|"),
+            key: boardKey,
             from: nowStamp - 2 * 60,
             to: nowStamp + 6 * 60 * 60,
             limit: 120,
             place: { ref in stops.lookup(ref) }
         )
+        let cadenceByService = Dictionary(
+            timetable.departureCadences(
+                callingAt: group.stations,
+                key: boardKey,
+                on: now
+            ).map { cadence in
+                (
+                    Self.cadenceKey(
+                        mode: cadence.mode.rawValue,
+                        line: cadence.line,
+                        direction: cadence.direction
+                    ),
+                    cadence.minutes
+                )
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
 
         return journeys.compactMap { journey in
-            guard let call = journey.stops.first(where: {
+            guard let callIndex = journey.stops.firstIndex(where: {
                 guard let ref = $0.ref else { return false }
                 return group.stations.contains(TimetableStore.station(ofSlotRef: ref))
-                    && $0.dep >= nowStamp - 2 * 60
+                    && max($0.arr, $0.dep) >= nowStamp - 2 * 60
             }) else { return nil }
+            let call = journey.stops[callIndex]
             let line = journey.line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let vehicle = Self.vehicle(
+                from: journey,
+                at: nowStamp,
+                includeUpcoming: true
+            )
+            let destination = journey.to ?? "—"
+            let displayLine = line.isEmpty
+                ? (journey.number ?? journey.mode.rawValue.capitalized)
+                : line
+            let direction = journey.stops.dropFirst(callIndex + 1).compactMap { next -> String? in
+                    guard let reference = next.ref else { return nil }
+                    let station = TimetableStore.station(ofSlotRef: reference)
+                    return group.stations.contains(station) ? nil : station
+                }.first
             return WatchStationDeparture(
                 id: "\(journey.id)|\(call.dep)|\(call.ref ?? call.name)",
                 mode: journey.mode.rawValue,
-                line: line.isEmpty ? (journey.number ?? journey.mode.rawValue.capitalized) : line,
-                destination: journey.to ?? "—",
+                line: displayLine,
+                destination: destination,
+                origin: journey.from.isEmpty
+                    ? (journey.stops.first?.name ?? "—")
+                    : journey.from,
+                arrival: Date(timeIntervalSince1970: TimeInterval(call.arr)),
                 departure: Date(timeIntervalSince1970: TimeInterval(call.dep)),
                 platform: call.platform ?? call.assigned,
-                delayMinutes: call.delay
+                delayMinutes: call.delay,
+                vehicle: vehicle,
+                originates: callIndex == journey.stops.startIndex,
+                terminates: callIndex == journey.stops.index(before: journey.stops.endIndex),
+                typicalIntervalMinutes: direction.flatMap {
+                    cadenceByService[Self.cadenceKey(
+                        mode: journey.mode.rawValue,
+                        line: displayLine,
+                        direction: $0
+                    )]
+                }
             )
         }
         .sorted { $0.departure < $1.departure }
         .prefix(30)
         .map { $0 }
+    }
+
+    private static func cadenceKey(
+        mode: String,
+        line: String,
+        direction: String
+    ) -> String {
+        [mode, line, direction].map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                .folding(
+                    options: [.caseInsensitive, .diacriticInsensitive],
+                    locale: Locale(identifier: "en_US")
+                )
+        }.joined(separator: "\u{1F}")
     }
 
     func station(near coordinate: WatchCoordinate) throws -> WatchTransitStop? {
@@ -207,7 +342,8 @@ actor WatchNationalTimetableService {
             metres: 250
         )
         let parent = nearby.filter {
-            partOfStation(stop.name, $0.name)
+            WatchStopPlaceIdentity.sameName(stop.name, $0.name)
+                || WatchStopPlaceIdentity.isGenericChild(stop.name, of: $0.name)
         }.min { lhs, rhs in
             if lhs.name.count != rhs.name.count { return lhs.name.count < rhs.name.count }
             return metres(
@@ -219,29 +355,13 @@ actor WatchNationalTimetableService {
             )
         }
         let name = parent?.name ?? stop.name
-        for registered in nearby where partOfStation(registered.name, name) {
+        for registered in nearby where WatchStopPlaceIdentity.belongsToInterchange(
+            registered.name,
+            parent: name
+        ) {
             stations.insert(TimetableStore.station(ofSlotRef: registered.id))
         }
         return (name, Set(stations.filter { !$0.isEmpty }))
-    }
-
-    private static func sameStop(_ lhs: String, _ rhs: String) -> Bool {
-        squash(lhs) == squash(rhs)
-    }
-
-    private static func squash(_ name: String) -> String {
-        name.folding(
-            options: [.diacriticInsensitive, .caseInsensitive],
-            locale: Locale(identifier: "en_US")
-        ).filter { $0.isLetter || $0.isNumber }
-    }
-
-    private static func partOfStation(_ name: String, _ stationName: String) -> Bool {
-        sameStop(name, stationName)
-            || name.range(
-                of: "\(stationName), ",
-                options: [.anchored, .caseInsensitive]
-            ) != nil
     }
 
     private static func metres(
@@ -292,7 +412,11 @@ actor WatchNationalTimetableService {
         return loadedInfo
     }
 
-    private static func vehicle(from journey: Journey, at now: Int) -> WatchTransitVehicle? {
+    private static func vehicle(
+        from journey: Journey,
+        at now: Int,
+        includeUpcoming: Bool = false
+    ) -> WatchTransitVehicle? {
         let calls = journey.stops.filter {
             ($0.lat != 0 || $0.lon != 0)
                 && $0.lat.isFinite && $0.lon.isFinite
@@ -300,12 +424,14 @@ actor WatchNationalTimetableService {
                 && (-180 ... 180).contains($0.lon)
         }
         guard calls.count >= 2,
-              now >= calls[0].arr - 5 * 60,
               now <= calls[calls.count - 1].dep + 2 * 60
         else { return nil }
 
         let position: (lat: Double, lon: Double, delay: Int?)
-        if now <= calls[0].dep {
+        if now < calls[0].arr - 5 * 60 {
+            guard includeUpcoming else { return nil }
+            position = (calls[0].lat, calls[0].lon, calls[0].delay)
+        } else if now <= calls[0].dep {
             position = (calls[0].lat, calls[0].lon, calls[0].delay)
         } else if let found = positionBetweenCalls(calls, at: now) {
             position = found
