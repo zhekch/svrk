@@ -173,6 +173,9 @@ public struct VehicleFootprint: Sendable, Equatable {
     /// drawn last, over a dark casing, and the pair reads the way it looks from
     /// the platform.
     public var aboveGround: Bool
+    /// Keep the whole train visible while it is dwelling at a stop, including
+    /// coaches extending beyond the station's approximate platform section.
+    public var stoppedAtStation: Bool = false
 
     /// The same footprint moved bodily by a lon/lat offset.
     ///
@@ -309,7 +312,13 @@ public enum VehicleShape {
             return false
         }
         guard let path = vehicle.geometry?.path, path.count >= 2 else { return false }
-        return Geo.length(of: path) >= max(shortestDrawableRouteMetres, vehicleLength)
+        let required = max(shortestDrawableRouteMetres, vehicleLength)
+        var length = 0.0
+        for i in 1..<path.count {
+            length += Geo.metres(path[i - 1], path[i])
+            if length >= required { return true }
+        }
+        return false
     }
 
     /// Where the change from dot to vehicle begins for a given layout.
@@ -753,7 +762,8 @@ public enum VehicleShape {
             emergence: emergence,
             stroke: layout.livery.stroke, selected: selected,
             hanging: Cableway.hangs(vehicle), ringed: ringed ?? selected,
-            aboveGround: Self.isAboveGround(vehicle.mode)
+            aboveGround: Self.isAboveGround(vehicle.mode),
+            stoppedAtStation: vehicle.mode == .train && !vehicle.moving && !vehicle.stops.isEmpty
         )
     }
 

@@ -283,18 +283,24 @@ public enum RideMatching {
         return pace >= movingAt
     }
 
+    /// Enough accuracy to name a station. Picking one platform remains a
+    /// separate, tighter check in `Fleet.confidentStop`.
+    public static let stationaryAccuracy: Double = 70
+
     /// Whether the newest fixes describe a phone resting in one place.
     ///
     /// This is intentionally stricter than simply being "not riding". A walk
     /// through a station and the first seconds after leaving a vehicle are both
-    /// not rides, but neither is permission to announce a stop. The recent
-    /// fixes must span several seconds, report walking speed or less, and fit
-    /// inside the uncertainty-sized circle around the newest fix.
+    /// not rides, but neither is permission to announce a stop. Two seconds of
+    /// walking-or-less clustered fixes is enough to name a station; a platform
+    /// still needs the tighter `confidentStop` check.
     public static func isStill(_ fixes: [RideFix]) -> Bool {
-        guard let last = fixes.last, last.accuracy <= 35 else { return false }
+        guard let last = fixes.last,
+              last.accuracy >= 0, last.accuracy <= stationaryAccuracy
+        else { return false }
         let recent = fixes.filter { last.at - $0.at <= 12 }
-        guard recent.count >= 4, let first = recent.first,
-              last.at - first.at >= 6
+        guard recent.count >= 2, let first = recent.first,
+              last.at - first.at >= 2
         else { return false }
 
         let stated = recent.compactMap { $0.speed }.filter { $0 >= 0 }
@@ -307,16 +313,24 @@ public enum RideMatching {
         let net = Geo.flatMetres(
             first.coord.lon, first.coord.lat, last.coord.lon, last.coord.lat
         )
-        guard net / span <= 1.1 else { return false }
+        // Two stationary readings can lie on opposite sides of their accuracy
+        // circles. Only displacement beyond that uncertainty is evidence of
+        // walking; raw endpoint distance turned normal GPS jitter into motion.
+        let uncertainty = hypot(first.accuracy, last.accuracy)
+        guard max(0, net - uncertainty) / span <= 1.1 else { return false }
 
         // A good GPS fix should form a tight cluster; a less exact one gets
         // room equal to its own honest uncertainty, but never enough to cover
         // a person walking from one stop side to another.
         let widestAccuracy = recent.map(\.accuracy).max() ?? last.accuracy
         let radius = max(12, min(30, widestAccuracy))
+        let centre = Coord(
+            lon: recent.reduce(0) { $0 + $1.coord.lon } / Double(recent.count),
+            lat: recent.reduce(0) { $0 + $1.coord.lat } / Double(recent.count)
+        )
         return recent.allSatisfy {
             Geo.flatMetres(
-                $0.coord.lon, $0.coord.lat, last.coord.lon, last.coord.lat
+                $0.coord.lon, $0.coord.lat, centre.lon, centre.lat
             ) <= radius
         }
     }

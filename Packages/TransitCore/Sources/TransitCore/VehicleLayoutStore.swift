@@ -28,7 +28,7 @@ import Foundation
 // **The usual formation stays until something else has been seen more often.**
 // Recency used to win, so one strengthened S42 redrew every other working of
 // it. The count is what stops that. The odd working is cached for this
-// journey only and forgotten when the app is next launched.
+// working, while the majority still answers for other workings on that line.
 
 /// Which train a stored layout belongs to.
 public struct LayoutKey: Hashable, Sendable, Codable {
@@ -104,6 +104,8 @@ public struct LayoutRecord: Sendable, Codable, Equatable {
     /// the usual four-car set has been seen fifty times, the strengthened one
     /// once, and the count is what tells them apart.
     public var count: Int
+    /// Missing in records learned before train/platform membership was read.
+    public var formationRevision: Int?
 
     public init(wagons: [StoredWagon], seen: Date, count: Int = 1) {
         self.wagons = wagons
@@ -125,7 +127,7 @@ public struct LayoutRecord: Sendable, Codable, Equatable {
     /// sweep asks the same questions again and the quota goes on silences.
     public var isSilence: Bool { wagons.isEmpty }
 
-    enum CodingKeys: String, CodingKey { case wagons = "w", seen = "s", count = "c" }
+    enum CodingKeys: String, CodingKey { case wagons = "w", seen = "s", count = "c", formationRevision = "r" }
 }
 
 /// The learned half of the layout database.
@@ -267,6 +269,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         /// Nil for anything with no timetable to place it in the day by, which
         /// is every vehicle the slot tier does not apply to anyway.
         var slot: TimeSlot?
+        var operationDay: Int?
     }
 
     /// What to draw for a vehicle.
@@ -295,10 +298,15 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         // for the life of the journey — which is what lets it sit in a cache
         // key at all. See `slot(of:)`.
         let slot = pattern == nil ? nil : self.slot(of: vehicle)
+        let partStart = vehicle.parts?.last { $0.start <= vehicle.index && vehicle.index <= $0.end }?.start ?? 0
+        let operationSeconds = vehicle.stops.indices.contains(partStart)
+            ? vehicle.stops[partStart].dep : Int(Date().timeIntervalSince1970)
+        let dayOffset = learnedKey == nil ? 0 : offset(at: operationSeconds)
+        let operationDay = learnedKey == nil ? nil : (operationSeconds + dayOffset) / 86_400
         let cacheKey = ResolvedKey(
             mode: vehicle.mode, category: vehicle.category, line: vehicle.line,
             operatorName: vehicle.operatorName, learned: learnedKey,
-            variant: variant, slot: slot
+            variant: variant, slot: slot, operationDay: operationDay
         )
         if let held = resolved[cacheKey] {
             lock.unlock()
@@ -307,8 +315,8 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         // Most specific first, and each tier is a strictly better answer than
         // the one behind it:
         //
-        // 1. this journey, because a unique working is drawn as itself for as
-        //    long as it is on the map;
+        // 1. this working: the measured drawing in memory, or its saved coach
+        //    list rebuilt after a launch;
         // 2. this line at this hour — the eight o'clock RE1 and not the eleven
         //    o'clock one, which is the whole reason slots exist;
         // 3. this line, whenever, which is what it looked like before the app
@@ -323,14 +331,19 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         // from the register rather than from a class average. The tiers behind
         // it are stored as names and rebuilt here.
         let exact = learnedKey.flatMap { journeys[$0] }
-        let remembered: [StoredWagon]? = exact != nil ? nil : pattern.flatMap { key in
+        let working = learnedKey.flatMap { records[$0] }.flatMap {
+            !$0.isSilence && $0.formationRevision == Self.formationRevision
+                && (Int($0.seen.timeIntervalSince1970) + dayOffset) / 86_400 == operationDay
+                ? $0.wagons : nil
+        }
+        let remembered: [StoredWagon]? = exact != nil ? nil : working ?? pattern.flatMap { key in
             slot.flatMap { slots[SlotKey(pattern: key, slot: $0)]?.wagons }
                 ?? patterns[key]?.wagons
         }
         let knownClasses = remembered == nil ? [:] : classes
         lock.unlock()
 
-        let paint = LayoutLibrary.livery(
+        let base = LayoutLibrary.livery(
             operatorName: vehicle.operatorName, mode: vehicle.mode,
             modeColour: modeColour, variant: variant
         )
@@ -345,11 +358,17 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         )
         let learned = exact ?? remembered.flatMap {
             WagonCatalogue.layout(
-                of: $0, livery: paint, like: Self.representative(of: guess),
+                of: $0, livery: base, like: Self.representative(of: guess),
                 measured: knownClasses
             )
         }
-        let answer = learned?.painted(paint) ?? guess
+        let formed = learned ?? guess
+        let paint = LayoutLibrary.stockLivery(
+            mode: vehicle.mode, line: vehicle.line,
+            operatorName: vehicle.operatorName, category: vehicle.category,
+            units: formed.units, name: formed.name, base: base
+        )
+        let answer = formed.painted(paint)
 
         lock.lock()
         // A bound, not a measurement: the country cannot produce more distinct
@@ -437,6 +456,14 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         return records[key]
     }
 
+    /// Recheck old observations once: they may include the detached portion
+    /// outside the train's brackets. Keep the seed available while refetching.
+    public func needsFormation(for key: LayoutKey) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let record = records[key] else { return true }
+        return !record.isSilence && record.formationRevision != Self.formationRevision
+    }
+
     /// What the store has counted for a line.
     public func pattern(for key: PatternKey) -> LayoutRecord? {
         lock.lock(); defer { lock.unlock() }
@@ -495,7 +522,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         // changes number partway is filed by the service under each number
         // separately. Without a call list to place the vehicle in, the journey's
         // own id is the best available.
-        let leg = vehicle.parts?.first { $0.start <= vehicle.index && vehicle.index <= $0.end }
+        let leg = vehicle.parts?.last { $0.start <= vehicle.index && vehicle.index <= $0.end }
         guard let parsed = FormationKey(
             journeyID: vehicle.formationReference(leg: leg), operationDate: ""
         ) else { return nil }
@@ -527,27 +554,34 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         mode: Mode, category: String?, line: String, operatorName: String?,
         modeColour: String, slot: TimeSlot? = nil
     ) -> Bool {
-        let paint = LayoutLibrary.livery(
+        let base = LayoutLibrary.livery(
             operatorName: operatorName, mode: mode, modeColour: modeColour
+        )
+        let guess = LayoutLibrary.layout(
+            mode: mode, category: category, line: line,
+            operatorName: operatorName, modeColour: modeColour
         )
         // What the service actually said, kept exactly, with the register's own
         // measured lengths in it. This is the drawing for *this* journey and it
         // is never written to disk — see `journeys`.
-        guard let observed = Self.layout(from: formation, at: moment, livery: paint)
+        guard var observed = Self.layout(
+            from: formation, at: moment, livery: base, like: Self.representative(of: guess)
+        )
         else { return false }
+        observed = observed.painted(LayoutLibrary.stockLivery(
+            mode: mode, line: line, operatorName: operatorName, category: category,
+            units: observed.units, name: observed.name, base: base
+        ))
 
         // What goes on file: the names, and nothing that can be deduced from
         // them. `WagonCatalogue.units` puts the rest back at drawing time.
         let wagons = Self.wagons(from: formation, at: moment)
         guard !wagons.isEmpty else { return false }
 
-        let guess = LayoutLibrary.layout(
-            mode: mode, category: category, line: line,
-            operatorName: operatorName, modeColour: modeColour
-        )
         let matches = guess.drawsAlike(observed)
 
-        let incoming = LayoutRecord(wagons: wagons, seen: moment, count: 1)
+        var incoming = LayoutRecord(wagons: wagons, seen: moment, count: 1)
+        incoming.formationRevision = Self.formationRevision
 
         // What the register measured, filed against the class rather than the
         // train. This is the only place a real dimension enters the database,
@@ -581,7 +615,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
             let known = classes
             let agrees: (LayoutRecord) -> Bool = { record in
                 WagonCatalogue.layout(
-                    of: record.wagons, livery: paint, like: template, measured: known
+                    of: record.wagons, livery: base, like: template, measured: known
                 ).map(guess.drawsAlike) ?? false
             }
             Self.tally(
@@ -695,7 +729,8 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     /// formation stop by stop for exactly that reason, and taking the first
     /// stop would draw the whole train right up until it stopped being one.
     public static func layout(
-        from formation: TrainFormation, at moment: Date, livery: Livery
+        from formation: TrainFormation, at moment: Date, livery: Livery,
+        like template: VehicleUnit? = nil
     ) -> VehicleLayout? {
         let stops = formation.stops.filter { !$0.isEmpty }
         guard let stop = stops.min(by: { $0.distance(from: moment) < $1.distance(from: moment) })
@@ -703,7 +738,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
         else { return nil }
         guard !stop.coaches.isEmpty else { return nil }
 
-        var units = WagonCatalogue.units(from: wagons(from: formation, at: moment))
+        var units = WagonCatalogue.units(from: wagons(from: formation, at: moment), like: template)
         // Both lists come from the same stop's coaches, so they are the same
         // length; the guard is here so that a future change which breaks that
         // gives up rather than pairing a coach with somebody else's body.
@@ -968,6 +1003,7 @@ public final class VehicleLayoutStore: @unchecked Sendable {
     /// one. What it cannot invent is the class names, which version 2 never
     /// stored; those fill in as each train is next observed.
     static let version = 5
+    static let formationRevision = 1
 
     /// How long a "the service has nothing for this train" note stands.
     static let silenceLife: TimeInterval = 7 * 24 * 3600

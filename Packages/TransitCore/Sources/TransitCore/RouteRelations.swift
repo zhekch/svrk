@@ -1,5 +1,40 @@
 import Foundation
 
+/// An OSM public-transport relation fetched from Overpass, owned in memory
+/// rather than mapped from `routes.bin`.
+public struct OSMFetchedRoute: Sendable, Equatable {
+    public var id: Int32
+    public var route: String
+    public var ref: String?
+    public var name: String?
+    public var operatorName: String?
+    public var from: String?
+    public var to: String?
+    public var stops: [Coord]
+    /// OSM `name` on each stop node, same order as `stops`.
+    public var stopNames: [String?]
+    public var path: [Coord]
+    public var ways: [Int64]
+
+    public init(
+        id: Int32, route: String, ref: String? = nil, name: String? = nil,
+        operatorName: String? = nil, from: String? = nil, to: String? = nil,
+        stops: [Coord], stopNames: [String?] = [], path: [Coord], ways: [Int64]
+    ) {
+        self.id = id
+        self.route = route
+        self.ref = ref
+        self.name = name
+        self.operatorName = operatorName
+        self.from = from
+        self.to = to
+        self.stops = stops
+        self.stopNames = stopNames
+        self.path = path
+        self.ways = ways
+    }
+}
+
 /// A run of coordinates read straight out of the mapped relation store.
 ///
 /// The relation store is 32 MB of geometry — roughly 3.7 million coordinates.
@@ -57,6 +92,8 @@ public struct RouteRelation: Sendable {
     /// Whether the stitched polyline runs opposite to the stop list. See
     /// `RelationStore.orient`.
     var pathReversed: Bool = false
+    /// Geometry lives in the Overpass overlay rather than `routes.bin`.
+    var usesOverlay: Bool = false
 }
 
 /// Bind a timetable journey to the OSM route relation it actually runs on.
@@ -81,7 +118,13 @@ public final class RelationStore: @unchecked Sendable {
     /// Higher, because the stop sequence is then the only evidence there is.
     static let minCoverageUnrefed = 0.8
     /// A partial match has to account for at least this many stops in a row.
-    static let minSegmentStops = 3
+    /// Two, not three: an ICE from Frankfurt to Interlaken is three calls in
+    /// the Swiss feed — origin, Olten, terminus — and only the last two sit on
+    /// the packed IC 61. Requiring three left that Swiss half as a chord.
+    static let minSegmentStops = 2
+    /// How close two relations' calls must be to count as the same station
+    /// when stitching a foreign ICE onto a Swiss IC at Basel.
+    static let joinMetres = 400.0
     /// How many times a journey may be split before we stop looking.
     static let maxSegmentDepth = 3
 
@@ -136,6 +179,10 @@ public final class RelationStore: @unchecked Sendable {
     private var segmentCache: [String: Match?] = [:]
     private var offsetCache: [Int32: [Double]] = [:]
     private let lock = NSLock()
+
+    /// Relations fetched from Overpass. Owned arrays rather than a second
+    /// mapped blob, so ingest cannot trip `CoordView` over a dangling pointer.
+    private var overlayRoutes: [Int32: OSMFetchedRoute] = [:]
 
     public struct Match: Sendable {
         public var relationIndex: Int
@@ -240,8 +287,9 @@ public final class RelationStore: @unchecked Sendable {
     /// entirely — this single fix took mapped train legs from 36% to 78%.
     private func orient(_ relation: inout RouteRelation) {
         guard relation.pathCount >= 2, relation.stopCount >= 2 else { return }
-        let path = CoordView(bytes: bytes, offset: relation.pathOffset, count: relation.pathCount, isReversed: false)
-        let stops = CoordView(bytes: bytes, offset: relation.stopOffset, count: relation.stopCount, isReversed: false)
+        let path = pathCoords(of: relation)
+        let stops = stopCoords(of: relation)
+        guard path.count >= 2, stops.count >= 2 else { return }
 
         let head = path[0], tail = path[path.count - 1]
         let first = stops[0], last = stops[stops.count - 1]
@@ -263,15 +311,21 @@ public final class RelationStore: @unchecked Sendable {
     public func indexOf(id: Int32) -> Int? { byId[id] }
 
     public func path(of relation: RouteRelation) -> CoordView {
-        CoordView(bytes: bytes, offset: relation.pathOffset, count: relation.pathCount,
-                  isReversed: relation.pathReversed)
+        CoordView(
+            bytes: bytes, offset: relation.pathOffset, count: relation.pathCount,
+            isReversed: relation.pathReversed
+        )
     }
 
     public func stops(of relation: RouteRelation) -> CoordView {
-        CoordView(bytes: bytes, offset: relation.stopOffset, count: relation.stopCount, isReversed: false)
+        CoordView(
+            bytes: bytes, offset: relation.stopOffset, count: relation.stopCount,
+            isReversed: false
+        )
     }
 
     public func ways(of relation: RouteRelation) -> [Int64] {
+        if let overlay = overlayRoutes[relation.id] { return overlay.ways }
         var out = [Int64]()
         out.reserveCapacity(relation.wayCount)
         for i in 0..<relation.wayCount {
@@ -280,12 +334,92 @@ public final class RelationStore: @unchecked Sendable {
         return out
     }
 
+    func pathCoords(of relation: RouteRelation) -> [Coord] {
+        if let overlay = overlayRoutes[relation.id] {
+            return relation.pathReversed ? overlay.path.reversed() : overlay.path
+        }
+        return path(of: relation).toArray()
+    }
+
+    func stopCoords(of relation: RouteRelation) -> [Coord] {
+        if let overlay = overlayRoutes[relation.id] { return overlay.stops }
+        return stops(of: relation).toArray()
+    }
+
+    /// Fold Overpass relations into the store so the existing matcher can use
+    /// them. Ids already present — packed or previously fetched — are skipped.
+    @discardableResult
+    public func ingest(_ fetched: [OSMFetchedRoute]) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        var added = 0
+        for route in fetched {
+            if byId[route.id] != nil { continue }
+            guard route.path.count >= 2, !Geo.hasUnplaced(route.path), !Geo.hasJump(route.path) else { continue }
+            appendOverlay(route)
+            added += 1
+        }
+        if added > 0 { buildIndexes() }
+        return added
+    }
+
+    /// Replace packed geometry with a fetched worldwide copy of the same id.
+    ///
+    /// `ingest` skips ids it already has, which is right for matching a
+    /// vehicle onto rails we already carry. Opening a line wants the unclipped
+    /// member list, so this overlays the packed Swiss fragment.
+    public func overlay(_ fetched: [OSMFetchedRoute]) {
+        lock.lock()
+        defer { lock.unlock() }
+        var changed = false
+        for route in fetched {
+            guard route.path.count >= 2, !Geo.hasUnplaced(route.path), !Geo.hasJump(route.path) else { continue }
+            // A shorter overlay is a stitch that dropped the packed alignment,
+            // not an unclipped worldwide copy. ICE 60 across the Rhine is
+            // *longer* than the Swiss fragment; a spiderweb is not.
+            if let existing = overlayRoutes[route.id] {
+                if Geo.length(of: route.path) + 1_000 < Geo.length(of: existing.path) { continue }
+            } else if let i = byId[route.id], !relations[i].usesOverlay {
+                let packed = path(of: relations[i]).toArray()
+                if packed.count >= 2,
+                   Geo.length(of: route.path) + 1_000 < Geo.length(of: packed) { continue }
+            }
+            overlayRoutes[route.id] = route
+            changed = true
+            if let i = byId[route.id] {
+                relations[i].usesOverlay = true
+            } else {
+                appendOverlay(route)
+            }
+        }
+        if changed {
+            stopIndexBuilt = false
+            trackIndexBuilt = false
+        }
+    }
+
+    public func overlay(id: Int32) -> OSMFetchedRoute? {
+        overlayRoutes[id]
+    }
+
+    private func appendOverlay(_ route: OSMFetchedRoute) {
+        overlayRoutes[route.id] = route
+        relations.append(RouteRelation(
+            id: route.id, route: route.route, ref: route.ref, name: route.name,
+            operatorName: route.operatorName, network: nil, from: route.from, to: route.to,
+            stopOffset: 0, stopCount: route.stops.count,
+            pathOffset: 0, pathCount: route.path.count,
+            wayOffset: 0, wayCount: route.ways.count,
+            pathReversed: false, usesOverlay: true
+        ))
+    }
+
     /// OSM `ref` and the feed's line number agree on digits but not decoration.
-    static func normaliseRef(_ ref: String?) -> String {
-        guard let ref else { return "" }
-        return String(ref.uppercased().unicodeScalars.filter {
-            ("A"..."Z").contains(String($0)) || ("0"..."9").contains(String($0))
-        }.map(Character.init))
+    ///
+    /// Leading zeros in the number are padding (`EC000066` vs `EC66`), not a
+    /// different line.
+    public static func normaliseRef(_ ref: String?) -> String {
+        Journey.publishedLine(ref)
     }
 
     // MARK: - Matching
@@ -326,7 +460,7 @@ public final class RelationStore: @unchecked Sendable {
     }
 
     func coverage(_ journeyStops: [Call], _ relation: RouteRelation) -> Coverage {
-        let relStops = stops(of: relation)
+        let relStops = stopCoords(of: relation)
         var out = Coverage()
         var cursor = 0
         var run = 0
@@ -357,6 +491,50 @@ public final class RelationStore: @unchecked Sendable {
             }
         }
 
+        out.ratio = journeyStops.isEmpty ? 0 : Double(out.matched) / Double(journeyStops.count)
+        if relation.usesOverlay {
+            let alongPath = pathCoverage(journeyStops, relation)
+            if alongPath.matched > out.matched { return alongPath }
+        }
+        return out
+    }
+
+    /// Overlay relations are fetched because they serve this run, but OSM often
+    /// omits the stop members south of the border. Walking the polyline is what
+    /// still counts Frankfurt Flughafen when the relation only named Hbf.
+    func pathCoverage(_ journeyStops: [Call], _ relation: RouteRelation) -> Coverage {
+        let path = pathCoords(of: relation)
+        var out = Coverage()
+        guard !path.isEmpty else { return out }
+        let radius = Self.projection(for: .train).reject
+        var cursor = 0
+        var run = 0
+        for (at, stop) in journeyStops.enumerated() {
+            var best = Double.infinity
+            var bestIndex = cursor
+            var i = cursor
+            while i < path.count {
+                let d = Geo.metres(stop.lon, stop.lat, path[i].lon, path[i].lat)
+                if d < best {
+                    best = d
+                    bestIndex = i
+                }
+                i += 1
+            }
+            if best <= radius {
+                out.matched += 1
+                out.indices.append(bestIndex)
+                cursor = bestIndex
+                run += 1
+                if run > out.runLength {
+                    out.runLength = run
+                    out.runTo = at
+                    out.runFrom = at - run + 1
+                }
+            } else {
+                run = 0
+            }
+        }
         out.ratio = journeyStops.isEmpty ? 0 : Double(out.matched) / Double(journeyStops.count)
         return out
     }
@@ -403,6 +581,18 @@ public final class RelationStore: @unchecked Sendable {
             for i in byKey[key] ?? [] where !seen.contains(i) {
                 seen.insert(i)
                 candidates.append(i)
+            }
+        }
+        // Overpass is asked because the GTFS number is not the OSM number —
+        // Swiss IC 3 vs ICE 43 / IC 61 for the same Frankfurt–Interlaken train.
+        // Those fetched relations have to be in the pool or ingesting them does
+        // nothing.
+        if !overlayRoutes.isEmpty {
+            let kinds = Self.modeRoutes[probe.mode] ?? []
+            for route in overlayRoutes.values where kinds.contains(route.route) {
+                if let i = byId[route.id], seen.insert(i).inserted {
+                    candidates.append(i)
+                }
             }
         }
 
@@ -561,8 +751,8 @@ public final class RelationStore: @unchecked Sendable {
     func stopOffsets(_ relation: RouteRelation) -> [Double] {
         if let hit = lock.withLock({ offsetCache[relation.id] }) { return hit }
 
-        let path = self.path(of: relation)
-        let relStops = self.stops(of: relation)
+        let path = self.pathCoords(of: relation)
+        let relStops = self.stopCoords(of: relation)
         var cumulative = [Double](repeating: 0, count: path.count)
         if path.count > 1 {
             for i in 1..<path.count {
@@ -619,7 +809,7 @@ public final class RelationStore: @unchecked Sendable {
         let relation = relations[match.relationIndex]
         let offsets = stopOffsets(relation)
         let here = firstIndex < offsets.count ? offsets[firstIndex] : 0
-        let relStops = stops(of: relation)
+        let relStops = stopCoords(of: relation)
 
         // Earliest first. Walking back one stop at a time needs a request per
         // stop; the board at the line's *first* stop carries the whole run in

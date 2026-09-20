@@ -3,7 +3,7 @@ import Observation
 import MapboxMaps
 import TransitCore
 
-/// A named piece of Switzerland the user can keep on the device.
+/// A named piece of the map the user can keep on the device.
 struct Region: Identifiable, Hashable {
     let id: String
     let name: String
@@ -44,6 +44,16 @@ struct Region: Identifiable, Hashable {
                bbox: BBox(west: 6.7, south: 45.9, east: 8.5, north: 46.5)),
         Region(id: "graubunden", name: "Graubünden", detail: "Chur, Davos, St. Moritz",
                bbox: BBox(west: 8.6, south: 46.2, east: 10.5, north: 47.1)),
+        // Neighbouring corridors Swiss trains actually use. The Watch overlay
+        // stays clipped to Switzerland; the phone draws and caches these too.
+        Region(id: "lombardy", name: "Lombardy", detail: "Milano, Como, Domodossola",
+               bbox: BBox(west: 8.4, south: 45.3, east: 10.6, north: 46.4)),
+        Region(id: "alsace", name: "Alsace & Jura", detail: "Mulhouse, Belfort, Dijon",
+               bbox: BBox(west: 5.5, south: 46.7, east: 7.6, north: 48.2)),
+        Region(id: "baden", name: "Baden-Württemberg", detail: "Freiburg, Stuttgart, Konstanz",
+               bbox: BBox(west: 7.5, south: 47.5, east: 10.2, north: 49.0)),
+        Region(id: "tyrol", name: "Tyrol & Vorarlberg", detail: "Innsbruck, Bregenz, Feldkirch",
+               bbox: BBox(west: 9.4, south: 46.6, east: 12.6, north: 47.7)),
     ]
 }
 
@@ -63,8 +73,10 @@ struct RegionState: Equatable {
 ///
 /// The transit data — every stop, all 7,860 route relations, the whole railway
 /// graph — ships with the app and is already on the device, so what is actually
-/// downloadable is the *basemap*: the vector tiles Mapbox renders. That is the
-/// large, per-area, optional part, and it is what this manages.
+/// downloadable is the *basemap*: the vector tiles Mapbox renders, including
+/// neighbouring corridors Swiss trains use. That is the large, per-area,
+/// optional part, and it is what this manages. The Watch overlay stays
+/// clipped to Switzerland; the phone draws railways wherever the camera goes.
 ///
 /// The other half of working offline is the fleet itself, and that is handled
 /// where it is produced: every refresh writes the response straight to disk as

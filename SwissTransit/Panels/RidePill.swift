@@ -2,40 +2,7 @@ import Combine
 import SwiftUI
 import TransitCore
 
-/// "RE1 to Brig" or "Bern · Platform 7" — the sheet, at its smallest.
-///
-/// Deliberately the smallest thing that can carry that: the name, plus a live
-/// pulse only where the answer is a moving service. The app has worked out
-/// something the person holding it
-/// already knows — they can see the train they are sitting in — so it has no
-/// business taking the screen to announce it. What it *does* know that they do
-/// not is where the train is going, how late it is and what it is made of, and
-/// all of that is one pull away in the panel that already exists.
-///
-/// It is a *detent* of that panel's sheet rather than a badge floating over the
-/// map, and that is the whole design. A badge can only imitate the pull: it
-/// follows the finger a little, decides at the end of the gesture, and then
-/// swaps itself for a different view. As a detent the pull is the sheet's own —
-/// the offer grows into the panel it was promising, at whatever speed the
-/// finger chose, and lands wherever the finger lets go.
-///
-/// Nothing here draws a background, a border or a grab handle. The sheet draws
-/// all three, which is what "native" means and is the one thing a hand-rolled
-/// capsule cannot keep doing when the platform's own chrome changes underneath
-/// it. No chevron either: the handle above it already says which way it goes.
-///
-/// Pushing it off the screen is the other half. An offer that cannot be
-/// declined is an interruption, and a badge naming the wrong train — the one on
-/// the next track, at a station, running alongside — is exactly the case the
-/// fit cannot rule out on its own. That is the sheet's own downward swipe from
-/// this height, and `ContentView` reads a dismissal from it as "not my train".
-///
-/// Pushing the *panel* back down is not that, and the difference is the whole
-/// of this height's job. The bar is where the sheet rests for as long as the
-/// ride lasts: pull up for the panel, push down and the bar is still there,
-/// swipe down again and it is gone. Taking the offer used to retire it, so
-/// closing the panel left bare map and no way back to the train underneath the
-/// phone — the app throwing away the one thing it had worked out.
+
 struct RidePill: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let offer: RideWatch.Offer
@@ -102,6 +69,7 @@ struct RidePill: View {
         .accessibilityHint(accessibilityHint)
         .accessibilityAction { open() }
         .accessibilityAction(named: dismissName) { dismiss() }
+        .accessibilityIdentifier("Live ride pill")
     }
 
     private var showsLiveDot: Bool {
@@ -180,6 +148,7 @@ struct RidePill: View {
                 open: {}, dismiss: {}
             )
             .presentationDetents([.height(RidePill.height), .large])
+            .presentationCornerRadius(RidePill.height)
             .presentationDragIndicator(.visible)
         }
         .preferredColorScheme(.dark)

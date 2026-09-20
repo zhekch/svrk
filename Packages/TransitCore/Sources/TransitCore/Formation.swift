@@ -208,6 +208,9 @@ public enum CoachOffer: String, Sendable, Equatable, CaseIterable {
 
 /// One vehicle in a train, as it stands at one stop.
 public struct Coach: Sendable, Equatable, Identifiable {
+    /// False for another working shown beside this train on the platform.
+    public var belongsToTrain = true
+    public var isTrainVehicle: Bool { belongsToTrain && kind != .fictitious }
     /// Position in the formation, counting from the front. 1-based.
     public var position: Int
     public var id: Int { position }
@@ -527,32 +530,76 @@ public struct TrainFormation: Sendable, Equatable {
         /// the realtime feed by the time they leave.
         public var moment: Date?
         /// The portions as they stand while the train is still one train.
+        ///
+        /// One of them, or none, where the service files the parting as a
+        /// relationship and leaves the coach goals whole — see `split`. A
+        /// portion is a claim about coaches, not about the parting, and
+        /// inventing a second one to make the pair look symmetrical would put
+        /// coach numbers on the picker that nothing published.
         public var portions: [FormationAtStop.Portion]
+        /// The workings the train becomes, where the service names them.
+        ///
+        /// The half that carries no coach goal is findable only by name, and
+        /// this is the name: a journey id the feed keys journeys by. Empty for
+        /// a split read out of the goals alone.
+        public var branches: [Working] = []
     }
 
-    /// The split this train makes, read from the coach goals rather than from a
-    /// relationship.
+    /// The split this train makes: the coach goals where they say, the
+    /// separation relationship where they do not.
     ///
-    /// `separation` is the better source and is used where it exists, but it
-    /// often does not: the S44 out of Burgistein has "coaches 1–4 to Solothurn,
-    /// 5–8 to Sumiswald-Grünen" against every stop and a null `relationships`.
-    /// The goals alone are enough to find the parting, because they are listed
-    /// while the coaches are together and stop being listed once they are not —
-    /// so the split is the stop after the last one that named two destinations.
+    /// **The goals first.** The S44 out of Burgistein has "coaches 1–4 to
+    /// Solothurn, 5–8 to Sumiswald-Grünen" against every stop and a null
+    /// `relationships`. They are listed while the coaches are together and stop
+    /// being listed once they are not, so the split is the stop after the last
+    /// one that named two destinations — and they say which coaches go where,
+    /// which is the thing a passenger standing on the platform needs.
+    ///
+    /// **The relationship where the goals are silent.** RE1 4177 out of Bern
+    /// files every one of its twelve coaches to Domodossola and parts at Spiez
+    /// all the same, into RE1 4277 and R11 6829, and says so as a `T`. Taking
+    /// only the goals there left a train advertised as "Domodossola (I) |
+    /// Zweisimmen" with no split at all: no picker, no Zweisimmen stops, and a
+    /// direction arrow claiming all twelve coaches were going to both places.
+    /// The relationship cannot say which coaches go where and does not pretend
+    /// to; what it names is the parting and the two workings, which is enough
+    /// for the card to offer the choice.
     public var split: Split? {
-        guard let last = stops.lastIndex(where: { $0.portions.count > 1 }) else { return nil }
-        let together = stops[last]
-        let next = stops.indices.contains(last + 1) ? stops[last + 1] : together
-        // The relationship wins on where, when there is one: it names the stop
-        // outright rather than by inference from a gap in a list.
-        let name = separation?.stopName ?? next.stopName
-        let parting = stops.first {
-            $0.stopName.compare(name, options: .caseInsensitive) == .orderedSame
-        } ?? next
+        if let last = stops.lastIndex(where: { $0.portions.count > 1 }) {
+            let together = stops[last]
+            let next = stops.indices.contains(last + 1) ? stops[last + 1] : together
+            // The relationship wins on where, when there is one: it names the
+            // stop outright rather than by inference from a gap in a list.
+            let name = separation?.stopName ?? next.stopName
+            let parting = stops.first {
+                $0.stopName.compare(name, options: .caseInsensitive) == .orderedSame
+            } ?? next
+            return Split(
+                stopName: parting.stopName, stopUIC: parting.uic,
+                moment: parting.arrival ?? parting.departure,
+                portions: together.portions,
+                branches: separation?.branches ?? []
+            )
+        }
+        guard let separation, !separation.branches.isEmpty else { return nil }
+        // Only where the parting is a stop this train actually makes. A
+        // relationship naming somewhere off this working's list is about a
+        // later leg of the same physical train, and the card is not showing
+        // that leg.
+        guard let index = stops.firstIndex(where: {
+            $0.uic == separation.stopUIC
+                || $0.stopName.compare(separation.stopName, options: .caseInsensitive) == .orderedSame
+        }) else { return nil }
+        let parting = stops[index]
         return Split(
             stopName: parting.stopName, stopUIC: parting.uic,
             moment: parting.arrival ?? parting.departure,
-            portions: together.portions
+            // The goals as they stand on the way in. One destination for the
+            // whole train is still worth carrying: it is what puts coach
+            // numbers beside the half that has them and the right name on the
+            // direction arrow over the drawing.
+            portions: stops[..<index].last { !$0.portions.isEmpty }?.portions ?? [],
+            branches: separation.branches
         )
     }
 
@@ -602,14 +649,18 @@ public struct TrainFormation: Sendable, Equatable {
 public enum FormationShortString {
     /// Every vehicle the string names, in order, fictitious ones included.
     ///
-    /// Nothing is thrown away here: a caller that wants only the real coaches
-    /// filters, and a caller asking which sectors the train fails to reach
-    /// needs the padding to answer. `position` counts real vehicles only, from
+    /// Nothing is thrown away here: a caller that wants this train's coaches
+    /// filters on `isTrainVehicle`; platform context retains the rest.
+    /// `position` counts this train's vehicles only, from
     /// 1, so it is the same number the vehicle-based half of the response uses;
     /// padding is left at 0.
     public static func parse(_ string: String) -> [Coach] {
         var coaches: [Coach] = []
         var position = 0
+        // Membership spans sectors and tokens. Unbracketed legacy strings
+        // describe the whole train; a bracketed string also describes nearby
+        // vehicles belonging to a different working after a split or merge.
+        var inside = !string.contains("[")
 
         // Cut at each sector marker first. A marker is not a vehicle and does
         // not sit tidily between commas — `@D,F,F,F@C,F` puts one at the head of
@@ -617,8 +668,12 @@ public enum FormationShortString {
         // runs are taken out before the commas are looked at.
         for segment in segments(of: string) {
             for piece in segment.body.split(separator: ",", omittingEmptySubsequences: true) {
+                if piece.contains("[") { inside = true }
+                let belongs = inside
+                if piece.contains("]") { inside = false }
                 guard var coach = vehicle(String(piece), position: 0) else { continue }
-                if coach.kind != .fictitious {
+                coach.belongsToTrain = belongs
+                if coach.isTrainVehicle {
                     position += 1
                     coach.position = position
                 }

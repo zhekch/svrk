@@ -14,6 +14,7 @@ final class WatchTransitModel: NSObject {
     private(set) var isRefreshing = false
     private(set) var isLocating = false
     private(set) var isDownloadingFullTimetable = false
+    private(set) var fullTimetableProgress: WatchTimetableDownloadProgress?
     private(set) var lastError: String?
     private(set) var userLocation: WatchCoordinate?
     private(set) var locationAuthorization: CLAuthorizationStatus
@@ -29,6 +30,7 @@ final class WatchTransitModel: NSObject {
     @ObservationIgnored private var pendingLocationRefresh = false
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var fullDownloadTask: Task<Void, Never>?
+    @ObservationIgnored private var downloadProgressTask: Task<Void, Never>?
     @ObservationIgnored private var nationalInfoTask: Task<Void, Never>?
     @ObservationIgnored private var locationTimeoutTask: Task<Void, Never>?
     @ObservationIgnored private var lastViewportRefreshAt = Date.distantPast
@@ -65,13 +67,18 @@ final class WatchTransitModel: NSObject {
         userLocation.map(WatchViewport.near)
     }
 
+    var nearbyStatusText: String {
+        guard hasSnapshot else { return "None" }
+        return isSnapshotStale ? "Needs refresh" : "Up to date"
+    }
+
     var locationStatusText: String {
         if isLocating { return "Locating" }
         switch locationAuthorization {
         case .authorizedAlways, .authorizedWhenInUse:
-            return userLocation == nil ? "Ready" : "One-shot"
+            return userLocation == nil ? "Waiting" : "Found"
         case .notDetermined:
-            return "Not requested"
+            return "Not asked"
         case .denied, .restricted:
             return "Off"
         @unknown default:
@@ -80,9 +87,23 @@ final class WatchTransitModel: NSObject {
     }
 
     var fullTimetableStatus: String {
-        if isDownloadingFullTimetable { return "Downloading…" }
+        if isDownloadingFullTimetable {
+            if let progress = fullTimetableProgress, progress.hasBytes {
+                return "\(Int((progress.fraction * 100).rounded()))%"
+            }
+            return "Starting"
+        }
         guard nationalTimetableInfo != nil else { return "Not downloaded" }
         return "Downloaded"
+    }
+
+    var fullTimetableRemainingText: String? {
+        guard isDownloadingFullTimetable, let progress = fullTimetableProgress else {
+            return nil
+        }
+        if !progress.hasBytes { return "Starting…" }
+        let remaining = progress.remainingBytes.formatted(.byteCount(style: .file))
+        return "\(remaining) left"
     }
 
     var fullTimetableValidity: String? {
@@ -126,10 +147,14 @@ final class WatchTransitModel: NSObject {
         locationTimeoutTask = nil
         locationManager.stopUpdatingLocation()
         isRefreshing = false
-        isDownloadingFullTimetable = false
         isLocating = false
         pendingLocationFocus = false
         pendingLocationRefresh = false
+        // The 124 MB transfer continues in a background URL session. Keep the
+        // last known remaining count so the menu still has something to show
+        // when the wrist comes back up.
+        downloadProgressTask?.cancel()
+        downloadProgressTask = nil
     }
 
     /// Fetches around the currently visible map centre. It never starts a
@@ -157,6 +182,7 @@ final class WatchTransitModel: NSObject {
         lastError = nil
         let target = normalizedRefreshViewport(currentViewport)
         isDownloadingFullTimetable = true
+        startDownloadProgressObservation()
 
         fullDownloadTask?.cancel()
         fullDownloadTask = Task { [weak self] in
@@ -164,18 +190,16 @@ final class WatchTransitModel: NSObject {
             do {
                 try await nationalService.downloadAndInstall()
                 try Task.checkCancellation()
-                guard isForeground else {
-                    isDownloadingFullTimetable = false
-                    return
-                }
                 guard let info = try await nationalService.installedInfo() else {
                     throw WatchNationalArchiveFiles.ArchiveError.notInstalled
                 }
                 nationalTimetableInfo = info
-                let nationalSnapshot = try await nationalService.snapshot(viewport: target)
-                snapshot = Self.validated(snapshot: nationalSnapshot)
-                currentViewport = target
-                persist(snapshot: snapshot)
+                if isForeground {
+                    let nationalSnapshot = try await nationalService.snapshot(viewport: target)
+                    snapshot = Self.validated(snapshot: nationalSnapshot)
+                    currentViewport = target
+                    persist(snapshot: snapshot)
+                }
                 lastError = nil
             } catch is CancellationError {
                 // The partial staged file is discarded by the download service.
@@ -184,6 +208,9 @@ final class WatchTransitModel: NSObject {
             }
             if !Task.isCancelled {
                 isDownloadingFullTimetable = false
+                fullTimetableProgress = nil
+                downloadProgressTask?.cancel()
+                downloadProgressTask = nil
             }
         }
     }
@@ -424,8 +451,24 @@ final class WatchTransitModel: NSObject {
         nationalInfoTask?.cancel()
         nationalInfoTask = Task { [weak self] in
             guard let self else { return }
-            isDownloadingFullTimetable = await nationalService.downloadIsActive()
+            let downloading = await nationalService.downloadIsActive()
+            isDownloadingFullTimetable = downloading
+            if downloading {
+                startDownloadProgressObservation()
+            }
             nationalTimetableInfo = try? await nationalService.installedInfo()
+        }
+    }
+
+    private func startDownloadProgressObservation() {
+        guard downloadProgressTask == nil else { return }
+        downloadProgressTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let snapshot = await WatchTimetableDownloadCoordinator.shared.progressSnapshot()
+                guard !Task.isCancelled else { return }
+                self?.fullTimetableProgress = snapshot
+                try? await Task.sleep(for: .milliseconds(250))
+            }
         }
     }
 

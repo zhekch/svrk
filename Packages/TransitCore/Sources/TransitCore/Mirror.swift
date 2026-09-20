@@ -92,6 +92,10 @@ enum MirrorBoard {
     /// exists, which is how the mirror expresses a late train that has not been
     /// individually re-timed.
     private static func time(_ stop: [String: Any], _ which: String) -> Timestamp? {
+        // The mirror puts the query clock in the prognosis of an event that
+        // does not exist (notably an origin's arrival). Never turn that into a
+        // stop time and then push every departure forward to it.
+        guard let scheduled = stop["\(which)Timestamp"] as? Double else { return nil }
         if let prognosis = stop["prognosis"] as? [String: Any],
            let text = prognosis[which] as? String {
             let formatter = ISO8601DateFormatter()
@@ -100,9 +104,18 @@ enum MirrorBoard {
                 return Timestamp(parsed.timeIntervalSince1970)
             }
         }
-        guard let scheduled = stop["\(which)Timestamp"] as? Double else { return nil }
         let delay = (stop["delay"] as? Double).map { $0 * 60 } ?? 0
         return Timestamp(scheduled + delay)
+    }
+
+    private static func delay(_ stop: [String: Any]) -> Int? {
+        if let prognosis = stop["prognosis"] as? [String: Any],
+           prognosis["departure"] as? String != nil,
+           let planned = stop["departureTimestamp"] as? Double,
+           let live = time(stop, "departure") {
+            return SiriParser.reportableDelay(live - Timestamp(planned))
+        }
+        return (stop["delay"] as? Double).map { Int($0) }
     }
 
     private static func journey(from entry: [String: Any], station: [String: Any]?) -> Journey? {
@@ -124,6 +137,7 @@ enum MirrorBoard {
             let coordinate = where_?["coordinate"] as? [String: Any]
             var lat = coordinate?["x"] as? Double
             var lon = coordinate?["y"] as? Double
+            var ref = where_?["id"] as? String
             // The first passList entry repeats the board's own station but often
             // carries a platform-level id with null coordinates.
             if lat == nil || lon == nil, i == 0, let station {
@@ -131,6 +145,9 @@ enum MirrorBoard {
                 lat = own?["x"] as? Double
                 lon = own?["y"] as? Double
                 name = name ?? station["name"] as? String
+                // This placeholder sometimes carries the destination's ID.
+                // Its stop is the queried board, just like its name/coordinate.
+                ref = station["id"] as? String
             }
             guard let lat, let lon else { continue }
 
@@ -141,7 +158,7 @@ enum MirrorBoard {
             let platform = (p["platform"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             stops.append(Call(
                 key: "\(name ?? "—")|\(i)",
-                ref: nil,
+                ref: ref.map { StopRegister.sloid(forDidok: $0) ?? $0 },
                 name: name ?? "—",
                 lat: lat, lon: lon,
                 platform: platform,
@@ -150,13 +167,30 @@ enum MirrorBoard {
                 // both so the interpolator never has to special-case the ends.
                 arr: arrival ?? departure!,
                 dep: departure ?? arrival!,
-                delay: (p["delay"] as? Double).map { Int($0) },
+                delay: delay(p),
                 observed: false,
                 sched: (p["departureTimestamp"] as? Double).map { Timestamp($0) }
-                    ?? (p["arrivalTimestamp"] as? Double).map { Timestamp($0) }
+                    ?? (p["arrivalTimestamp"] as? Double).map { Timestamp($0) },
+                scheduledArrival: (p["arrivalTimestamp"] as? Double).map { Timestamp($0) }
+                    ?? (p["departureTimestamp"] as? Double).map { Timestamp($0) }
             ))
         }
         guard stops.count >= 2 else { return nil }
+
+        // HAFAS can append the next working's return leg to passList (boats,
+        // buses and turnback trains). This entry names only the outward course.
+        // End it at its advertised destination instead of assigning the return
+        // calls to that course as well. A circular service advertised back to
+        // its origin still keeps its complete loop.
+        if let destination = entry["to"] as? String,
+           !Fleet.sameBoardDestination(destination, stops[0].name),
+           let end = stops.indices.dropFirst().first(where: {
+               Fleet.sameBoardDestination(destination, stops[$0].name)
+           }), end < stops.count - 1 {
+            stops = Array(stops[...end])
+            stops[end].dep = stops[end].arr
+            stops[end].sched = stops[end].scheduledArrival ?? stops[end].arr
+        }
 
         // Times must be non-decreasing or the interpolation can run backwards.
         for i in 1..<stops.count {
@@ -166,9 +200,11 @@ enum MirrorBoard {
 
         let category = entry["category"] as? String
         let number = entry["number"] as? String
-        let line = category == number
+        let mode = Categories.mode(of: category)
+        let glued = category == number
             ? (category ?? "?")
             : "\((category ?? ""))\((number ?? ""))"
+        let line = Journey.publishedLine(glued, mode: mode)
         let operatorName = entry["operator"] as? String
         let to = entry["to"] as? String
 
@@ -182,10 +218,10 @@ enum MirrorBoard {
 
         return Journey(
             id: id,
-            mode: Categories.mode(of: category),
+            mode: mode,
             category: category,
-            line: line.trimmingCharacters(in: .whitespaces).isEmpty ? (trip ?? "?") : line,
-            number: number,
+            line: line.isEmpty ? (trip ?? "?") : line,
+            number: trip.flatMap { $0.allSatisfy(\.isNumber) ? $0 : nil },
             operatorName: operatorName,
             operatorFull: nil,
             to: to,

@@ -99,7 +99,17 @@ public enum LayoutLibrary {
         // TRAVYS runs unpainted-looking silver-white stock with the red
         // wordmark and nothing else on it.
         "TRAVYS": Livery(body: "#e4e7ea", roof: "#9aa1ab", trim: "#d81e30", glass: "#2b3440", stroke: "#5b6169"),
-        "RA": Livery(body: "#e2001a", roof: "#9aa1ab", trim: "#ffffff", glass: "#2b3440", stroke: "#7a000e"),
+        // RegionAlps Domino: white body, red doors, red front, red roof band —
+        // the SBB regional scheme, not a red train. Painting it from a red
+        // tin made every Valais local a solid red worm.
+        "RA": Livery(
+            body: "#f2f3f5", roof: "#8e959d", trim: "#e2001a",
+            glass: "#2b3440", stroke: "#4a5058", belt: "#e2001a", ends: "#e2001a"
+        ),
+        "REGIONALPS": Livery(
+            body: "#f2f3f5", roof: "#8e959d", trim: "#e2001a",
+            glass: "#2b3440", stroke: "#4a5058", belt: "#e2001a", ends: "#e2001a"
+        ),
 
         // The road. PostAuto's yellow is the single most recognisable livery in
         // the country and the one most worth getting onto the map.
@@ -173,9 +183,8 @@ public enum LayoutLibrary {
         // The regional companies whose colours were missing rather than wrong.
         // Zug: white under a blue band, on a fleet that is nearly all bus.
         "ZVB": Livery(body: "#f2f4f7", roof: "#a2a7ad", trim: "#0a4f9c", glass: "#22303f", stroke: "#0a3466", belt: "#0a4f9c"),
-        // Regionalverkehr Bern-Solothurn: red with a silver band, which is
-        // near enough Bernmobil's colours to be confusing on the ground and
-        // exactly right on the map.
+        // RBS road vehicles retain their separate operator palette; rail
+        // stock uses the orange livery below.
         "RBS": Livery(body: "#d8232a", roof: "#a2a7ad", trim: "#ffffff", glass: "#2b3440", stroke: "#7a000e", belt: "#e8eaec"),
 
         // Foreign operators reaching into Switzerland, so an ICE through Basel
@@ -264,6 +273,14 @@ public enum LayoutLibrary {
         return hash
     }
 
+    /// RBS rail stock: orange bodies and driving ends, a pale band and grey
+    /// roofs. Shared by library layouts and learned formations.
+    static let rbsTrain = Livery(
+        body: "#f58220", roof: "#a2a7ad", trim: "#ffffff",
+        glass: "#2b3440", stroke: "#8a430d", powered: "#f58220",
+        belt: "#e8eaec", ends: "#f58220"
+    )
+
     /// The paint for one vehicle: the operator's where it is known, the mode's
     /// otherwise.
     ///
@@ -281,6 +298,7 @@ public enum LayoutLibrary {
         // repainted every boat somebody actually tapped on.
         if mode == .boat { return boatLivery(operatorName: operatorName) }
         if let code = operatorName?.uppercased() {
+            if code == "RBS", mode == .train { return rbsTrain }
             if let set = variants[code], set.modes.contains(mode), !set.liveries.isEmpty {
                 let count = set.liveries.count
                 return set.liveries[((variant % count) + count) % count]
@@ -350,8 +368,21 @@ public enum LayoutLibrary {
         )
     }
 
+    /// Zürich S-Bahn DPZ and DTZ: cobalt body, white deck stripe, red cab.
+    ///
+    /// RAL 5013 on the NPZ/DPZ, with the white band between the decks and the
+    /// red front that both the Re 450 and the driving trailer wear. SBB's own
+    /// tin is the long-distance silver-and-red, which is what these were
+    /// painted until the class names were allowed to say otherwise.
+    static let zurichSBahn = Livery(
+        body: "#0F4C81", roof: "#5c5e58", trim: "#e2001a",
+        glass: "#1a2838", stroke: "#0a2a4a",
+        powered: "#0F4C81", belt: "#f4f6f8", ends: "#e2001a"
+    )
+
     static func stockLivery(
         mode: Mode, line: String?, operatorName: String?, category: String? = nil,
+        units: [VehicleUnit] = [], name: String? = nil,
         base: Livery
     ) -> Livery {
         // The Rigi's Vitznau line, for the same reason and a stronger one: the
@@ -378,6 +409,13 @@ public enum LayoutLibrary {
                 glass: "#2b3440", stroke: "#6f6a58",
                 belt: "#3b4046", ends: "#63644d"
             )
+        }
+        if units.contains(where: { $0.type.map { WagonCatalogue.isZurichSBahnBlue($0.raw) } ?? false })
+            || (name?.contains("DTZ") ?? false)
+            || (name?.contains("RABe 514") ?? false)
+            || (name?.contains("Re 450") ?? false)
+        {
+            return zurichSBahn
         }
         guard operatorName?.uppercased() == "TL", mode == .metro else { return base }
         return Livery(
@@ -1392,20 +1430,24 @@ public enum LayoutLibrary {
         mode: Mode, category: String?, line: String?, operatorName: String?,
         modeColour: String, cable: CableKind? = nil, variant: Int = 0
     ) -> VehicleLayout {
-        let paint = stockLivery(
-            mode: mode, line: line, operatorName: operatorName, category: category,
-            base: livery(
-                operatorName: operatorName, mode: mode,
-                modeColour: modeColour, variant: variant
-            )
+        let base = livery(
+            operatorName: operatorName, mode: mode,
+            modeColour: modeColour, variant: variant
         )
+        func finish(_ units: [VehicleUnit], _ name: String) -> VehicleLayout {
+            let paint = stockLivery(
+                mode: mode, line: line, operatorName: operatorName, category: category,
+                units: units, name: name, base: base
+            )
+            return VehicleLayout(units: units, livery: paint, name: name).resolvingStripes()
+        }
 
         guard mode == .train else {
             let (units, name) = road(
                 mode: mode, operatorName: operatorName, line: line, category: category,
                 cable: cable, variant: variant
             )
-            return VehicleLayout(units: units, livery: paint, name: name).resolvingStripes()
+            return finish(units, name)
         }
 
         let lineKey = normalise(line)
@@ -1425,12 +1467,9 @@ public enum LayoutLibrary {
             ?? "FLIRT"
 
         guard let (units, name) = named(className) else {
-            return VehicleLayout(
-                units: Stock.multipleUnit(cars: 4, carLength: 18.6),
-                livery: paint, name: "Train"
-            ).resolvingStripes()
+            return finish(Stock.multipleUnit(cars: 4, carLength: 18.6), "Train")
         }
-        return VehicleLayout(units: units, livery: paint, name: name).resolvingStripes()
+        return finish(units, name)
     }
 
     /// `IC 1` and `ic1` are the same line; `S 12` and `S12` are the same line.

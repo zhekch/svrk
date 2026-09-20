@@ -185,8 +185,8 @@ struct WatchTransitMap: View {
             ForEach(railLines) { line in
                 MapPolyline(coordinates: line.coordinates.map(\.mapCoordinate))
                     .stroke(
-                        line.style.color.opacity(0.72),
-                        lineWidth: line.isDetailed ? 1.35 : 1
+                        line.style.color.opacity(0.86),
+                        style: line.strokeStyle
                     )
             }
 
@@ -762,7 +762,7 @@ private struct WatchMapStopTarget: Identifiable {
 
 extension WatchTransitVehicle {
     var accessibilityName: String {
-        let service = line.isEmpty ? mode.capitalized : line
+        let service = line.isEmpty ? "ext" : line
         if let destination, !destination.isEmpty {
             return "\(service) to \(destination)"
         }

@@ -1,5 +1,6 @@
 import Foundation
 import MapboxMaps
+import TransitCore
 import UIKit
 
 // The ground, the sky, and the buildings — the three things that turn a map you
@@ -23,7 +24,6 @@ import UIKit
 enum Terrain3D {
     /// Mapbox's global elevation tiles.
     static let demSource = "transit-dem"
-    static let sky = "transit-sky"
     static let buildings = "transit-buildings"
 
     /// The vector source and layer the ordinary Mapbox styles keep their
@@ -52,10 +52,11 @@ enum Terrain3D {
         guard !style.sourceExists(withId: demSource) else { return }
         var dem = RasterDemSource(id: demSource)
         dem.url = "mapbox://mapbox.mapbox-terrain-dem-v1"
-        // 514 rather than 512: the DEM tiles carry a one-pixel border on every
-        // side so neighbouring tiles can be interpolated across their shared
-        // edge without a seam. Set to 512 the terrain comes out quilted.
-        dem.tileSize = 514
+        // Keep terrain tile selection on the SDK's default 512-pixel size.
+        dem.tileSize = 512
+        // Request the visible elevation level directly when terrain is enabled,
+        // rather than first loading a coarse parent four zoom levels away.
+        dem.prefetchZoomDelta = 0
         // Above 14 there is no more elevation data, and asking for it produces
         // over-scaled parent tiles at full price.
         dem.maxzoom = 14
@@ -82,63 +83,71 @@ enum Terrain3D {
         }
     }
 
-    // MARK: - Sky
-
-    /// The sky over the horizon, once there is a horizon to put it over.
-    ///
-    /// A tilted map has one and a flat map does not, which is why this only
-    /// appears with the pitch. Without it, tilting past about fifty degrees
-    /// shows the basemap running out into the background colour along a hard
-    /// straight line — the single thing that most makes a tilted map look like
-    /// a texture on a table rather than a view of a country.
-    static func installSky(_ style: MapboxMap, dark: Bool) throws {
-        guard !style.layerExists(withId: sky) else { return }
-        var layer = SkyLayer(id: sky)
-        layer.skyType = .constant(.atmosphere)
-        // Low in the sky and slightly to the north-east, which is roughly where
-        // the sun is over Switzerland on a summer morning. It is not tracked
-        // against the clock: a sun that moves while somebody watches a train is
-        // a distraction, and one fixed direction means the shading on the
-        // mountains is the same every time the app is opened, which is what
-        // makes a familiar valley recognisable.
-        layer.skyAtmosphereSun = .constant([50, 82])
-        layer.skyAtmosphereSunIntensity = .constant(dark ? 4 : 12)
-        layer.skyAtmosphereColor = .constant(StyleColor(
-            dark ? UIColor(red: 0.10, green: 0.13, blue: 0.20, alpha: 1)
-                 : UIColor(red: 0.52, green: 0.68, blue: 0.86, alpha: 1)
-        ))
-        layer.skyAtmosphereHaloColor = .constant(StyleColor(
-            dark ? UIColor(red: 0.22, green: 0.26, blue: 0.36, alpha: 1)
-                 : UIColor(red: 0.85, green: 0.90, blue: 0.97, alpha: 1)
-        ))
-        try style.addLayer(layer)
-    }
-
-    /// How far the ground fades into the sky at the horizon.
-    ///
-    /// The sky layer paints above the horizon; this is what stops the ground
-    /// meeting it at a razor edge. Set on the style rather than on a layer
-    /// because it is a property of the atmosphere the whole scene is in.
-    static func applyAtmosphere(_ style: MapboxMap, dark: Bool) {
-        var air = Atmosphere()
-        air.horizonBlend = .constant(0.035)
-        air.color = .constant(StyleColor(
-            dark ? UIColor(red: 0.12, green: 0.15, blue: 0.21, alpha: 1)
-                 : UIColor(red: 0.72, green: 0.80, blue: 0.90, alpha: 1)
-        ))
-        air.highColor = .constant(StyleColor(
-            dark ? UIColor(red: 0.06, green: 0.09, blue: 0.16, alpha: 1)
-                 : UIColor(red: 0.36, green: 0.55, blue: 0.82, alpha: 1)
-        ))
-        air.spaceColor = .constant(StyleColor(
-            dark ? UIColor(red: 0.02, green: 0.03, blue: 0.06, alpha: 1)
-                 : UIColor(red: 0.60, green: 0.73, blue: 0.89, alpha: 1)
-        ))
-        air.starIntensity = .constant(dark ? 0.12 : 0)
-        do { try style.setAtmosphere(air) } catch {
-            Diagnostics.note("atmosphere unavailable: \(error)")
+    /// Keep distant terrain clear. Reapply after style loads and scene changes
+    /// because a basemap may supply its own atmosphere.
+    static func removeAtmosphere(_ style: MapboxMap) {
+        do {
+            try style.removeAtmosphere()
+            for layer in style.allLayerIdentifiers where layer.type == .sky {
+                try style.removeLayer(withId: layer.id)
+            }
+        } catch {
+            Diagnostics.note("could not remove atmosphere: \(error)")
         }
     }
+
+    /// Fog as a far clip, not as scenery.
+    ///
+    /// A 60° camera sees the horizon. Mapbox Standard then draws every building
+    /// and tree in that frustum. Fully opaque fog at a short range hides that
+    /// work *and* — per the style spec — stops those tiles being loaded.
+    /// Opacity below 100% does the opposite, so the fade is in range, not in
+    /// alpha. Flat cameras skip this: a plan view has no horizon to lid.
+    static func applyHorizon(
+        _ style: MapboxMap, pitch: Double, zoom: Double, dark: Bool
+    ) {
+        guard pitch >= Geo.tiltLookAheadPitch, zoom >= 12 else {
+            removeAtmosphere(style)
+            return
+        }
+        let t = min(1, max(0, (pitch - Geo.tiltLookAheadPitch) / 54))
+        var fog = Atmosphere()
+        fog.range = .constant([2.2 - t * 2.0, 8.0 - t * 6.6])
+        fog.rangeTransition = StyleTransition(duration: 0.3, delay: 0)
+        fog.horizonBlend = .constant(0.12 + t * 0.2)
+        fog.starIntensity = .constant(0)
+        if dark {
+            fog.color = .constant(StyleColor(UIColor(
+                red: 0.07, green: 0.09, blue: 0.14, alpha: 1
+            )))
+            fog.highColor = .constant(StyleColor(UIColor(
+                red: 0.05, green: 0.08, blue: 0.16, alpha: 1
+            )))
+            fog.spaceColor = .constant(StyleColor(UIColor(
+                red: 0.02, green: 0.03, blue: 0.06, alpha: 1
+            )))
+        } else {
+            fog.color = .constant(StyleColor(UIColor(
+                red: 0.78, green: 0.84, blue: 0.90, alpha: 1
+            )))
+            fog.highColor = .constant(StyleColor(UIColor(
+                red: 0.62, green: 0.74, blue: 0.88, alpha: 1
+            )))
+            fog.spaceColor = .constant(StyleColor(UIColor(
+                red: 0.45, green: 0.62, blue: 0.82, alpha: 1
+            )))
+        }
+        do {
+            try style.setAtmosphere(fog)
+        } catch {
+            Diagnostics.note("horizon fog refused: \(error)")
+        }
+    }
+
+    /// 3D trees fill a steep frustum to the horizon. Buildings next to the
+    /// train stay; trees and far landmarks do not.
+    static let treePitchLimit = 12.0
+    static let landmarkMinZoom = 15.2
 
     // MARK: - Buildings
 
@@ -231,46 +240,88 @@ enum Terrain3D {
     /// hard-coded name that stops matching fails silently — the config is
     /// simply ignored and the map looks subtly wrong with nothing in the log.
     static func applyStandardConfig(
-        _ style: MapboxMap, preset: LightPreset, buildings: Bool
+        _ style: MapboxMap, preset: LightPreset, buildings: Bool,
+        trees: Bool, landmarks: Bool
     ) {
         guard let importId = style.styleImports.first?.id else { return }
         do {
             try style.setStyleImportConfigProperties(for: importId, configs: [
-                "lightPreset": preset.rawValue,
+                "lightPreset": preset.mapboxValue,
                 // Standard owns these inside its import, so this is also the
                 // only route by which the app's 3D-buildings setting can avoid
                 // their geometry and depth passes.
                 "show3dObjects": buildings,
+                "show3dBuildings": buildings,
                 // The basemap's own transit labels, over an app whose entire
                 // subject is transit. Two sets of station names at two sizes in
                 // two fonts, and neither of them the one that can be tapped.
                 "showTransitLabels": false,
                 "showPointOfInterestLabels": false,
             ])
+            // Separate from the rest: an older Standard import that does not
+            // know these names must not take the lighting config down with it.
+            try? style.setStyleImportConfigProperty(
+                for: importId, config: "show3dTrees", value: trees
+            )
+            try? style.setStyleImportConfigProperty(
+                for: importId, config: "show3dLandmarks", value: landmarks
+            )
+            try? style.setStyleImportConfigProperty(
+                for: importId, config: "aerialways", value: false
+            )
         } catch {
             Diagnostics.note("standard config rejected: \(error)")
         }
     }
 
-    /// What time of day the Standard basemap is lit for.
-    ///
-    /// Mapbox's own four, exposed because the choice is not cosmetic on a map
-    /// with terrain: `dusk` rakes the light across the Alps and every valley
-    /// gets a shadow, `day` flattens them, and `night` is the only one that
-    /// belongs under this app's dark chrome.
+    /// User-facing lighting choice. Resolve Auto before passing it to Mapbox;
+    /// it follows the real sun at the map, not the timetable's simulated time.
     enum LightPreset: String, CaseIterable, Identifiable {
-        case dawn, day, dusk, night
+        case day, dawn, dusk, night, auto
         var id: String { rawValue }
         var label: String { rawValue.capitalized }
 
-        /// Whether the ground under our layers comes out dark.
-        ///
-        /// What every halo, casing and overlay palette this app installs is
-        /// chosen from — see `MapCoordinator.isDarkTheme`. Dusk counts: the
-        /// preset that rakes the light across the Alps also puts most of the
-        /// country in shadow, and white labels with a dark halo are what reads
-        /// over it.
-        var isDark: Bool { self == .night || self == .dusk }
+        /// What the lighting control shows. Dawn and dusk are Mapbox presets
+        /// Auto picks; they are not extra segments on a three-choice dial.
+        static var controlCases: [LightPreset] { [.day, .night, .auto] }
+
+        var symbol: String {
+            switch self {
+            case .day: return "sun.max.fill"
+            case .dawn: return "sunrise.fill"
+            case .dusk: return "sunset.fill"
+            case .night: return "moon.fill"
+            case .auto: return "clock.arrow.circlepath"
+            }
+        }
+
+        /// Mapbox Standard's `lightPreset` values. Auto is resolved first.
+        var mapboxValue: String {
+            switch self {
+            case .auto: return LightPreset.day.rawValue
+            default: return rawValue
+            }
+        }
+
+        func resolved(
+            at date: Date, latitude: Double, longitude: Double
+        ) -> Self {
+            guard self == .auto else { return self }
+            let sun = Geo.sunPosition(at: date, latitude: latitude, longitude: longitude)
+            // Civil twilight is about −6°. A few degrees of clear sky above
+            // the horizon is already daytime lighting; between the two, the
+            // sun is low enough for Mapbox's dawn and dusk.
+            if sun.elevation >= 8 { return .day }
+            if sun.elevation >= -6 { return sun.hourAngle < 0 ? .dawn : .dusk }
+            return .night
+        }
+
+        var isDark: Bool {
+            switch self {
+            case .night, .dusk: return true
+            case .day, .dawn, .auto: return false
+            }
+        }
     }
 }
 
@@ -305,30 +356,29 @@ enum Terrain3D {
 /// layer somebody adds.
 extension Terrain3D {
     /// The prefixes of the layers that are painted flat on the ground, and so
-    /// have to go behind anything standing on it.
-    private static let groundPrefixes = ["orm-", "transit-tracks", "transit-route"]
-
-    /// And the ones whose names do not say so.
-    ///
-    /// The flat drawing of a vehicle is painted on the ground exactly as the
-    /// rails under it are, and belongs behind the buildings for the same
-    /// reason: a train on the far side of a block is not on its roof. What
-    /// keeps it visible anyway is a second copy of the same drawing left up at
-    /// `top` at half strength — see `VehicleShapes.ghostOpacity` — so what a
-    /// reader sees through a building is a ghost of the vehicle rather than
-    /// nothing, and what they see in the open is the drawing itself.
-    ///
-    /// The casing comes down with it because it is the shadow *under* the body:
-    /// left above the fill it would be painted over the vehicle it belongs to.
-    private static let groundLayers: Set<String> = [
-        VehicleShapes.casing, VehicleShapes.fill,
-        VehicleShapes.followCasing, VehicleShapes.followFill,
+    /// have to go behind anything standing on it. The selected route belongs
+    /// here with the rails: it is a marking on the ground, and a path, a
+    /// travelled dot or an arrow across a roof is the same decal the tracks
+    /// used to be. Station dots — rail and bus alike — and the unlabelled
+    /// kerb poles are the same kind of mark; their names and platform plates
+    /// stay at `top` so they remain readable as controls.
+    private static let groundPrefixes = [
+        "orm-", "transit-tracks", "transit-route",
+        "transit-stops-rail", "transit-stops-local", "transit-stops-selected",
+        "transit-platforms-pole",
     ]
 
     static func placeOverlay(_ style: MapboxMap, ownLayers: Set<String>) {
         for layer in style.allLayerIdentifiers where ownLayers.contains(layer.id) {
-            let ground = groundLayers.contains(layer.id)
-                || groundPrefixes.contains { layer.id.hasPrefix($0) }
+            // Vehicle bodies used to join this set, behind the buildings, with
+            // a ghost copy at `top` so a train the far side of a block was
+            // still visible. Street names also sit above `middle`, so the
+            // train went under every "Spiezstrasse" it crossed — the worse of
+            // the two overlaps. Bodies now share `top` with the vehicle dots
+            // and the models; the rails, the route and the station dots stay
+            // in `middle`, because a mark across a roof is still a decal and
+            // none of them needs to be read through a label.
+            let ground = groundPrefixes.contains { layer.id.hasPrefix($0) }
             try? style.setLayerProperty(
                 for: layer.id, property: "slot",
                 // `Slot.middle` and `Slot.top` are declared through a failable

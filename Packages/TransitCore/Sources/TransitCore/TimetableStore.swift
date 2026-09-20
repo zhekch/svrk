@@ -1,8 +1,19 @@
 import Foundation
+import os
 
 /// A dominant scheduled headway for one advertised service at one station.
 /// It is derived from packed integers without expanding the day's journeys.
 public struct TimetableCadence: Sendable, Equatable {
+    public static func intervalDescription(_ minutes: Int, prefix: String = "every") -> String {
+        guard minutes >= 60 else { return "\(prefix) \(minutes) min" }
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        if remainder == 0 {
+            return hours == 1 ? "\(prefix) hour" : "\(prefix) \(hours) hours"
+        }
+        return "\(prefix) \(hours) hr \(remainder) min"
+    }
+
     public var mode: Mode
     public var line: String
     /// The first different station after the board stop. This stays stable when
@@ -45,7 +56,10 @@ public struct TimetableCadence: Sendable, Equatable {
 ///   register exactly as it does for a SIRI call.
 public final class TimetableStore: @unchecked Sendable {
     static let magic = "SVTIMTB1"
-    static let version: UInt32 = 3
+    /// Format 4 carries the through-service graph. Earlier formats are not
+    /// read: the graph is not an optional extra any more, it is how chaining
+    /// works, and an archive without it would quietly fall back to guessing.
+    static let version: UInt32 = 4
 
     /// One trip: pattern, service, start minute, class, id prefix, number, id
     /// suffix. Deliberately not a multiple of four — at two million trips the
@@ -59,7 +73,16 @@ public final class TimetableStore: @unchecked Sendable {
     private let file: MappedFile
     private let bytes: UnsafeRawBufferPointer
 
-    private let strings: [String]
+    /// The packed string blob, decoded on first use rather than at open.
+    ///
+    /// The table holds 353,733 entries. Materialising every one as a `String`
+    /// was most of "Reading the transit network" on a phone — a launch that
+    /// then drew one canton had paid for the names of every stop in the
+    /// country. The blob stays mapped; a viewport interned a few thousand.
+    private let stringCount: Int
+    private let stringOffsetsAt: Int
+    private let stringBlobAt: Int
+    private var interned: [String?] = []
 
     /// Days since 1970 of the feed's first service day; the calendar bitmaps
     /// are indexed from here.
@@ -80,12 +103,18 @@ public final class TimetableStore: @unchecked Sendable {
     private let tripKeysAt: Int
     private let literalsAt: Int
     private let keyPairCount: Int
+    private let routesAt: Int
+    private let routeCount: Int
+    /// The through-service graph: which numbered workings are one vehicle.
+    private let linksAt: Int
+    private let linkCount: Int
 
     /// `route_id` to the line it is published as, and the mode it runs in.
     ///
     /// Kept because GTFS-Realtime names an *added* run — one in no timetable —
     /// by its route and nothing else. Small enough (5,121 routes) to hold as a
-    /// dictionary rather than searched in place.
+    /// dictionary rather than searched in place, and filled on first ask
+    /// because a launch that never sees an extra run never asks.
     private var routeLines: [String: (line: String?, mode: Mode)] = [:]
 
     public private(set) var patternCount = 0
@@ -97,20 +126,34 @@ public final class TimetableStore: @unchecked Sendable {
     /// Each pattern's last departure offset, so a window query can reject a trip
     /// that finished before the window opened without reading its calls.
     ///
-    /// Built at load by touching the last call of every pattern — 179,287 reads
-    /// into a mapped file, a few milliseconds — because the alternative is
-    /// scanning every trip from the start of the service day.
-    private var patternDuration: [UInt16] = []
-    private var longestPattern = 0
+    /// Filled per pattern on first use. Opening used to walk every pattern's
+    /// last call — 179,287 jumps into the mapped file — before anything had
+    /// been asked for. A viewport only needs the patterns in its window.
+    private var patternDuration: [Int32] = []
 
-    /// Start minute of every trip, in file order, which is sorted.
+    /// Bound used to open a window query. Larger than any real run in this
+    /// feed (a night service filed at 25:40 is still well under a day), so a
+    /// query that has not yet seen every pattern still includes trips that
+    /// started before the window and have not finished.
     ///
-    /// Copied out rather than read through the mapping: the window query
-    /// binary-searches it on every refresh, and two million unaligned loads to
-    /// find a bound is the one place a copy pays for itself.
-    private var tripStart: [UInt16] = []
+    /// Forty-eight hours used to be the floor, which for a day-relative start
+    /// minute is "scan from midnight". After durations are known this tightens
+    /// to the longest pattern plus a little slack.
+    private var lookbackMinutes = 16 * 60
+
+    /// Sentinel: this pattern's duration has not been read yet.
+    private static let unknownDuration: Int32 = -1
 
     public var isReady: Bool { tripCount > 0 }
+
+    /// Slot coordinates, pattern boxes and durations are filled, either from
+    /// a cache written by an earlier launch or from one sequential pass.
+    public private(set) var geographyReady = false
+
+    /// Where the derived geography is kept between launches, if anywhere.
+    private var geographyURL: URL?
+
+    private static let log = Logger(subsystem: "com.kexts.swisstransit", category: "timetable")
 
     public init(url: URL) throws {
         file = try MappedFile(url: url)
@@ -118,7 +161,13 @@ public final class TimetableStore: @unchecked Sendable {
 
         var reader = BinaryReader(file)
         try reader.expect(magic: Self.magic, version: Self.version)
-        strings = try reader.readStringTable()
+        // Mapped, not decoded. See `interned`.
+        stringCount = Int(try reader.readUInt32())
+        stringOffsetsAt = try reader.skip((stringCount + 1) * 4)
+        let blobLength = Int(
+            bytes.loadUnaligned(fromByteOffset: stringOffsetsAt + stringCount * 4, as: UInt32.self)
+        )
+        stringBlobAt = try reader.skip(blobLength)
         try reader.align(to: 4)
 
         feedStart = Int(try reader.readUInt32())
@@ -156,8 +205,8 @@ public final class TimetableStore: @unchecked Sendable {
         // one is `<prefix>.<number>.<season>` over 5,120 distinct prefix/season
         // pairs with the number below 65,536 — so an id is two `UInt16`s, four
         // bytes, and it comes back byte for byte. Whole they would be 55.6 MB.
-        let routeCount = Int(try reader.readUInt32())
-        let routesAt = try reader.skip(routeCount * 12)
+        routeCount = Int(try reader.readUInt32())
+        routesAt = try reader.skip(routeCount * 12)
         try reader.align(to: 4)
 
         keyPairCount = Int(try reader.readUInt32())
@@ -167,8 +216,156 @@ public final class TimetableStore: @unchecked Sendable {
         let literalBytes = Int(try reader.readUInt32())
         literalsAt = try reader.skip(literalBytes)
 
-        buildIndexes()
+        // Through-services: twelve bytes a link, being the two trip rows and
+        // the calendar the link runs on.
+        try reader.align(to: 4)
+        linkCount = Int(try reader.readUInt32())
+        linksAt = try reader.skip(linkCount * 12)
+    }
 
+    // MARK: - Derived geography
+
+    private static let geoMagic = "SVTGEO01"
+    private static let geoVersion: UInt32 = 1
+
+    /// Remember where a later launch should look for slot coordinates and
+    /// pattern boxes, and load them if they still match this file.
+    public func openGeographyCache(at url: URL) {
+        geographyURL = url
+        _ = loadGeographyCache()
+    }
+
+    /// Make a clipped window query cheap: every pattern box is an integer
+    /// compare instead of a stop-register walk through cold mapped pages.
+    ///
+    /// A launch used to derive boxes in trip order while scanning the window.
+    /// That is random access through 119 MB, and on a phone whose page cache
+    /// had been emptied overnight it was the minute the curtain sat still.
+    /// One sequential pass — or the cache that pass writes — is the same
+    /// answer, in order, once.
+    public func prepareQuery(place: (String) -> Place?) {
+        if geographyReady { return }
+        if loadGeographyCache() {
+            Self.log.notice("geography: cache hit")
+            return
+        }
+        // A cache miss must not walk every pattern before the first viewport
+        // is drawn. On an iPhone Debug build that sequential fill was 28 s
+        // of the curtain; the window query only needs the boxes it rejects
+        // against. The rest is filled after the map is up.
+        prepareGeography()
+    }
+
+    /// Walk every pattern once and persist the boxes, so the next launch is
+    /// a cache hit rather than a stop-register walk.
+    public func completeGeography(place: (String) -> Place?) {
+        if geographyReady { return }
+        if loadGeographyCache() { return }
+        let started = Date()
+        fillGeography(place: place)
+        geographyReady = true
+        updateLookback()
+        saveGeographyCache()
+        Self.log.notice("geography: sequential fill \(Date().timeIntervalSince(started) * 1000, format: .fixed(precision: 0))ms")
+    }
+
+    private func fillGeography(place: (String) -> Place?) {
+        file.adviseSequential()
+        prepareGeography()
+        if patternDuration.count != patternCount {
+            patternDuration = [Int32](repeating: Self.unknownDuration, count: patternCount)
+        }
+        for slot in 0..<stopCount {
+            _ = slotCoord(slot, place: place)
+        }
+        for pattern in 0..<patternCount {
+            let indexAt = patternIndexAt + pattern * 8
+            let offset = Int(bytes.loadUnaligned(fromByteOffset: indexAt, as: UInt32.self))
+            let count = Int(bytes.loadUnaligned(fromByteOffset: indexAt + 4, as: UInt32.self))
+            if count > 0 {
+                let last = patternCallsAt + offset + (count - 1) * Self.callStride
+                patternDuration[pattern] = Int32(
+                    bytes.loadUnaligned(fromByteOffset: last + 6, as: UInt16.self)
+                )
+            } else {
+                patternDuration[pattern] = 0
+            }
+            _ = patternBox(pattern, place: place)
+        }
+        file.adviseNormal()
+    }
+
+    private func updateLookback() {
+        var longest = 0
+        for duration in patternDuration where duration >= 0 {
+            longest = max(longest, Int(duration))
+        }
+        if longest > 0 {
+            lookbackMinutes = min(16 * 60, longest + 15)
+        }
+    }
+
+    private func loadGeographyCache() -> Bool {
+        guard let url = geographyURL else { return false }
+        guard let mapped = try? MappedFile(url: url) else { return false }
+        var reader = BinaryReader(mapped)
+        guard (try? reader.expect(magic: Self.geoMagic, version: Self.geoVersion)) != nil,
+              let trips = try? reader.readUInt32(), trips == UInt32(tripCount),
+              let patterns = try? reader.readUInt32(), patterns == UInt32(patternCount),
+              let stops = try? reader.readUInt32(), stops == UInt32(stopCount),
+              let length = try? reader.readInt64(), length == Int64(bytes.count),
+              let start = try? reader.readUInt32(), start == UInt32(feedStart)
+        else { return false }
+        guard
+            let durations = try? reader.readArray(Int32.self, count: patternCount),
+            let lons = try? reader.readArray(Int32.self, count: stopCount),
+            let lats = try? reader.readArray(Int32.self, count: stopCount),
+            let boxes = try? reader.readArray(Int32.self, count: patternCount * 4)
+        else { return false }
+        patternDuration = durations
+        slotLon = lons
+        slotLat = lats
+        patternBoxes = boxes
+        geographyReady = true
+        updateLookback()
+        return true
+    }
+
+    private func saveGeographyCache() {
+        guard geographyReady, let url = geographyURL else { return }
+        let parent = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        var data = Data()
+        data.append(contentsOf: Self.geoMagic.utf8)
+        func putU32(_ value: UInt32) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+        }
+        func putI64(_ value: Int64) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+        }
+        putU32(Self.geoVersion)
+        putU32(UInt32(tripCount))
+        putU32(UInt32(patternCount))
+        putU32(UInt32(stopCount))
+        putI64(Int64(bytes.count))
+        putU32(UInt32(feedStart))
+        patternDuration.withUnsafeBytes { data.append(contentsOf: $0) }
+        slotLon.withUnsafeBytes { data.append(contentsOf: $0) }
+        slotLat.withUnsafeBytes { data.append(contentsOf: $0) }
+        patternBoxes.withUnsafeBytes { data.append(contentsOf: $0) }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// What a route is published as, where the static feed knows it.
+    public func route(_ id: String) -> (line: String?, mode: Mode)? {
+        ensureRouteLines()
+        return routeLines[id]
+    }
+
+    private func ensureRouteLines() {
+        guard routeLines.isEmpty, routeCount > 0 else { return }
         let modes: [Mode] = [.train, .tram, .bus, .metro, .boat, .cable, .other]
         routeLines.reserveCapacity(routeCount)
         for i in 0..<routeCount {
@@ -181,31 +378,39 @@ public final class TimetableStore: @unchecked Sendable {
         }
     }
 
-    /// What a route is published as, where the static feed knows it.
-    public func route(_ id: String) -> (line: String?, mode: Mode)? { routeLines[id] }
-
-    private func buildIndexes() {
-        patternDuration = [UInt16](unsafeUninitializedCapacity: patternCount) { out, count in
-            for i in 0..<patternCount {
-                let at = patternIndexAt + i * 8
-                let offset = Int(bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
-                let calls = Int(bytes.loadUnaligned(fromByteOffset: at + 4, as: UInt32.self))
-                guard calls > 0 else { out[i] = 0; continue }
+    /// Last-call offset of one pattern, read on first use.
+    private func duration(of pattern: Int) -> Int {
+        guard pattern >= 0, pattern < patternCount else { return 0 }
+        if patternDuration.count != patternCount {
+            patternDuration = [Int32](repeating: Self.unknownDuration, count: patternCount)
+        }
+        var held = patternDuration[pattern]
+        if held == Self.unknownDuration {
+            let at = patternIndexAt + pattern * 8
+            let offset = Int(bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
+            let calls = Int(bytes.loadUnaligned(fromByteOffset: at + 4, as: UInt32.self))
+            if calls > 0 {
                 let last = patternCallsAt + offset + (calls - 1) * Self.callStride
-                out[i] = bytes.loadUnaligned(fromByteOffset: last + 6, as: UInt16.self)
-            }
-            count = patternCount
-        }
-        longestPattern = Int(patternDuration.max() ?? 0)
-
-        tripStart = [UInt16](unsafeUninitializedCapacity: tripCount) { out, count in
-            for i in 0..<tripCount {
-                out[i] = bytes.loadUnaligned(
-                    fromByteOffset: tripsAt + i * Self.tripStride + 8, as: UInt16.self
+                held = Int32(
+                    bytes.loadUnaligned(fromByteOffset: last + 6, as: UInt16.self)
                 )
+            } else {
+                held = 0
             }
-            count = tripCount
+            patternDuration[pattern] = held
         }
+        return Int(held)
+    }
+
+    /// Start minute of trip `i`, read through the mapping.
+    ///
+    /// Used to be copied into an array of two million `UInt16`s at open, which
+    /// is 2,071,007 strided unaligned loads through 44 MB of trip records.
+    /// A window query binary-searches this (~21 loads) and then scans the
+    /// window; copying the country to make that scan a handful of nanoseconds
+    /// faster was the wrong trade for a launch.
+    private func tripStartMinute(_ i: Int) -> Int {
+        Int(bytes.loadUnaligned(fromByteOffset: tripsAt + i * Self.tripStride + 8, as: UInt16.self))
     }
 
     // MARK: - Record access
@@ -262,7 +467,24 @@ public final class TimetableStore: @unchecked Sendable {
     }
 
     private func string(_ index: UInt32) -> String? {
-        index == BinaryFormat.noString || Int(index) >= strings.count ? nil : strings[Int(index)]
+        let i = Int(index)
+        guard index != BinaryFormat.noString, i >= 0, i < stringCount else { return nil }
+        if interned.count != stringCount {
+            interned = [String?](repeating: nil, count: stringCount)
+        }
+        if let held = interned[i] { return held }
+        let lo = stringBlobAt + Int(
+            bytes.loadUnaligned(fromByteOffset: stringOffsetsAt + i * 4, as: UInt32.self)
+        )
+        let hi = stringBlobAt + Int(
+            bytes.loadUnaligned(fromByteOffset: stringOffsetsAt + (i + 1) * 4, as: UInt32.self)
+        )
+        guard lo >= stringBlobAt, hi >= lo, hi <= bytes.count else { return nil }
+        let decoded = String(
+            decoding: UnsafeRawBufferPointer(rebasing: bytes[lo..<hi]), as: UTF8.self
+        )
+        interned[i] = decoded
+        return decoded
     }
 
     private func stopRef(_ slot: Int) -> String {
@@ -422,12 +644,13 @@ public final class TimetableStore: @unchecked Sendable {
     /// - **Slot to station.** One pass over the 81,756 stop slots, interning the
     ///   station each belongs to. `ch:1:sloid:7000:1:21` and `ch:1:sloid:7000`
     ///   are the same station, which is exactly the join a board is made of.
-    /// - **Station to patterns.** A pass over every pattern's calls, kept per
-    ///   station once it has been asked for. A pattern runs a dozen times a day
-    ///   and a reader taps a handful of stops, so this is paid once and read
-    ///   back on every later board for the same place.
+    /// - **Station to patterns.** One pass over every pattern's calls, then an
+    ///   array per station. Asking per tap used to rescan all 179,287 patterns
+    ///   (~250 ms) for every destination a Bern board chained through — ten
+    ///   seconds of the same walk. Paid once, read back for every later stop.
     private var stationOfSlot: [Int32] = []
     private var stationSlots: [String: Int32] = [:]
+    private var patternsAtStation: [[Int32]] = []
     private var patternsByKey: [String: [Int32]] = [:]
     private var cadencesByKey: [String: [TimetableCadence]] = [:]
 
@@ -450,6 +673,76 @@ public final class TimetableStore: @unchecked Sendable {
         stationSlots = ids
     }
 
+    /// Walk every pattern once and remember which stations it calls at.
+    ///
+    /// `patterns(callingAt:)` used to do this scan for *each* station key. A
+    /// through-working looks up the destination of every train, so a Bern
+    /// board paid it fifty times over. The lists are a few megabytes; the
+    /// alternative was a spinner.
+    private func preparePatternIndex() {
+        prepareStations()
+        let stationCount = stationSlots.count
+        guard stationCount > 0, patternsAtStation.count != stationCount else { return }
+        var lists = [[Int32]](repeating: [], count: stationCount)
+        var stamp = [UInt32](repeating: 0, count: stationCount)
+        var generation: UInt32 = 1
+        for index in 0..<patternCount {
+            if generation == 0 {
+                stamp = [UInt32](repeating: 0, count: stationCount)
+                generation = 1
+            }
+            let gen = generation
+            generation &+= 1
+            let at = patternIndexAt + index * 8
+            let offset = Int(bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
+            let count = Int(bytes.loadUnaligned(fromByteOffset: at + 4, as: UInt32.self))
+            let pattern = Int32(index)
+            for call in 0..<count {
+                let slot = Int(bytes.loadUnaligned(
+                    fromByteOffset: patternCallsAt + offset + call * Self.callStride,
+                    as: UInt32.self
+                ))
+                guard slot >= 0, slot < stationOfSlot.count else { continue }
+                let station = Int(stationOfSlot[slot])
+                guard station >= 0, station < stationCount, stamp[station] != gen else { continue }
+                stamp[station] = gen
+                lists[station].append(pattern)
+            }
+        }
+        patternsAtStation = lists
+    }
+
+    /// Build the board indexes off the tap path. A map that is only being
+    /// drawn still never pays; the first station tap then does not either.
+    public func prepareBoardIndexes() {
+        guard isReady else { return }
+        prepareStations()
+        preparePatternIndex()
+        prepareTripsByPattern()
+    }
+
+    private var railwayStationCache: [String: Bool] = [:]
+
+    /// Railway evidence independent of today's running services. Some small
+    /// stations are missing the stop register's crawl-derived railway flag.
+    public func isRailwayStation(_ id: String) -> Bool {
+        let ref = StopRegister.sloid(forDidok: id) ?? id
+        let station = Self.station(ofSlotRef: ref)
+        if let cached = railwayStationCache[station] { return cached }
+        let candidates = patterns(callingAt: [station], key: "city-rail:\(station)")
+        prepareTripsByPattern()
+        let railway = candidates.contains { pattern in
+            let index = Int(pattern)
+            for slot in Int(patternTripsAt[index])..<Int(patternTripsAt[index + 1]) {
+                let row = trip(Int(patternTrips[slot]))
+                if klass(row.klass).mode == .train { return true }
+            }
+            return false
+        }
+        railwayStationCache[station] = railway
+        return railway
+    }
+
     /// `StopRegister.stationOf`, over the whole stop table without the litter.
     ///
     /// The register's own version splits on every colon and joins the first
@@ -458,6 +751,16 @@ public final class TimetableStore: @unchecked Sendable {
     /// is most of the cost of the pass, and the answer is the same: everything
     /// up to the fourth colon, with a `_gen` suffix cut off first.
     static func station(ofSlotRef ref: String) -> String {
+        // Generated sector references can contain a complete platform SLOID
+        // after `_gen`, e.g. `8005_gen:ch:1:sloid:8005:3:4_pf:4AB`.
+        // Trim that suffix before counting colons or the station becomes
+        // `ch:1:sloid:8005_gen` and departures vanish from Burgdorf's index.
+        if let cut = ref.range(of: "_gen") {
+            return station(ofSlotRef: String(ref[..<cut.lowerBound]))
+        }
+        // Foreign stops are filed as `ch:1:ScheduledStopPoint:8301003`. The
+        // board asks for the UIC, so the index has to be the UIC too.
+        if let code = StopRegister.scheduledStopPointCode(ref) { return code }
         var colons = 0
         var end = ref.utf8.count
         var index = 0
@@ -469,11 +772,7 @@ public final class TimetableStore: @unchecked Sendable {
             index += 1
         }
         if colons < 4 {
-            // Fewer than four parts is a station reference already. `_gen` is
-            // the register's own marker for a generated row and never belongs
-            // to the identifier.
-            guard let cut = ref.range(of: "_gen") else { return ref }
-            return String(ref[ref.startIndex..<cut.lowerBound])
+            return ref
         }
         return String(decoding: Array(ref.utf8.prefix(end)), as: UTF8.self)
     }
@@ -533,48 +832,60 @@ public final class TimetableStore: @unchecked Sendable {
     private func patterns(
         callingAt stations: Set<String>, key: String, accepting: ((String) -> Bool)? = nil
     ) -> [Int32] {
-        prepareStations()
+        preparePatternIndex()
         if let known = patternsByKey[key] { return known }
 
         var ids = Set<Int32>()
         for station in stations {
             if let id = stationSlots[station] { ids.insert(id) }
         }
-        var slots = [Bool](repeating: false, count: stopCount)
-        var any = false
-        if !ids.isEmpty {
-            for slot in 0..<stopCount {
-                let station = stationOfSlot[slot]
-                guard station >= 0, ids.contains(station) else { continue }
-                if let accepting, !accepting(stopRef(slot)) { continue }
-                slots[slot] = true
-                any = true
-            }
-        }
-        // Asked and answered: a place the timetable has no slot for has no
-        // patterns, and remembering that is what stops every later board
-        // scanning the file to find out again.
-        guard any else {
+        guard !ids.isEmpty else {
             patternsByKey[key] = []
             return []
         }
 
         var found: [Int32] = []
-        for index in 0..<patternCount {
-            let at = patternIndexAt + index * 8
-            let offset = Int(bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
-            let count = Int(bytes.loadUnaligned(fromByteOffset: at + 4, as: UInt32.self))
-            for c in 0..<count {
-                let slot = Int(bytes.loadUnaligned(
-                    fromByteOffset: patternCallsAt + offset + c * Self.callStride, as: UInt32.self
-                ))
-                guard slot < slots.count, slots[slot] else { continue }
-                found.append(Int32(index))
-                break
+        if ids.count == 1, accepting == nil, let id = ids.first {
+            found = patternsAtStation[Int(id)]
+            patternsByKey[key] = found
+            return found
+        }
+
+        var seen = Set<Int32>()
+        found.reserveCapacity(ids.reduce(0) { $0 + patternsAtStation[Int($1)].count })
+        for id in ids {
+            for pattern in patternsAtStation[Int(id)] {
+                guard seen.insert(pattern).inserted else { continue }
+                if let accepting, !patternCalls(
+                    Int(pattern), at: ids, accepting: accepting
+                ) { continue }
+                found.append(pattern)
             }
         }
         patternsByKey[key] = found
         return found
+    }
+
+    /// Whether any call of this pattern is at one of these stations *and*
+    /// accepted as this platform. Used to turn the station index into a
+    /// platform index without walking the other 179,000 patterns.
+    private func patternCalls(
+        _ pattern: Int, at stationIDs: Set<Int32>, accepting: (String) -> Bool
+    ) -> Bool {
+        guard pattern >= 0, pattern < patternCount else { return false }
+        let indexAt = patternIndexAt + pattern * 8
+        let offset = Int(bytes.loadUnaligned(fromByteOffset: indexAt, as: UInt32.self))
+        let count = Int(bytes.loadUnaligned(fromByteOffset: indexAt + 4, as: UInt32.self))
+        for call in 0..<count {
+            let at = patternCallsAt + offset + call * Self.callStride
+            let slot = Int(bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
+            guard slot >= 0, slot < stationOfSlot.count,
+                  stationIDs.contains(stationOfSlot[slot]),
+                  accepting(stopRef(slot))
+            else { continue }
+            return true
+        }
+        return false
     }
 
     /// The pattern a trip row runs, read on its own.
@@ -608,6 +919,7 @@ public final class TimetableStore: @unchecked Sendable {
         to: Timestamp,
         zone: TimeZone = TimeZone(identifier: "Europe/Zurich") ?? .current,
         limit: Int = 120,
+        keepHiddenPatterns: Bool = true,
         place: (String) -> Place?,
         operatorName: (String) -> String? = { _ in nil }
     ) -> [Journey] {
@@ -645,13 +957,13 @@ public final class TimetableStore: @unchecked Sendable {
         for pattern in wanted {
             let index = Int(pattern)
             guard index < patternCount else { continue }
-            let duration = Int(patternDuration[index])
+            let run = duration(of: index)
             for slot in Int(patternTripsAt[index])..<Int(patternTripsAt[index + 1]) {
                 let row = Int(patternTrips[slot])
-                let start = Int(tripStart[row])
+                let start = tripStartMinute(row)
                 var service = -1
                 for day in days {
-                    if start > day.closes || start + duration < day.opened { continue }
+                    if start > day.closes || start + run < day.opened { continue }
                     if service < 0 { service = trip(row).service }
                     guard runs(service: service, onDay: day.index) else { continue }
                     candidates.append((day.zero + Timestamp(start) * 60, row, day.index, day.zero))
@@ -660,18 +972,75 @@ public final class TimetableStore: @unchecked Sendable {
         }
         candidates.sort { $0.at < $1.at }
 
+        // A busy station's next N trips are the seven-minute tram, over and
+        // over. Stopping at `limit` never reached the hourly S-Bahn. Walk the
+        // rest of the day for patterns that still have no upcoming call here,
+        // and only skip *extra* trips of a pattern already on the board.
+        prepareStations()
+        let stationIDs = Set(stations.compactMap { stationSlots[$0] })
+        var offsetByPattern: [Int: Int] = [:]
+        func stationOffset(of pattern: Int) -> Int? {
+            if let cached = offsetByPattern[pattern] { return cached }
+            guard let found = departureOffset(
+                of: pattern, at: stationIDs, accepting: accepting
+            ) else { return nil }
+            offsetByPattern[pattern] = found
+            return found
+        }
+
+        var seenPatterns: Set<Int> = []
         var out: [Journey] = []
         out.reserveCapacity(min(limit, candidates.count))
+        let patternTotal = wanted.count
         for candidate in candidates {
-            if out.count >= limit { break }
+            let record = trip(candidate.row)
+            guard let offset = stationOffset(of: record.pattern) else { continue }
+            let callAt = candidate.at + Timestamp(offset) * 60
+            if callAt < from - 60 { continue }
+            let isNew = seenPatterns.insert(record.pattern).inserted
+            if !isNew {
+                if out.count >= limit { continue }
+            } else if out.count >= limit {
+                // Past the row budget, only modes that a frequent tram can
+                // hide still get a seat: trains, metros, boats, cableways.
+                // A first-paint board skips this extra walk so the packed
+                // rows can appear before the rare overnight services.
+                guard keepHiddenPatterns else { continue }
+                switch klass(record.klass).mode {
+                case .train, .metro, .boat, .cable: break
+                default: continue
+                }
+            }
             if let journey = build(
-                trip(candidate.row), row: candidate.row, dayZero: candidate.zero,
+                record, row: candidate.row, dayZero: candidate.zero,
                 place: place, operatorName: operatorName
             ) {
                 out.append(journey)
             }
+            if seenPatterns.count >= patternTotal, out.count >= limit { break }
         }
         return out
+    }
+
+    /// Minutes from a trip's origin to its first departure at one of these
+    /// stations, or nil if the pattern does not call there.
+    private func departureOffset(
+        of pattern: Int, at stationIDs: Set<Int32>, accepting: ((String) -> Bool)?
+    ) -> Int? {
+        guard pattern >= 0, pattern < patternCount, !stationIDs.isEmpty else { return nil }
+        let indexAt = patternIndexAt + pattern * 8
+        let callsOffset = Int(bytes.loadUnaligned(fromByteOffset: indexAt, as: UInt32.self))
+        let callCount = Int(bytes.loadUnaligned(fromByteOffset: indexAt + 4, as: UInt32.self))
+        for call in 0..<callCount {
+            let at = patternCallsAt + callsOffset + call * Self.callStride
+            let slot = Int(bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
+            guard slot >= 0, slot < stationOfSlot.count,
+                  stationIDs.contains(stationOfSlot[slot]),
+                  accepting?(stopRef(slot)) ?? true
+            else { continue }
+            return Int(bytes.loadUnaligned(fromByteOffset: at + 6, as: UInt16.self))
+        }
+        return nil
     }
 
     private struct Class {
@@ -944,8 +1313,8 @@ public final class TimetableStore: @unchecked Sendable {
     /// nothing is entered on a hunch. Most of the ref-less agencies are French,
     /// German and Austrian, and those stay out: the register is the Swiss one
     /// and has never heard of them, so nil is the true answer and a guess would
-    /// be worse than the blank. What is left is one company and a scatter of
-    /// eleven-row bus workings not worth a row.
+    /// be worse than the blank. Known Swiss agencies also cover journeys
+    /// whose references are absent on only some routes, such as PostAuto 220.
     ///
     /// The proper fix is upstream — the packer should write the SBOID into the
     /// class record, and then this goes away. Until it does, this is the only
@@ -970,6 +1339,10 @@ public final class TimetableStore: @unchecked Sendable {
     private static let sboidByAgency: [String: String] = [
         "48": "ch:1:sboid:100029",
         "93": "ch:1:sboid:100029",
+        // PostAuto. Kiental's 220 has no journey references; other workings
+        // under this agency identify PostAuto as 100602. An explicit journey
+        // reference still takes precedence for services run by another company.
+        "801": "ch:1:sboid:100602",
     ]
 
     /// The moments the packed feed can answer for.
@@ -1044,7 +1417,7 @@ public final class TimetableStore: @unchecked Sendable {
         var hi = tripCount
         while lo < hi {
             let mid = (lo + hi) / 2
-            if Int(tripStart[mid]) < minute { lo = mid + 1 } else { hi = mid }
+            if tripStartMinute(mid) < minute { lo = mid + 1 } else { hi = mid }
         }
         return lo
     }
@@ -1110,13 +1483,13 @@ public final class TimetableStore: @unchecked Sendable {
             let index = Self.daysSince1970(cursor, zone: zone) - feedStart
             guard index >= 0, index < dayCount else { continue }
 
-            let lo = Int((from - dayZero) / 60) - longestPattern
+            let lo = Int((from - dayZero) / 60) - lookbackMinutes
             let hi = Int((to - dayZero) / 60)
             guard hi >= 0 else { continue }
 
             var i = lowerBound(max(lo, 0))
             while i < tripCount, out.count < limit {
-                let start = Int(tripStart[i])
+                let start = tripStartMinute(i)
                 if start > hi { break }
                 defer { i += 1 }
 
@@ -1126,7 +1499,7 @@ public final class TimetableStore: @unchecked Sendable {
                 // The cheap rejections first: a trip that had already finished,
                 // then one that does not run today. Both are far cheaper than
                 // reading the pattern's calls.
-                if start + Int(patternDuration[record.pattern]) < Int((from - dayZero) / 60) { continue }
+                if start + duration(of: record.pattern) < Int((from - dayZero) / 60) { continue }
                 guard runs(service: record.service, onDay: index) else { continue }
                 // Last of the cheap rejections, because it is the only one that
                 // can have work to do the first time it is asked: a pattern
@@ -1142,6 +1515,65 @@ public final class TimetableStore: @unchecked Sendable {
             }
         }
         return out
+    }
+
+    /// Resolve pattern boxes for the window without building any journeys.
+    ///
+    /// A clipped expand only works out the boxes it needs to reject against.
+    /// Zooming out then pays that cost on the new patterns, on the fleet actor,
+    /// in front of the frame. Walking the rest of the window in the background
+    /// — the same cheap rejections, no `Journey` objects — means a later
+    /// expand is a box compare and a build of what is newly in view.
+    ///
+    /// `budget` is how many *unknown* boxes this call will resolve, so a caller
+    /// can interleave it with the draw loop rather than owning the actor for
+    /// the whole remainder. Returns whether any unknown boxes were still
+    /// waiting when the budget ran out.
+    public func prefetchGeography(
+        from: Timestamp,
+        to: Timestamp,
+        zone: TimeZone = TimeZone(identifier: "Europe/Zurich") ?? .current,
+        budget: Int = 512,
+        place: (String) -> Place?
+    ) -> Bool {
+        guard isReady, to >= from, budget > 0 else { return false }
+        if geographyReady { return false }
+        prepareGeography()
+
+        var remaining = budget
+        let firstDay = Date(timeIntervalSince1970: TimeInterval(from) - 86400)
+        let lastDay = Date(timeIntervalSince1970: TimeInterval(to))
+        var cursor = firstDay
+        while cursor <= lastDay {
+            defer { cursor = cursor.addingTimeInterval(86400) }
+            guard let dayZero = Self.dayStart(cursor, zone: zone) else { continue }
+            let index = Self.daysSince1970(cursor, zone: zone) - feedStart
+            guard index >= 0, index < dayCount else { continue }
+
+            let lo = Int((from - dayZero) / 60) - lookbackMinutes
+            let hi = Int((to - dayZero) / 60)
+            guard hi >= 0 else { continue }
+
+            var i = lowerBound(max(lo, 0))
+            while i < tripCount {
+                let start = tripStartMinute(i)
+                if start > hi { break }
+                defer { i += 1 }
+
+                let record = trip(i)
+                guard record.pattern < patternCount else { continue }
+                if start + duration(of: record.pattern) < Int((from - dayZero) / 60) {
+                    continue
+                }
+                guard runs(service: record.service, onDay: index) else { continue }
+                let at = record.pattern * 4
+                guard at < patternBoxes.count, patternBoxes[at] == Self.unknown else { continue }
+                _ = patternBox(record.pattern, place: place)
+                remaining -= 1
+                if remaining == 0 { return true }
+            }
+        }
+        return false
     }
 
     private func build(
@@ -1181,17 +1613,23 @@ public final class TimetableStore: @unchecked Sendable {
             visits[ref] = visit
 
             let found = place(ref)
+            let name = found?.name ?? ref
+            if StopNaming.isTechnical(name) { continue }
+            // An unplaced call is written as `(0, 0)` everywhere else, and
+            // that is a vertex in the Gulf of Guinea. Skip it here so the
+            // printed timetable cannot mint the Africa chord either.
+            guard let found, found.lat != 0 || found.lon != 0 else { continue }
             let arrive = origin + Timestamp(arriveAt) * 60
             let depart = origin + Timestamp(departAt) * 60
 
             calls.append(Call(
                 key: "\(ref)|\(visit)",
                 ref: ref,
-                name: found?.name ?? ref,
-                lat: found?.lat ?? 0,
-                lon: found?.lon ?? 0,
-                platform: found?.platform,
-                precise: found?.precise ?? false,
+                name: name,
+                lat: found.lat,
+                lon: found.lon,
+                platform: found.platform,
+                precise: found.precise,
                 arr: arrive,
                 dep: depart,
                 delay: nil,
@@ -1200,7 +1638,7 @@ public final class TimetableStore: @unchecked Sendable {
                 // measurement once OJP has been asked and has not answered.
                 observed: false,
                 sched: depart,
-                assigned: found?.assigned
+                assigned: found.assigned
             ))
         }
 
@@ -1218,7 +1656,7 @@ public final class TimetableStore: @unchecked Sendable {
             id: tripID(row: row),
             mode: info.mode,
             category: nil,
-            line: info.line ?? "",
+            line: Journey.publishedLine(info.line, mode: info.mode),
             number: string(record.number),
             // The journey reference first, because it is this run's own word
             // for who is running it; the agency id only where there is no
@@ -1238,6 +1676,69 @@ public final class TimetableStore: @unchecked Sendable {
             stops: calls,
             journeyRef: ref
         )
+    }
+
+    // MARK: - Through-services
+
+    /// Rebuild a row's journey reference, or nil where the feed gives it none.
+    private func journeyReference(row: Int) -> String? {
+        guard row >= 0, row < tripCount else { return nil }
+        let record = trip(row)
+        return journeyRef(prefix: record.prefix, suffix: record.suffix)
+    }
+
+    /// Every name this working answers to, for matching it against a fleet.
+    ///
+    /// Two, because the two sources spell a run differently and both reach
+    /// here: the packed timetable files a journey under its GTFS `trip_id`,
+    /// while SIRI files the same run under its Swiss Journey ID. A link that
+    /// offered only one of them would join packed legs and never live ones.
+    ///
+    /// Lower-cased here, once, rather than at every comparison. The feeds
+    /// disagree on the case of the namespace — `CH:1:sjyid:` against
+    /// `ch:1:sjyid:` — so the comparison has to be case-insensitive, and doing
+    /// it lazily meant re-folding 75,000 names on every chain rebuild.
+    private func workingNames(row: Int) -> [String] {
+        var names = [tripID(row: row).lowercased()]
+        if let ref = journeyReference(row: row)?.lowercased(), ref != names[0] {
+            names.append(ref)
+        }
+        return names.filter { !$0.isEmpty }
+    }
+
+    /// The published through-services running on `date`.
+    ///
+    /// This is the feed saying outright what the app used to infer: these two
+    /// numbered workings are one vehicle and the passenger does not get off.
+    /// A day is around 18,800 links nationally, so the whole day is resolved at
+    /// once and the caller indexes it; there is no per-train query because at
+    /// this size there does not need to be one.
+    ///
+    /// The calendar is not a detail. A link is only true on the days both its
+    /// workings run, and the same trip row carries different successors on
+    /// different days — unfiltered, one appears to part as many as 56 ways.
+    public func throughServices(
+        on date: Date, zone: TimeZone = TimeZone(identifier: "Europe/Zurich") ?? .current
+    ) -> [ThroughLink] {
+        guard isReady, linkCount > 0 else { return [] }
+        let day = Self.daysSince1970(date, zone: zone) - feedStart
+        guard day >= 0, day < dayCount else { return [] }
+
+        var out: [ThroughLink] = []
+        out.reserveCapacity(4096)
+        for i in 0..<linkCount {
+            let at = linksAt + i * 12
+            let service = Int(bytes.loadUnaligned(fromByteOffset: at + 8, as: UInt32.self))
+            guard runs(service: service, onDay: day) else { continue }
+            let from = Int(bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
+            let to = Int(bytes.loadUnaligned(fromByteOffset: at + 4, as: UInt32.self))
+            guard from >= 0, from < tripCount, to >= 0, to < tripCount else { continue }
+            let leaving = workingNames(row: from)
+            let arriving = workingNames(row: to)
+            guard !leaving.isEmpty, !arriving.isEmpty else { continue }
+            out.append(ThroughLink(from: leaving, to: arriving))
+        }
+        return out
     }
 
     /// The mode field alone, for queries that can reject a trip without

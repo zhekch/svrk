@@ -1,13 +1,17 @@
 import SwiftUI
 import TransitCore
 
-struct OfflineSheet: View {
+/// Transit data already on the device, and the optional map-area packs.
+///
+/// Pushed from Settings rather than opened from a map button: the map's
+/// chrome is for looking, and this is storage.
+struct OfflineView: View {
     @Bindable var model: AppModel
+    var basemap: Basemap = .standard
+    var onClose: (() -> Void)? = nil
     @State private var store = RegionStore()
-    @State private var basemap: Basemap = .dark
-    @Environment(\.dismiss) private var dismiss
 
-    /// What the packed stores and the stored snapshot actually occupy.
+    /// Packed stores plus the last fleet snapshot, in bytes.
     ///
     /// Measured rather than quoted: the bundled data is a directory of packed
     /// files that changes size every time it is rebuilt, and the fleet cache
@@ -18,9 +22,9 @@ struct OfflineSheet: View {
     /// evaluation of `body`, and the body is re-evaluated for every progress
     /// report of a running download. Asked once per appearance now, and off
     /// the main actor.
-    @State private var onDeviceSize = "—"
+    @State private var onDeviceBytes: Int64 = 0
 
-    private nonisolated static func measureOnDevice() -> String {
+    private nonisolated static func measureOnDevice() -> Int64 {
         var bytes: Int64 = 0
         let files = FileManager.default
         if let data = Bundle.main.resourceURL?.appendingPathComponent("Data"),
@@ -31,69 +35,89 @@ struct OfflineSheet: View {
         }
         let snapshot = URL.applicationSupportDirectory.appendingPathComponent("fleet.bin")
         bytes += Int64((try? snapshot.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        guard bytes > 0 else { return "—" }
-        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        return bytes
+    }
+
+    private static func bytes(_ value: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+    }
+
+    /// Map tiles and transit data together. The footer used to report only the
+    /// packs, so a device with 59 MB of timetable and no tiles said "nothing
+    /// stored yet".
+    private var storedSummary: String {
+        let maps = Int64(store.totalBytes)
+        let transit = onDeviceBytes
+        switch (maps > 0, transit > 0) {
+        case (true, true):
+            return "Stored: \(Self.bytes(transit)+Self.bytes(maps)) of data."
+        case (false, true):
+            return "Stored: \(Self.bytes(transit)) of transit data. No map areas yet."
+        case (true, false):
+            return "Stored: \(Self.bytes(maps)) of map areas."
+        case (false, false):
+            return "Nothing stored yet."
+        }
     }
 
     var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Downloaded content:")
-                            .font(.callout.weight(.semibold))
-                        // Worth stating plainly, because it is the unusual part:
-                        // the transit data is not a download, it ships with the
-                        // app.
-                        bundledRow("Stops", "\(model.loaded?.stops ?? 0)")
-                        bundledRow("Route relations", "\(model.loaded?.relations ?? 0)")
-                        bundledRow("Railway graph", "\(model.loaded?.railnetNodes ?? 0)")
-                        bundledRow("Last fleet snapshot",
-                                   model.status.journeys > 0
-                                       ? "\(model.status.journeys) journeys"
-                                       : "none stored yet")
-                        Divider().padding(.vertical, 2)
-                        bundledRow("Space used", onDeviceSize)
-                    }
-                    .padding(.vertical, 2)
+        List {
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Downloaded content:")
+                        .font(.callout.weight(.semibold))
+                    // Worth stating plainly, because it is the unusual part:
+                    // the transit data is not a download, it ships with the
+                    // app.
+                    bundledRow("Stops", "\(model.loaded?.stops ?? 0)")
+                    bundledRow("Last fleet snapshot",
+                               model.status.journeys > 0
+                                   ? "\(model.status.journeys) journeys"
+                                   : "none stored yet")
+                    Divider().padding(.vertical, 2)
+                    bundledRow(
+                        "Transit data",
+                        onDeviceBytes > 0 ? Self.bytes(onDeviceBytes) : "—"
+                    )
                 }
+                .padding(.vertical, 2)
+            }
 
-                Section {
-                    ForEach(Region.all) { region in
-                        RegionRow(
-                            region: region,
-                            state: store.states[region.id] ?? RegionState(),
-                            download: { store.download(region, basemap: basemap) },
-                            remove: { store.remove(region) }
-                        )
-                        .onAppear { store.estimate(region, basemap: basemap) }
-                    }
-                } header: {
-                    Text("Map areas")
-                } footer: {
-                    Text(store.totalBytes > 0
-                         ? "Stored: \(ByteCountFormatter.string(fromByteCount: Int64(store.totalBytes), countStyle: .file))"
-                         : "Nothing stored yet.")
+            Section {
+                ForEach(Region.all) { region in
+                    RegionRow(
+                        region: region,
+                        state: store.states[region.id] ?? RegionState(),
+                        download: { store.download(region, basemap: basemap) },
+                        remove: { store.remove(region) }
+                    )
+                    .onAppear { store.estimate(region, basemap: basemap) }
                 }
+            } header: {
+                Text("Map areas")
+            } footer: {
+                Text(storedSummary)
             }
-            .navigationTitle("Offline")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+        }
+        .navigationTitle("Offline")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if let onClose {
+                ToolbarItem(placement: .topBarTrailing) { Button("Done") { onClose() } }
             }
-            .task {
-                onDeviceSize = await Task.detached(priority: .utility) {
-                    Self.measureOnDevice()
-                }.value
-            }
-            .onAppear {
-                store.refreshStoredState()
-                // `-downloadRegion bern` starts one immediately, so the download
-                // path can be exercised without a tap.
-                if let id = UserDefaults.standard.string(forKey: "downloadRegion"),
-                   let region = Region.all.first(where: { $0.id == id }) {
-                    store.download(region, basemap: basemap)
-                }
+        }
+        .task {
+            onDeviceBytes = await Task.detached(priority: .utility) {
+                Self.measureOnDevice()
+            }.value
+        }
+        .onAppear {
+            store.refreshStoredState()
+            // `-downloadRegion bern` starts one immediately, so the download
+            // path can be exercised without a tap.
+            if let id = UserDefaults.standard.string(forKey: "downloadRegion"),
+               let region = Region.all.first(where: { $0.id == id }) {
+                store.download(region, basemap: basemap)
             }
         }
     }
@@ -164,7 +188,15 @@ struct RegionRow: View {
 
 struct SettingsSheet: View {
     @Bindable var model: AppModel
+    var basemap: Basemap = .standard
+    /// `-openSheet offline` lands here rather than on a second sheet.
+    var openOffline = false
     @Environment(\.dismiss) private var dismiss
+    @State private var path = NavigationPath()
+
+    private enum Page: Hashable {
+        case offline
+    }
 
     // The basemap and the track overlay used to head this list. They are now
     // on the map itself, behind the button above the locate arrow — see
@@ -172,7 +204,7 @@ struct SettingsSheet: View {
     // them, which is the one thing a full-height sheet cannot let you do.
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List {
                 Section {
                     Picker("Data", selection: Binding(
@@ -188,42 +220,22 @@ struct SettingsSheet: View {
                 }
 
                 Section {
-                    ForEach(Mode.allCases, id: \.self) { mode in
-                        Toggle(isOn: Binding(
-                            get: { !model.hiddenModes.contains(mode) },
-                            set: { on in
-                                if on { model.hiddenModes.remove(mode) } else { model.hiddenModes.insert(mode) }
-                                model.requestTick()
-                            }
-                        )) {
-                            HStack {
-                                Circle().fill(mode.color).frame(width: 9, height: 9)
-                                Text(mode.label)
-                            }
-                        }
-                    }
-                    Toggle("Bus stops", isOn: Binding(
-                        get: { model.showStops }, set: { model.showStops = $0 }
-                    ))
                     Toggle("Platforms and stations", isOn: Binding(
                         get: { model.showRailwayShapes }, set: { model.showRailwayShapes = $0 }
                     ))
-                } header: {
-                    Text("Show")
-                } footer: {
-                    Text("""
-                    What is on the map at all. The railway network and the \
-                    basemap are on the map itself, behind the map button above \
-                    the locate arrow.
-                    """)
-                }
-
-                Section {
+                    Toggle("Detailed stops", isOn: Binding(
+                        get: { model.showStops }, set: { model.showStops = $0 }
+                    ))
                     Toggle("Detailed vehicles", isOn: Binding(
                         get: { model.detailedVehicles },
                         set: { model.detailedVehicles = $0 }
                     ))
-                    Toggle("Notice the service you are on", isOn: Binding(
+                } header: {
+                    Text("Visual")
+                }
+
+                Section {
+                    Toggle("Vehicle and stop suggestions", isOn: Binding(
                         get: { model.rides.enabled },
                         set: { model.rides.enabled = $0 }
                     ))
@@ -232,72 +244,58 @@ struct SettingsSheet: View {
                 }
 
                 Section {
-                    LabeledContent("Formations learned") {
-                        Text("\(model.layouts.count) trains, \(model.layouts.patternCount) lines")
-                            .font(.caption.monospacedDigit())
+                    NavigationLink(value: Page.offline) {
+                        Label("Offline", systemImage: "arrow.down.circle")
                     }
-                    if let file = model.exportLayouts() {
-                        ShareLink(item: file) {
-                            Label("Export learned formations", systemImage: "square.and.arrow.up")
-                        }
-                    }
-                } header: {
-                    Text("Train formations")
-                } footer: {
-                    Text("""
-                    Exporting hands over the learned formations as JSON — drop \
-                    it into the project as \
-                    SwissTransit/Resources/vehicle-layouts.json and the next \
-                    build starts out knowing them.
-                    """)
                 }
-
+                
                 Section {
-                    Toggle("Frame readout", isOn: Binding(
+                    Toggle("Debug", isOn: Binding(
                         get: { model.showDiagnostics }, set: { model.showDiagnostics = $0 }
                     ))
-                    Toggle("Wagon hitboxes", isOn: Binding(
-                        get: { model.showWagonHitboxes },
-                        set: { model.showWagonHitboxes = $0 }
-                    ))
-                } header: {
-                    Text("Diagnostics")
-                } footer: {
-                    Text("""
-                    The readout shows what each frame draws. Hitboxes draw each \
-                    wagon's outline and the heading, grade and euler the \
-                    renderer was given for it.
-                    """)
+                    if model.showDiagnostics {
+                        Toggle("Wagon hitboxes", isOn: Binding(
+                            get: { model.showWagonHitboxes },
+                            set: { model.showWagonHitboxes = $0 }
+                        ))
+                        if let file = model.exportLayouts() {
+                            ShareLink(item: file) {
+                                Label("Export learned formations", systemImage: "square.and.arrow.up")
+                            }
+                        }
+                    }
                 }
 
-                Section("Status") {
-                    row("Journeys", "\(model.status.journeys)")
-                    row("Vehicles after chaining", "\(model.status.vehicles)")
-                    row("Unresolved calls", "\(model.status.unresolved)")
-                    row("Source", model.status.source)
-                    if let at = model.status.refreshedAt {
-                        row("Refreshed", Format.time(Int(at.timeIntervalSince1970)))
-                    }
-                    row("Parse", String(format: "%.2f s", model.status.parseSeconds))
-                    if model.status.refreshSeconds > 0 {
-                        row("Refresh", String(format: "%.1f s", model.status.refreshSeconds))
-                    }
-                    if model.status.bytes > 0 {
-                        row("Downloaded", ByteCountFormatter.string(
-                            fromByteCount: Int64(model.status.bytes), countStyle: .file))
-                    }
-                    if model.status.failures > 0 {
-                        row("Failed refreshes", "\(model.status.failures)")
-                    }
-                    if let error = model.status.lastError {
-                        row("Last error", error)
-                    }
-                    // Collected by `Fleet.load` since the first build and, until
-                    // now, shown nowhere: a store that failed to open left the
-                    // feature that depends on it quietly missing, with the app
-                    // reporting nothing at all.
-                    ForEach(model.loaded?.problems ?? [], id: \.self) { problem in
-                        row("Did not load", problem)
+                if model.showDiagnostics {
+                    Section("Status") {
+                        row("Journeys", "\(model.status.journeys)")
+                        row("Vehicles after chaining", "\(model.status.vehicles)")
+                        row("Unresolved calls", "\(model.status.unresolved)")
+                        row("Source", model.status.source)
+                        if let at = model.status.refreshedAt {
+                            row("Refreshed", Format.time(Int(at.timeIntervalSince1970)))
+                        }
+                        row("Parse", String(format: "%.2f s", model.status.parseSeconds))
+                        if model.status.refreshSeconds > 0 {
+                            row("Refresh", String(format: "%.1f s", model.status.refreshSeconds))
+                        }
+                        if model.status.bytes > 0 {
+                            row("Downloaded", ByteCountFormatter.string(
+                                fromByteCount: Int64(model.status.bytes), countStyle: .file))
+                        }
+                        if model.status.failures > 0 {
+                            row("Failed refreshes", "\(model.status.failures)")
+                        }
+                        if let error = model.status.lastError {
+                            row("Last error", error)
+                        }
+                        // Collected by `Fleet.load` since the first build and, until
+                        // now, shown nowhere: a store that failed to open left the
+                        // feature that depends on it quietly missing, with the app
+                        // reporting nothing at all.
+                        ForEach(model.loaded?.problems ?? [], id: \.self) { problem in
+                            row("Did not load", problem)
+                        }
                     }
                 }
 
@@ -325,10 +323,21 @@ struct SettingsSheet: View {
                 }
 
             }
+            .menuAnimation(value: model.dataMode)
+            .menuAnimation(value: model.showDiagnostics)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: Page.self) { page in
+                switch page {
+                case .offline:
+                    OfflineView(model: model, basemap: basemap, onClose: { dismiss() })
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+            }
+            .task {
+                if openOffline { path.append(Page.offline) }
             }
         }
     }
@@ -366,6 +375,8 @@ private struct SettingsSheetPreview: View {
 }
 
 #Preview("Offline maps") {
-    OfflineSheet(model: AppModel())
-        .preferredColorScheme(.dark)
+    NavigationStack {
+        OfflineView(model: AppModel())
+    }
+    .preferredColorScheme(.dark)
 }

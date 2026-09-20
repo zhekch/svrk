@@ -64,11 +64,11 @@ enum TransitDataMode: String, CaseIterable, Identifiable, Sendable {
     var detail: String {
         switch self {
         case .all:
-            return "All live data, including disruptions and engineering works."
+            return "All live data, including disruptions."
         case .onDemand:
-            return "GTFS Realtime, with OJP and train formations only for vehicles you open."
+            return "Delays, cancellations, occupancy and train formations."
         case .off:
-            return "No live transit-data requests. The on-device timetable still draws the map."
+            return "No data requests are made."
         }
     }
 }
@@ -110,7 +110,7 @@ struct BootProgress: Equatable {
 
         var detail: String {
             switch self {
-            case .reading: return "Stops, route relations and the railway graph"
+            case .reading: return "Stops, operators and the printed timetable"
             case .caches: return "Routed legs kept from earlier runs"
             case .learned: return "Formations and layouts this app has been told"
             case .disruptions: return "Stored notices, before the network answers"
@@ -123,10 +123,10 @@ struct BootProgress: Equatable {
         var start: Double {
             switch self {
             case .reading: return 0
-            case .caches: return 0.50
-            case .learned: return 0.66
-            case .disruptions: return 0.72
-            case .drawing: return 0.80
+            case .caches: return 0.20
+            case .learned: return 0.28
+            case .disruptions: return 0.40
+            case .drawing: return 0.55
             case .ready: return 1
             }
         }
@@ -163,7 +163,15 @@ struct BootProgress: Equatable {
 
     private var entered = Date()
     private var spent: [Step] = []
-    private let began = Date()
+    private var began = Date()
+
+    /// Call when `start()` actually begins, so Mapbox's first layout is not
+    /// counted as "Reading the transit network".
+    mutating func noteStarted() {
+        entered = Date()
+        began = Date()
+        spent = []
+    }
 
     /// A line per step and a total, in milliseconds.
     func report() -> String {
@@ -247,6 +255,12 @@ final class AppModel {
     /// renderer underneath it.
     @ObservationIgnored private(set) var frameVersion = 0
     @ObservationIgnored private(set) var stopsVersion = 0
+    /// Vertices on the selected journey, and how many of those are actually
+    /// in the route source. The gap is the off-screen tail a follow camera
+    /// must not ask Mapbox to reproject. Written by the map, out of
+    /// observation so a slice change does not invalidate SwiftUI.
+    @ObservationIgnored var routePathPoints = 0
+    @ObservationIgnored var drawnRoutePoints = 0
 
     /// Fixed cableway infrastructure in and around the viewport, sourced from
     /// the full service day rather than only the vehicles alive this minute.
@@ -277,6 +291,7 @@ final class AppModel {
     /// rebuilding features that have not changed.
     private(set) var plateRevision = 0
     private(set) var selectedGeometry: JourneyGeometry?
+    private(set) var selectedGeometryLoading = false
     /// Advances only when the highlighted route changes. The map uses this
     /// rather than treating every live-position tick as a route update.
     private(set) var selectedGeometryRevision = 0
@@ -310,6 +325,16 @@ final class AppModel {
     /// workings, one for Solothurn and one for Sumiswald-Grünen, and neither of
     /// them is the journey on the panel.
     private(set) var selectedBranches: [RouteBranch] = []
+    /// Where the selected train comes apart, from whichever source knows.
+    ///
+    /// The packed through-services first, because they are on the device and
+    /// answer at once; the formation service's account replaces it when that
+    /// arrives, because it is the one that can say which coaches go where.
+    /// The card reads this rather than the formation, so a train that parts
+    /// says so while its drawing is still loading — and says so at all for the
+    /// operators that publish no formation.
+    private(set) var vehicleSplit: TrainFormation.Split?
+    var preferredSplitJourneyID: String?
 
     struct RouteBranch: Equatable, Identifiable {
         var id: String { journeyID ?? destination ?? splitAt }
@@ -324,6 +349,7 @@ final class AppModel {
         /// Whether the line follows mapped track or is a chord between stops —
         /// the same distinction the main route draws solid or dashed.
         var exact: Bool
+        var geometry: JourneyGeometry?
         var destination: String?
         var journeyID: String?
         /// The coaches that go this way, where the formation says which.
@@ -355,6 +381,10 @@ final class AppModel {
     /// Which train `formation` describes, so a panel re-reading fifteen times a
     /// second asks the network once.
     private var formationKey: FormationKey?
+    /// The vehicle `formation` was asked for, so a change of working on the
+    /// same physical train can keep the last answer on screen while the next
+    /// one loads instead of blinking the section out.
+    private var formationVehicleID: String?
     private let formations = FormationService(token: Secrets.formationToken)
 
     /// How full the selected vehicle is, where OJP publishes a forecast.
@@ -378,11 +408,20 @@ final class AppModel {
     /// times a second asks the network once.
     private var loadKey: LoadService.Key?
     private let loads = LoadService(token: Secrets.ojpToken)
+    /// Pinned departures and arrivals. Shared with the background-task
+    /// handler, which can run before `start()` has finished reading the
+    /// timetable.
+    let liveActivities = LiveActivityController.shared
     /// Foreground requests belonging to the selected panel. These used to be
     /// fire-and-forget tasks, so changing selection or leaving the app did not
     /// cancel their sockets and stale answers could still mutate the new card.
     private var selectionTask: Task<Void, Never>?
+    private var selectedRouteTask: Task<Void, Never>?
+    private var selectedRouteKey: String?
+    private var selectedRouteRetryAt = Date.distantPast
     private var occupancyTask: Task<Void, Never>?
+    private var occupancyRefreshTask: Task<Void, Never>?
+    private var occupancyFailures = 0
     private var occupancyVehicleID: String?
     private var occupancyRequestGeneration: UInt64 = 0
     private var formationTask: Task<Void, Never>?
@@ -448,6 +487,36 @@ final class AppModel {
         return low...high
     }
 
+    private(set) var selectionRevision: UInt64 = 0
+    @ObservationIgnored private var panelDismissalInProgress = false
+    @ObservationIgnored private var interactionRevision: UInt64 = 0
+    @ObservationIgnored private var isReplacingSelection = false
+
+    /// A renderer/actor lookup may finish after another tap, navigation or Done.
+    /// Only the latest interaction is allowed to change what is open.
+    func beginSelectionInteraction() -> UInt64 {
+        interactionRevision &+= 1
+        return interactionRevision
+    }
+
+    func selectionInteractionIsCurrent(_ revision: UInt64) -> Bool {
+        revision == interactionRevision && !Task.isCancelled && !backgroundWorkSuspended
+    }
+
+    func beginPanelDismissal() {
+        panelDismissalInProgress = true
+        interactionRevision &+= 1
+        settlePanelPresentation()
+        onMapOverlays?()
+    }
+
+    func finishPanelDismissal() {
+        panelDismissalInProgress = false
+        onMapOverlays?()
+    }
+
+    var showsSelectionOnMap: Bool { selection != .none && !panelDismissalInProgress }
+
     var selection: Selection = .none {
         didSet {
             // Nothing to do when it lands on what it already was. Dismissing the
@@ -456,6 +525,23 @@ final class AppModel {
             // history and start another refresh underneath a navigation bar
             // already being torn down.
             guard selection != oldValue else { return }
+            // New timings belong to the existing board, including its polling
+            // task and expanded rows. Do not cancel and restart that request.
+            if isReplacingSelection {
+                switch (oldValue, selection) {
+                case let (.station(old), .station(new)) where old.id == new.id:
+                    return
+                case let (.platform(old), .platform(new)) where old.id == new.id:
+                    return
+                default: break
+                }
+            }
+            // A refreshed board is still the same presentation. Treating it
+            // as a new tap can reopen the sheet after Done finishes dismissing.
+            if !isReplacingSelection {
+                selectionRevision &+= 1
+                interactionRevision &+= 1
+            }
             // A tap on the map starts a fresh trail. Only the panels navigate,
             // and they say so by going through `push`.
             if !isNavigating, !history.isEmpty { history.removeAll() }
@@ -471,7 +557,23 @@ final class AppModel {
             // a tap that did not land. Coalesced, so a sheet writing `.none`
             // back over its own dismissal still costs one.
             cancelSelectionWork(clearPresentation: true)
+            switch selection {
+            case .station, .platform, .choices, .track, .line: panelFold = 0
+            default: break
+            }
+            // Moving trains and intermediate stops can open from the map's
+            // snapshot. At the last stop, resolve the outgoing working first:
+            // seeding the arrival here briefly advertised "Terminal stop"
+            // before the whole card changed to the departure's destination.
+            if case let .vehicle(id) = selection,
+               let visible = vehicles.first(where: { $0.id == id }),
+               !visible.isStandingAtLastStop {
+                selectedVehicle = visible
+                setSelectedGeometry(visible.geometry)
+            }
+            if selection != .none { settlePanelPresentation() }
             requestTick()
+            repaceIfNeeded()
             scheduleSelectionRefresh()
         }
     }
@@ -517,6 +619,7 @@ final class AppModel {
     /// Close whatever is open, without touching the selection.
     func requestDismiss() {
         guard selection != .none else { return }
+        interactionRevision &+= 1
         dismissRequests += 1
     }
 
@@ -531,6 +634,9 @@ final class AppModel {
     /// Replace what is on screen with a better answer to the same question —
     /// a board refilled from the mirror — without it counting as a move.
     private func replace(_ next: Selection) {
+        let wasReplacing = isReplacingSelection
+        isReplacingSelection = true
+        defer { isReplacingSelection = wasReplacing }
         withoutClearingHistory { selection = next }
     }
 
@@ -572,7 +678,12 @@ final class AppModel {
             onFrameRoute?(line.geometry?.path ?? [])
         case let .vehicle(id):
             guard let vehicle = await fleet.journey(id: id, at: clock.nowSeconds()) else { return }
-            onFocus?(Coord(lon: vehicle.lon, lat: vehicle.lat), max(zoom, 14))
+            guard selection == .vehicle(id) else { return }
+            if isFollowingVehicle {
+                onZoom?(max(zoom, 14))
+            } else {
+                onFocus?(Coord(lon: vehicle.lon, lat: vehicle.lat), max(zoom, 14))
+            }
         case .service:
             // A scheduled service has no honest current point to centre on and
             // no map vehicle to follow.
@@ -600,12 +711,6 @@ final class AppModel {
             case let .station(station):
                 selection = .station(station)
                 onFocus?(board.coordinate, max(zoom, 14))
-                if station.departures.isEmpty {
-                    let now = clock.nowSeconds()
-                    Task { [weak self] in
-                        await self?.fillStationFromMirror(placeId: station.id, at: now)
-                    }
-                }
             case let .platform(platform):
                 selection = .platform(platform)
                 onFocus?(board.coordinate, max(zoom, 14))
@@ -648,6 +753,16 @@ final class AppModel {
             Settings.set(hiddenModes, "hiddenModes")
         }
     }
+
+    func toggleHidden(_ mode: Mode) {
+        if hiddenModes.contains(mode) {
+            hiddenModes.remove(mode)
+        } else {
+            hiddenModes.insert(mode)
+        }
+        requestTick()
+    }
+
     var showStops = Settings.bool("showStops", or: true) {
         didSet {
             guard showStops != oldValue else { return }
@@ -710,6 +825,9 @@ final class AppModel {
         var parts = 0
         var stops = 0
         var tracks = 0
+        /// Vertices on the selected journey, and how many reached the source.
+        var routePathPoints = 0
+        var drawnRoutePoints = 0
         /// Frames the map actually rendered, per second.
         ///
         /// Not the same thing as the tick rate and not derived from it. Mapbox
@@ -754,6 +872,9 @@ final class AppModel {
         var load = DeviceLoad.Sample()
         /// Where a tick's milliseconds actually go. See `TickCost`.
         var cost = TickCost()
+        /// GeoJSON write round-trip through Mapbox's serial queue. Zero unless
+        /// `-frameProbe YES` has been stamping `dataId`s. See `GeoJSONQueueProbe`.
+        var queue = GeoJSONQueueProbe.Snapshot()
 
         /// The tick, broken into the four things it does, in milliseconds.
         ///
@@ -807,7 +928,7 @@ final class AppModel {
     enum VehicleFollow: Equatable {
         /// Open, and the camera is wherever it was left.
         case off
-        /// The camera holds the vehicle, north up.
+        /// The camera holds the vehicle and leaves heading alone.
         case centred
         /// And turns with it, so the vehicle always runs up the screen.
         case bearing
@@ -824,7 +945,27 @@ final class AppModel {
     }
 
     private(set) var vehicleFollow: VehicleFollow = .off {
-        didSet { repaceIfNeeded() }
+        didSet {
+            if vehicleFollow == .off { spentVehicleApproach = nil }
+            repaceIfNeeded()
+        }
+    }
+
+    /// A tap on the open vehicle has already bought the close-up for this id.
+    /// The next tap advances the follow cycle instead of zooming again.
+    private var spentVehicleApproach: String?
+
+    /// Sit the followed vehicle lower on the screen while the sheet is the
+    /// compact follow bar — the map chrome is gone and the card is a strip
+    /// at the bottom, so the old fifth-of-the-height lift leaves it too high.
+    var followLockLow = false
+
+    /// Drop heading lock but keep chasing the vehicle. A two-finger rotate
+    /// (or the compass) asked for a heading of its own; snapping back to the
+    /// train's bearing would undo it.
+    func releaseFollowBearing() {
+        guard vehicleFollow == .bearing else { return }
+        vehicleFollow = .centred
     }
 
     /// Whether the camera is currently chasing the selected vehicle at all.
@@ -877,8 +1018,9 @@ final class AppModel {
     /// it is held changed".
     @discardableResult
     func tappedOpenVehicle() -> Bool {
-        if let closer = approachZoom() {
+        if case let .vehicle(id) = selection, let closer = approachZoom() {
             if vehicleFollow == .off { vehicleFollow = .centred }
+            spentVehicleApproach = id
             onZoom?(closer)
             return true
         }
@@ -894,12 +1036,17 @@ final class AppModel {
     /// *before* this one, or nil, in exactly the moments a second tap lands in.
     /// Unknown either way, the tap falls through to the cycle rather than
     /// guessing a zoom.
+    ///
+    /// Spent after one approach for this vehicle. The follow camera writes
+    /// every frame and used to cancel the zoom ease, so each tap only gained a
+    /// little height and the bearing lock took four presses to reach.
     private func approachZoom() -> Double? {
         // Not out of the bearing lock. Reaching it means the map was already
         // close enough to have skipped the approach, and a tap there is the
         // reader asking to be let go of — turning it into a zoom would make the
         // cycle a place with no way out.
         guard case let .vehicle(id) = selection, vehicleFollow != .bearing else { return nil }
+        if spentVehicleApproach == id { return nil }
         let found = vehicles.first { $0.id == id }
             ?? (selectedVehicle?.id == id ? selectedVehicle : nil)
         guard let mode = found?.mode else { return nil }
@@ -1083,6 +1230,8 @@ final class AppModel {
     /// while empty, and never touched afterwards. The map computed 182 vehicles
     /// and drew none of them.
     var onFrame: (() -> Void)?
+    /// Fixed overlays must be publishable while a vehicle query is still busy.
+    var onMapOverlays: (() -> Void)?
 
     /// Tell the map how fast the model intends to feed it, whenever that
     /// changes. Set by the coordinator, which owns the renderer.
@@ -1129,9 +1278,11 @@ final class AppModel {
     /// move was possible.
     var onLocate: (() -> Void)?
 
-    /// Ask the map to tilt. Set by the coordinator, for the same reason: the
-    /// camera is the coordinator's and nothing else may set one.
-    var onTilt: ((Double) -> Void)?
+    /// Show or hide the fleet overlay. Set by the coordinator so a route-map
+    /// toggle can flip layer visibility on the same tap, without waiting for
+    /// SwiftUI to rebuild the representable.
+    var onSetVehiclesVisible: ((Bool) -> Void)?
+
 
     /// Which of the three the button is showing.
     ///
@@ -1165,18 +1316,21 @@ final class AppModel {
             guard isClockPlaying != oldValue else { return }
             clock.setPlaying(isClockPlaying)
             requestTick()
+            repaceIfNeeded()
         }
     }
 
     /// How strongly the railway network is drawn under everything else.
     ///
-    /// A dial rather than a switch, because the right amount depends on the
-    /// basemap and on what is being looked at: enough to see which line a train
-    /// is on, not so much that the country turns into a diagram.
-    var trackOpacity: Double = Settings.double("trackOpacity", or: 0.55, in: 0...1) {
+    /// Full, always. It used to be a dial whose default left the overlay a
+    /// wash; taking the dial away without pinning this would have kept that
+    /// wash stored, with nothing on the map to turn it up. A launch argument
+    /// can still set it, for the same screenshots it always could.
+    var trackOpacity: Double = 1 {
         didSet {
             guard trackOpacity != oldValue else { return }
             Settings.set(trackOpacity, "trackOpacity")
+            requestTrackRefresh()
         }
     }
 
@@ -1207,7 +1361,7 @@ final class AppModel {
     /// true and the Mittelland is flat — which is also true, and throws away
     /// the only cue that the line through Olten is on a slope at all. Past
     /// about 2 the country becomes a relief model and the trains climb walls.
-    var terrainExaggeration = Settings.double("terrainExaggeration", or: 1.3, in: 0.5...2.5) {
+    var terrainExaggeration = Settings.double("terrainExaggeration", or: 1, in: 0.5...2.5) {
         didSet {
             guard terrainExaggeration != oldValue else { return }
             Settings.set(terrainExaggeration, "terrainExaggeration")
@@ -1230,7 +1384,11 @@ final class AppModel {
     }
 
     /// Whether a tilted, close-in map draws its vehicles as solids.
-    var solidVehicles = Settings.bool("solidVehicles", or: true) {
+    ///
+    /// On, always. It used to be a switch; taking the switch away without
+    /// pinning this would have left a stored Off with nothing on the map to
+    /// turn the bodies back on. A launch argument can still flatten them.
+    var solidVehicles = true {
         didSet {
             guard solidVehicles != oldValue else { return }
             Settings.set(solidVehicles, "solidVehicles")
@@ -1238,12 +1396,10 @@ final class AppModel {
         }
     }
 
-    /// Whether a wagon in a tunnel is drawn as a ghost.
+    /// Whether tunnelled vehicles give way to a small position marker.
     ///
-    /// On: it fades to nothing over the portal so the mountain is not a
-    /// train standing on the ridge. Off: tunnels are ignored and the body
-    /// stays solid, which is the wrong place but useful when checking a
-    /// rake against the hillside.
+    /// On: the body fades to a dot in tunnels, while station platforms remain
+    /// visible. Off: the body stays solid throughout the route.
     var ghostTunnels = Settings.bool("ghostTunnels", or: true) {
         didSet {
             guard ghostTunnels != oldValue else { return }
@@ -1259,7 +1415,7 @@ final class AppModel {
     /// a control somebody is holding while watching the map: a setting that
     /// waits for whatever happens to move next reads as a control that does not
     /// work. See `MapCoordinator.applyLightPreset`, which is where it lands.
-    var lightPreset: Terrain3D.LightPreset = Settings.choice("lightPreset", or: .night) {
+    var lightPreset: Terrain3D.LightPreset = Settings.choice("lightPreset", or: .auto) {
         didSet {
             guard lightPreset != oldValue else { return }
             Settings.set(lightPreset, "lightPreset")
@@ -1316,19 +1472,19 @@ final class AppModel {
     /// A two-finger vertical drag has always done this and remains the fastest
     /// way; it is also the least-known gesture on any phone map, and everything
     /// above is invisible until somebody performs it.
-    func tilt(to pitch: Double) { onTilt?(pitch) }
 
     /// Which of the two railway overlays is on screen.
     ///
-    /// Off, the network is the app's own: drawn from the routing graph, two
-    /// flat colours, right as a hint under the vehicles and near-invisible
-    /// when the railway *is* what you are reading. On, it is OpenRailwayMap's
-    /// own standard style from their vector tiles — orange main lines, yellow
-    /// branches, olive narrow gauge, each with a casing. See `RailwayLines`.
+    /// Off, Simple (the default): the routing graph in the same red and green
+    /// as the vehicles. On, ORM: OpenRailwayMap's own standard style from
+    /// their vector tiles — orange main lines, yellow branches, olive narrow
+    /// gauge, each with a casing. See `RailwayLines`.
     var highContrastTracks = Settings.bool("highContrastTracks", or: false) {
         didSet {
             guard highContrastTracks != oldValue else { return }
             Settings.set(highContrastTracks, "highContrastTracks")
+            onMapOverlays?()
+            requestTrackRefresh()
             requestTick()
         }
     }
@@ -1338,23 +1494,40 @@ final class AppModel {
     /// The same bargain the platform shapes make, for the same reason: the
     /// graph overlay works with no signal and theirs does not, so the app's own
     /// network only stands down once a line tile has been seen — and comes back
-    /// if the source starts failing. Otherwise switching to high contrast on a
-    /// train in a tunnel would leave the map with no railway on it at all.
+    /// if the source starts failing. Otherwise switching to ORM on a train in
+    /// a tunnel would leave the map with no railway on it at all.
     private(set) var railwayLinesDrawn = false
 
     func railwayLines(arrived: Bool) {
         guard arrived != railwayLinesDrawn else { return }
         railwayLinesDrawn = arrived
+        requestTrackRefresh()
         requestTick()
     }
 
+    /// Packed graph coverage. Outside it there is no Simple overlay to draw,
+    /// so ORM tiles take over — the Watch clip was Switzerland-only; the
+    /// phone renders railways wherever the map goes.
+    static let graphCoverage = BBox(west: 5.7, south: 45.7, east: 10.7, north: 48.0)
+
+    /// ORM when the user asked for it, or when the graph has nothing here.
+    var usesORMTracks: Bool { highContrastTracks || !Self.graphCoverage.intersects(viewport) }
+
     /// Whether the network drawn from the routing graph is the one on screen.
-    var ownTracksDrawn: Bool { !(highContrastTracks && railwayLinesDrawn) }
+    var ownTracksDrawn: Bool { !(usesORMTracks && railwayLinesDrawn) }
 
     /// The viewport, set by the map as it moves.
-    var viewport = BBox(west: 5.9, south: 45.8, east: 10.5, north: 47.8)
+    var viewport = BBox(west: 5.9, south: 45.8, east: 10.5, north: 47.8) {
+        didSet {
+            requestTrackRefresh()
+            coverViewportIfNeeded()
+        }
+    }
     var zoom = 7.4 {
-        didSet { repaceIfNeeded() }
+        didSet {
+            requestTrackRefresh()
+            repaceIfNeeded()
+        }
     }
     /// Metres of ground per screen point at the current camera.
     ///
@@ -1401,6 +1574,20 @@ final class AppModel {
         // called, which is how a recorded snapshot is replayed.
         let snapshot = URL.applicationSupportDirectory.appendingPathComponent("fleet.bin")
         fleet = Fleet(snapshotURL: snapshot)
+        if let clip = opening.clip {
+            viewport = clip
+            zoom = opening.zoom
+        }
+        // Start the packed read now, not from the window's `.task`. That task
+        // waits for the first layout, and the first layout creates the Mapbox
+        // view — on a cold process that is tens of seconds in front of the
+        // timetable, which is the 37 s "reading" half of an 83 s country
+        // launch. Previews set `XCODE_RUNNING_FOR_PREVIEWS` and stay local.
+        if ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] != "1" {
+            Task { @MainActor in
+                await self.start()
+            }
+        }
     }
 
     // MARK: - Launch
@@ -1420,25 +1607,33 @@ final class AppModel {
     /// after the fleet is drawn, so a clipped draw would be a clip of the
     /// wrong place — and the whole point of those arguments is a reproducible
     /// screenshot, which a fleet still filling in is not.
+    ///
+    /// A country-sized window is not drawn on the curtain. Expanding 25,000
+    /// journeys is what turned a zoomed-out launch into a minute of black
+    /// screen; the first frame draws the city under the camera and the rest
+    /// of the country is filled in once the map is up.
     private func openingClip() -> BBox? {
         guard UserDefaults.standard.object(forKey: "startLat") == nil else { return nil }
-        return opening.clip
+        let local = OpeningCamera.viewport(
+            centre: opening.coordinate, zoom: OpeningCamera.localZoom
+        )
+        guard let clip = opening.clip else { return local }
+        if clip.east - clip.west > (local.east - local.west) * 2.5 {
+            return local
+        }
+        return clip
     }
 
-    /// The rest of the country, and the rails under it, once the map is up.
+    /// Rails, nearby services, and the rest of the timetable's geography,
+    /// once the map is up.
     ///
-    /// Both of these used to be in front of the reader. Together they were 74%
-    /// of a launch — a national timetable expansion and a corridor match for
-    /// every running train — and neither is needed to draw the viewport that is
-    /// about to appear. They are needed *soon*: a pan two valleys over wants
-    /// the fleet already built, and a zoom out to the whole network wants the
-    /// trains already on their rails. Soon is what a background task is for.
-    ///
-    /// Ordered, not parallel. Completing the fleet first means the geometry
-    /// warm that follows covers the whole country rather than the viewport it
-    /// would have found a moment earlier — and both run on the fleet actor
-    /// anyway, so racing them would only interleave them badly.
-    private func finishOpening(at moment: Date) {
+    /// None of this used to wait. Together a national timetable expansion, a
+    /// corridor match for every running train, and the 31 MB route store were
+    /// most of a launch — and none of it is needed to draw the viewport that
+    /// is about to appear. A pan two valleys over wants the new ground built
+    /// then, not speculatively now. The rails under *this* viewport are needed
+    /// soon, which is what a background task is for.
+    private func finishOpening(at moment: Date, railsTask: Task<RailNet, Never>? = nil) {
         openingTask?.cancel()
         guard !backgroundWorkSuspended else {
             openingFinished = false
@@ -1448,44 +1643,113 @@ final class AppModel {
         openingTask = Task { [weak self] in
             guard let self else { return }
             let started = Date()
-            let grew = await self.fleet.completeTimetable()
-            if Task.isCancelled || self.backgroundWorkSuspended { return }
-            if grew {
-                let status = await self.fleet.currentStatus()
-                guard !Task.isCancelled, !self.backgroundWorkSuspended else { return }
-                self.status = status
+
+            if let railsTask {
+                let net = await railsTask.value
+                // Snapshot before installRailnet takes ownership of the graph.
+                if net.isReady { self.trackOverlay = net.trackOverlay() }
+                let nodeCount = net.nodeCount
+                await self.refreshTracksIfNeeded()
+                await self.fleet.installRailnet(net)
+                if var held = self.loaded {
+                    held.railnetNodes = nodeCount
+                    self.loaded = held
+                }
+                Self.log.notice("rails: \(nodeCount) nodes, tracks \(self.tracks.count)")
                 self.requestTick()
             }
-            let expanded = Date().timeIntervalSince(started)
 
-            // Opening is complete once the timetable exists. The national
-            // geometry pass below is only a speculative cache warm, so a
-            // Low-Power transition may cancel it without making resume repeat
-            // the timetable expansion or pretending launch is unfinished.
+            // Routes, platform plates, then the leg cache those feed.
+            // The overlay graph is already in if `rails` ran; `loadSupporting`
+            // skips it. This is what puts vehicles on their rails a moment
+            // later, not what paints the track overlay.
+            if let directory = self.dataDirectory {
+                let extra = await self.fleet.loadSupporting(from: directory)
+                if Task.isCancelled || self.backgroundWorkSuspended { return }
+                if !extra.problems.isEmpty, var held = self.loaded {
+                    held.problems.append(contentsOf: extra.problems)
+                    self.loaded = held
+                }
+                await self.fleet.openLegCache(
+                    at: URL.applicationSupportDirectory.appendingPathComponent("leg-cache.json"),
+                    seededBy: directory.appendingPathComponent("leg-cache.json")
+                )
+                if Task.isCancelled || self.backgroundWorkSuspended { return }
+                self.requestTick()
+            }
+            let rails = Date().timeIntervalSince(started)
+
+            // A little more than the opening clip, so a short pan does not
+            // wait on another expand. Not the country.
+            if let clip = self.openingClip() {
+                let grew = await self.fleet.expandTimetable(to: clip.padded(by: 0.5))
+                if Task.isCancelled || self.backgroundWorkSuspended { return }
+                if grew {
+                    let status = await self.fleet.currentStatus()
+                    guard !Task.isCancelled, !self.backgroundWorkSuspended else { return }
+                    self.status = status
+                    self.requestTick()
+                }
+            }
+
             self.openingFinished = true
 
-            // National geometry is a speculative warm: a cold viewport now
-            // queues the same work off the frame. Keep the complete timetable
-            // in Low Power/thermal states, but do not precompute rails the
-            // reader may never pan to while the phone is asking us to back off.
             if self.powerFactor == 1 {
-                await self.fleet.warmTrainGeometry(
-                    inBackground: Timestamp(moment.timeIntervalSince1970)
-                )
+                while !Task.isCancelled, !self.backgroundWorkSuspended, self.powerFactor == 1 {
+                    let more = await self.fleet.prefetchTimetableGeography()
+                    if !more { break }
+                    try? await Task.sleep(for: .milliseconds(30))
+                }
             }
             if Task.isCancelled || self.backgroundWorkSuspended { return }
-            // Last, because these are the only ones that never finish, and
-            // the two that do should not be queued behind them.
             if self.powerFactor == 1 {
                 self.keepRefining()
                 self.keepTimingsLive()
             }
             Self.log.notice(
-                "opened: country in \(expanded * 1000, format: .fixed(precision: 0))ms, rails in \(Date().timeIntervalSince(started) * 1000 - expanded * 1000, format: .fixed(precision: 0))ms"
+                "opened: rails in \(rails * 1000, format: .fixed(precision: 0))ms, nearby in \(Date().timeIntervalSince(started) * 1000 - rails * 1000, format: .fixed(precision: 0))ms"
             )
             self.openingTask = nil
         }
     }
+
+    private var dataDirectory: URL?
+
+    /// Expand the timetable to cover the camera, when it has left the region
+    /// already built. A pinch-out is the usual case; a pan onto a new city is
+    /// the other. Coalesced onto one task so a gesture that reports twenty
+    /// viewports does not start twenty expands.
+    private func coverViewportIfNeeded() {
+        guard started, !isLoading, !backgroundWorkSuspended else { return }
+        coverageGeneration &+= 1
+        if coverageTask != nil { return }
+        coverageTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.coverageTask = nil }
+            repeat {
+                let generation = self.coverageGeneration
+                // A route overview can expose most of the country at once.
+                // Paint its rails before expanding the newly visible fleet.
+                await self.refreshTracksIfNeeded()
+                if Task.isCancelled || self.backgroundWorkSuspended { return }
+                let box = self.viewport
+                let covered = await self.fleet.covers(box)
+                if Task.isCancelled || self.backgroundWorkSuspended { return }
+                if !covered {
+                    let grew = await self.fleet.expandTimetable(to: box)
+                    if Task.isCancelled || self.backgroundWorkSuspended { return }
+                    if grew {
+                        self.status = await self.fleet.currentStatus()
+                        self.requestTick()
+                    }
+                }
+                if generation == self.coverageGeneration { break }
+            } while !Task.isCancelled && !self.backgroundWorkSuspended
+        }
+    }
+
+    private var coverageTask: Task<Void, Never>?
+    private var coverageGeneration: UInt64 = 0
 
     private var openingTask: Task<Void, Never>?
     private var openingFinished = false
@@ -1551,8 +1815,8 @@ final class AppModel {
     /// platform's. So it takes the nearest to the middle of the screen first
     /// and leaves `liveTimingGap` between requests — the vehicle somebody is
     /// most likely to reach for is right within a few seconds, a screenful
-    /// inside a minute or two, and then it idles, because a run that has been
-    /// asked about is `monitored` and drops out of the set.
+    /// inside a minute or two. Each answer is held for four minutes before
+    /// that working becomes eligible again, even while the camera stays still.
     ///
     /// It does not fix every case on its own, and is not meant to. What lands
     /// while the reader is already looking still lands, and that is what
@@ -1606,7 +1870,14 @@ final class AppModel {
         guard !backgroundWorkSuspended, dataMode == .all, powerFactor == 1,
               await loads.isConfigured else { return 0 }
         let now = Timestamp(clock.nowSeconds())
-        let candidates = await fleet.awaitingLiveTiming(in: viewport, at: now)
+        let recent = Set(sweptTimings.compactMap { key, askedAt in
+            Date().timeIntervalSince(askedAt) < Self.liveTimingHold ? key.journeyID : nil
+        })
+        // Filter before Fleet takes its nearest eight. Otherwise recently
+        // checked trains can occupy every slot and starve the rest of the map.
+        let candidates = await fleet.awaitingLiveTiming(
+            in: viewport, at: now, excludingJourneyRefs: recent
+        )
         guard !candidates.isEmpty else { return 0 }
 
         var asked = 0
@@ -1646,58 +1917,43 @@ final class AppModel {
 
 
     func start() async {
+        guard !bootBegun else { return }
+        bootBegun = true
+        boot.noteStarted()
         let directory = Bundle.main.resourceURL?.appendingPathComponent("Data")
             ?? Bundle.main.bundleURL
 
         boot.stage = .reading
-        let result = await fleet.load(from: directory)
-        loaded = result
-        await fleet.configure(token: Secrets.realtimeToken)
-
-        // Routed legs, kept between launches. Every one of these is a Dijkstra
-        // over a 573,000-node graph that has already been run once, and the run
-        // happens on the fleet actor — the same actor the draw loop and every
-        // map tap go through. See `Fleet.openLegCache`.
-        boot.stage = .caches
-        await fleet.openLegCache(
-            at: URL.applicationSupportDirectory.appendingPathComponent("leg-cache.json"),
-            seededBy: directory.appendingPathComponent("leg-cache.json")
-        )
-
-        // What previous runs learned about individual trains, seeded with what
-        // the app already knew when it was built. The seed matters more than it
-        // looks: installing from Xcode wipes the container, so without it every
-        // build starts the map back at the library's guesses and everything the
-        // app had been told has to be learned again.
-        //
-        // Read before the first frame, so a train whose formation is already
-        // known is never drawn from the guess and corrected a moment later.
-        boot.stage = .learned
+        // Stops, operators, stop dots and the mapped timetable — not the 31 MB
+        // of route relations. The railway graph *is* needed for the first
+        // frame's track overlay, but it is a 17 MB read that does not touch
+        // the fleet actor, so it runs beside the packed timetable rather than
+        // behind `routes.bin` (which is why the rails used to arrive ten
+        // seconds after the vehicles).
+        let fleet = self.fleet
+        let railURL = directory.appendingPathComponent("railnet.bin")
+        let railsTask = Task.detached(priority: .userInitiated) {
+            let net = RailNet()
+            try? net.load(railURL)
+            return net
+        }
+        let loadTask = Task(priority: .userInitiated) {
+            await fleet.load(from: directory, supporting: false)
+        }
         layouts.load(seededBy: Bundle.main.url(
             forResource: "vehicle-layouts", withExtension: "json"
         ))
-
-        // And the formations themselves, kept between launches. The layout
-        // store remembers what a train is *shaped* like; this remembers the
-        // answer that shape came from, so opening a train the map already asked
-        // about in the background costs nothing at all.
-        await formations.keepAnswers(
-            in: URL.applicationSupportDirectory.appendingPathComponent("formations")
+        let result = await loadTask.value
+        loaded = result
+        await fleet.configure(token: Secrets.realtimeToken)
+        liveActivities.configure(
+            fleet: fleet, loads: loads, clock: clock, dataMode: { [weak self] in
+                self?.dataMode ?? .off
+            }
         )
-
-        // Disruptions. The line join needs the operator register the fleet
-        // already loaded, and the stored notices are read before the first
-        // fetch so a launch has something to say in the seconds before the
-        // network answers.
-        boot.stage = .disruptions
-        await situations.configure(token: Secrets.sxToken)
-        // Before `keepAnswers`, so a catalogue stored by an earlier session is
-        // not read back in when the setting says it is not wanted.
-        await situations.setIncludesPlanned(dataMode == .all)
-        let names = await fleet.operatorNamer()
-        await situations.nameOperators(with: names)
-        await situations.keepAnswers(
-            in: URL.applicationSupportDirectory.appendingPathComponent("situations")
+        dataDirectory = directory
+        await fleet.openGeographyCache(
+            at: URL.applicationSupportDirectory.appendingPathComponent("timetable-geography.bin")
         )
 
         // Draw the country from the printed timetable, which needs no network
@@ -1716,30 +1972,37 @@ final class AppModel {
         // And drawn for the *viewport*, not for the country. See
         // `OpeningCamera`: expanding the window nationally builds 25,518
         // journeys and half a million calls, of which a phone opened on one
-        // canton draws about a thousand. The rest are built behind the map
-        // rather than in front of it — `finishOpening` below.
+        // canton draws about a thousand. The rest of the country is not filled
+        // in behind the map — a pan or a zoom-out asks for the new ground.
         boot.stage = .drawing
         let moment = Date(timeIntervalSince1970: clock.now())
         var drew = await fleet.drawTimetable(at: moment, in: openingClip())
         // A viewport with no service in it is a real answer — a rural valley at
         // four in the morning — and it must not be mistaken for a build with no
-        // timetable. Ask for the country before falling back to the snapshot.
-        if !drew, openingClip() != nil {
-            drew = await fleet.drawTimetable(at: moment)
-        }
+        // timetable. Do not fall back to a national expansion on the curtain:
+        // that is the 45-second draw a zoomed-out launch used to wait through.
         if !drew {
             _ = await fleet.replayCachedSnapshot()
         }
         status = await fleet.currentStatus()
         await updateScrubRange()
         boot.stage = .ready
-        Self.log.notice("boot: \(self.boot.report(), privacy: .public), opened \(self.opening.where_.rawValue, privacy: .public)")
+        let report = self.boot.report()
+        Self.log.notice(
+            "boot: \(report, privacy: .public), opened \(self.opening.where_.rawValue, privacy: .public)"
+        )
+        let stamp = "\(report) opened \(opening.where_.rawValue)\n"
+        try? stamp.write(
+            to: URL.applicationSupportDirectory.appendingPathComponent("last-boot.txt"),
+            atomically: true, encoding: .utf8
+        )
         isLoading = false
+        Task { await fleet.prepareBoardIndexes() }
         // The stop register has just been read off disk, so whatever an
         // earlier tick cached for this box was cached against an empty store.
         stopsViewport = nil
-        await requestTickAndWait()
-        finishOpening(at: moment)
+        requestTick()
+        finishOpening(at: moment, railsTask: railsTask)
 
         // A development affordance: `-startOffsetMinutes 180` launches the map
         // three hours ahead. Switzerland's network is asleep between one and
@@ -1807,6 +2070,9 @@ final class AppModel {
         if defaults.object(forKey: "solidVehicles") != nil {
             solidVehicles = defaults.bool(forKey: "solidVehicles")
         }
+        if defaults.object(forKey: "showDiagnostics") != nil {
+            showDiagnostics = defaults.bool(forKey: "showDiagnostics")
+        }
         if defaults.object(forKey: "ghostTunnels") != nil {
             ghostTunnels = defaults.bool(forKey: "ghostTunnels")
         }
@@ -1836,8 +2102,52 @@ final class AppModel {
             }
         }
 
+        // `-openService IC61` opens the first matching running service, so a
+        // route screenshot is a command rather than a search typed by hand.
+        if let wanted = defaults.string(forKey: "openService"), !wanted.isEmpty {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                for _ in 0..<60 {
+                    if vehicles.isEmpty {
+                        try? await Task.sleep(for: .seconds(1))
+                        continue
+                    }
+                    searchQuery = wanted
+                    try? await Task.sleep(for: .seconds(1))
+                    if let vehicle = searchResults.vehicles.first {
+                        await open(vehicle: vehicle)
+                        return
+                    }
+                }
+            }
+        }
+
+        // `-pinLiveActivity 1` pins the open board's next departure, and
+        // `-pinLiveActivity arrival` the selected vehicle's next stop, so a
+        // lock-screen screenshot does not depend on a swipe.
+        if defaults.object(forKey: "pinLiveActivity") != nil {
+            Task { @MainActor [weak self] in
+                await self?.pinDebugLiveActivity()
+            }
+        }
+
+        // `-openRelation 5661040` opens a mapped line by OSM id, so a route
+        // screenshot is a command rather than a tap on a serving row.
+        if defaults.object(forKey: "openRelation") != nil {
+            let id = Int32(defaults.integer(forKey: "openRelation"))
+            Task { @MainActor [weak self] in
+                guard let self, id != 0 else { return }
+                for _ in 0..<40 {
+                    if await fleet.routeLine(relationId: id) != nil { break }
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                await openRoute(relation: id)
+            }
+        }
+
         watchPower()
         started = true
+        coverViewportIfNeeded()
         // `start()` can outlive a trip to the background because its disk and
         // actor work is intentionally asynchronous. Do not resurrect loops for
         // a scene that entered the background while that work was in flight.
@@ -1846,7 +2156,35 @@ final class AppModel {
             startTicking()
             if powerFactor == 1 { startLearning() }
             restartRefreshLoop()
-            restartSituationLoop()
+        }
+        restoreStoredAnswers()
+    }
+
+    /// Formations and disruption notices kept from the last session.
+    ///
+    /// Not the first frame. The works catalogue in particular is large enough
+    /// that reading it in front of the curtain made a launch look stuck after
+    /// the map was already ready to draw. The situation loop starts once this
+    /// has restored the timestamps, so a cold start does not immediately
+    /// re-parse 113 MB of planned-works XML the file already holds.
+    private func restoreStoredAnswers() {
+        let formations = self.formations
+        let situations = self.situations
+        let includePlanned = dataMode == .all
+        Task { @MainActor [weak self] in
+            await formations.keepAnswers(
+                in: URL.applicationSupportDirectory.appendingPathComponent("formations")
+            )
+            await situations.configure(token: Secrets.sxToken)
+            await situations.setIncludesPlanned(includePlanned)
+            guard let self else { return }
+            let names = await self.fleet.operatorNamer()
+            await situations.nameOperators(with: names)
+            await situations.keepAnswers(
+                in: URL.applicationSupportDirectory.appendingPathComponent("situations")
+            )
+            guard !self.backgroundWorkSuspended, self.dataMode == .all else { return }
+            self.restartSituationLoop()
         }
     }
 
@@ -1856,6 +2194,9 @@ final class AppModel {
     /// and a refresh loop started there would fetch against an empty fleet with
     /// a cadence nobody had configured yet.
     private var started = false
+    /// `start()` is kicked from `init` and again from the window `.task`.
+    /// The second call must not reload the packed files.
+    private var bootBegun = false
 
     private func watchNetwork() {
         pathMonitor?.cancel()
@@ -1921,7 +2262,8 @@ final class AppModel {
         situationTask = Task { [weak self] in
             var next = ContinuousClock.now
             while !Task.isCancelled {
-                if await self?.situations.refresh() == true {
+                let allowPlanned = self?.openingFinished == true && self?.isOnWiFi == true
+                if await self?.situations.refresh(allowPlanned: allowPlanned) == true {
                     await self?.refreshDisruptions()
                 }
                 next += .seconds(60)
@@ -2098,6 +2440,10 @@ final class AppModel {
     /// its in-flight frame need to stop; Mapbox independently pauses its display
     /// link when the scene deactivates.
     func pausePresentation() {
+        // A system interruption can cancel UIKit's pan without delivering its
+        // final callback. Do not retain a presentation hold across activation.
+        panelTransitions.removeAll()
+        endPanelInteraction()
         guard !tickSchedulerSuspended else { return }
         tickTask?.cancel(); tickTask = nil
         tickSchedulerSuspended = true
@@ -2133,6 +2479,10 @@ final class AppModel {
             await fleet.cancelBackgroundGeometry()
         }
         openingTask?.cancel(); openingTask = nil
+        coverageTask?.cancel(); coverageTask = nil
+        trackRefreshGeneration &+= 1
+        trackRefreshTask?.cancel(); trackRefreshTask = nil
+        trackRefreshPending = false
         refineTask?.cancel(); refineTask = nil
         liveTimingTask?.cancel(); liveTimingTask = nil
         learningTask?.cancel(); learningTask = nil
@@ -2145,6 +2495,7 @@ final class AppModel {
         situationTask?.cancel(); situationTask = nil
         searchTask?.cancel(); searchTask = nil
         pathMonitor?.cancel(); pathMonitor = nil
+        liveActivities.enteredBackground()
     }
 
     /// Back on screen. A transient cover needs only a fresh frame; a real
@@ -2155,6 +2506,7 @@ final class AppModel {
             return
         }
         backgroundWorkSuspended = false
+        liveActivities.enteredForeground()
         let previousGeometryTransition = geometryLifecycleTask
         geometryLifecycleTask = Task { @MainActor [weak self, fleet] in
             _ = await previousGeometryTransition?.value
@@ -2169,6 +2521,9 @@ final class AppModel {
             self.watchNetwork()
             self.restartRefreshLoop()
             self.restartSituationLoop()
+            self.sweptTimings.removeAll()
+            await self.loads.forget()
+            guard !self.backgroundWorkSuspended, !Task.isCancelled else { return }
             if self.selection != .none {
                 self.scheduleSelectionRefresh()
             }
@@ -2188,6 +2543,8 @@ final class AppModel {
             }
             if !self.openingFinished {
                 self.finishOpening(at: Date(timeIntervalSince1970: self.clock.now()))
+            } else {
+                self.coverViewportIfNeeded()
             }
         }
     }
@@ -2368,6 +2725,9 @@ final class AppModel {
         // produces positions at is the rate the *whole map* moves at, and a map
         // stepping once a second is not a map anybody can read.
         if isFollowingVehicle { return .milliseconds(33) }
+        // Paused or held still: vehicles do not move, so a second is enough
+        // to keep the picture honest without a 15 Hz national walk.
+        if !clock.isPlaying { return .seconds(1) }
         // Far enough back that nothing visibly moves.
         //
         // A tick is not free at any zoom: `Fleet.vehicles` walks every running
@@ -2379,14 +2739,46 @@ final class AppModel {
         // point. Once a second is still finer than the screen can show, and it
         // is fifteen times less work.
         if zoom < Self.stillZoom { return .seconds(1) }
-        guard detailedVehicles, zoom >= VehicleShape.minZoom else {
-            return .milliseconds(66)
+        let live: Duration
+        if detailedVehicles, zoom >= VehicleShape.minZoom {
+            live = Self.pace(
+                noFasterThan: zoom >= 14 ? .milliseconds(33) : .milliseconds(50),
+                movingAt: fastestDrawn, metresPerPoint: metresPerPoint
+            )
+        } else {
+            live = .milliseconds(66)
         }
-        return Self.pace(
-            noFasterThan: zoom >= 14 ? .milliseconds(33) : .milliseconds(50),
-            movingAt: fastestDrawn, metresPerPoint: metresPerPoint
-        )
+        return stillCameraInterval(floor: live)
     }
+
+    /// Stretch the tick once the user is looking at a still picture.
+    ///
+    /// Separate from `powerFactor` and `mapObscured`. A close camera on a
+    /// moving vehicle is not a still picture: the rake covers many pixels a
+    /// second, and stretching the tick is what made a train step and its
+    /// wagons chatter. `pace()` already chose the 33 ms floor for that case.
+    private func stillCameraInterval(floor: Duration) -> Duration {
+        guard cameraIsSettled, let at = cameraSettledAt else { return floor }
+        if zoom >= VehicleShape.minZoom, fastestDrawn > 0 { return floor }
+        let still = CFAbsoluteTimeGetCurrent() - at
+        if still >= Self.stillCameraIdleAfter, selection == .none {
+            return max(floor, Self.stillCameraIdle)
+        }
+        if still >= Self.stillCameraHeldAfter {
+            return max(floor, Self.stillCameraHeld)
+        }
+        if still >= Self.stillCameraWarmAfter {
+            return max(floor, Self.stillCameraWarm)
+        }
+        return floor
+    }
+
+    private static let stillCameraWarmAfter: CFTimeInterval = 2
+    private static let stillCameraHeldAfter: CFTimeInterval = 5
+    private static let stillCameraIdleAfter: CFTimeInterval = 15
+    private static let stillCameraWarm = Duration.milliseconds(250)
+    private static let stillCameraHeld = Duration.milliseconds(400)
+    private static let stillCameraIdle = Duration.milliseconds(750)
 
     // MARK: - Backing off
 
@@ -2406,6 +2798,49 @@ final class AppModel {
             repaceIfNeeded()
         }
     }
+
+    /// Whether a finger or an app-started camera ease is in flight.
+    ///
+    /// Written only on true/false edges by `MapCoordinator`, out of
+    /// observation so a settle does not invalidate SwiftUI. `wantedInterval`
+    /// reads it to stretch the tick on a still picture without waiting for
+    /// thermal pressure.
+    @ObservationIgnored var cameraIsSettled = true {
+        didSet {
+            guard cameraIsSettled != oldValue else { return }
+            if cameraIsSettled {
+                cameraSettledAt = CFAbsoluteTimeGetCurrent()
+            } else {
+                cameraSettledAt = nil
+                requestTick()
+                if started, !backgroundWorkSuspended, powerFactor == 1 {
+                    keepRefining()
+                    if openingFinished {
+                        keepTimingsLive()
+                        startLearning()
+                    }
+                }
+            }
+            repaceIfNeeded()
+        }
+    }
+
+    /// When `cameraIsSettled` last became true, on the Core Foundation clock.
+    @ObservationIgnored private var cameraSettledAt: CFTimeInterval?
+
+    /// Formation learning can pause while the camera rests. Visible route and
+    /// timing updates must continue: a still camera can be watching moving
+    /// trains, and selecting one must not be what first makes it current.
+    private var cameraStillPausesBackground: Bool {
+        guard cameraIsSettled, let at = cameraSettledAt, !isFollowingVehicle else {
+            return false
+        }
+        return CFAbsoluteTimeGetCurrent() - at >= 5
+    }
+
+    /// `.serious` / `.critical` cap DEM exaggeration at 1. Not a global Fair
+    /// throttle — a still camera already backs off without waiting for heat.
+    @ObservationIgnored var thermalCapsTerrain = false
 
     /// The multiplier the phone's own state puts on every frame interval.
     ///
@@ -2465,6 +2900,11 @@ final class AppModel {
         default: thermal = 1
         }
         let factor = max(thermal, info.isLowPowerModeEnabled ? 2 : 1)
+        let capsTerrain = info.thermalState == .serious || info.thermalState == .critical
+        if capsTerrain != thermalCapsTerrain {
+            thermalCapsTerrain = capsTerrain
+            requestTick()
+        }
         guard factor != powerFactor else { return }
         let previous = powerFactor
         powerFactor = factor
@@ -2826,6 +3266,8 @@ final class AppModel {
         let hiddenModes: Set<Mode>
         let dotSpacing: Double
         let shapesPossible: Bool
+        let needsTunnelCoverage: Bool
+        let tunnelCoverage: BBox?
         let solidShapes: Bool
         let bakedModels: Bool
         let standingVehicles: Set<String>
@@ -2871,6 +3313,10 @@ final class AppModel {
             hiddenModes: hiddenModes,
             dotSpacing: spacing,
             shapesPossible: canDrawShapes,
+            needsTunnelCoverage: ghostTunnels,
+            tunnelCoverage: tunnelsViewport,
+            // Prepare solids only as the camera approaches their visible band.
+            // Keeping them ready on a flat map rebuilt invisible models every tick.
             solidShapes: detailedVehicles && solidVehicles
                 && VehicleShape.solidity(pitch: pitch, zoom: frameZoom) > 0,
             bakedModels: bakedModels,
@@ -2890,6 +3336,10 @@ final class AppModel {
     /// Query and publish one immutable frame. Called only by
     /// `drainTickRequests`, which is what makes the awaits below globally serial.
     private func performTick(generation: UInt64, epoch: UInt64) async -> Bool {
+        // A new viewport needs its rails before timetable expansion and vehicle
+        // geometry. On an unchanged viewport this is just a cache check.
+        await refreshTracksIfNeeded()
+        guard !tickSchedulerSuspended, epoch == tickEpoch, !Task.isCancelled else { return false }
         let frame = captureTickFrame(generation: generation, epoch: epoch)
         // Four marks, so the readout can say which of the tick's four parts
         // the loop is actually behind on. The first covers everything up to
@@ -2927,6 +3377,7 @@ final class AppModel {
                 ? $0.id < $1.id
                 : $0.mode.drawOrder < $1.mode.drawOrder
         }
+        found = CableService.collapse(found, selectedID: frame.selectedID)
         found = collapsedPointVehicles(found, selectedID: frame.selectedID)
         // What the next interval is paced off. See `pace`.
         var fastest = 0.0
@@ -3085,12 +3536,10 @@ final class AppModel {
         let box = viewport
         let now = Timestamp(clock.now().rounded(.down))
         let plateMark = plateRevision
-        let trackMark = tracks.count
         let routeMark = selectedGeometryRevision
         let cablewayMark = cablewaysRevision
+        let tunnelMark = tunnelRevision
 
-        await refreshTracksIfNeeded()
-        guard !backgroundWorkSuspended, !Task.isCancelled else { return }
         await refreshTunnelsIfNeeded()
         guard !backgroundWorkSuspended, !Task.isCancelled else { return }
         await refreshCablewaysIfNeeded(at: now)
@@ -3176,11 +3625,15 @@ final class AppModel {
         // source is guarded on its own revision, so this costs a handful of
         // integer comparisons on the ticks where nothing changed — which is
         // nearly all of them, on a map nobody is panning.
-        if restated || plateRevision != plateMark || tracks.count != trackMark
+        if restated || plateRevision != plateMark
             || cablewaysRevision != cablewayMark
             || selectedGeometryRevision != routeMark {
             onFrame?()
         }
+        // Occupancy must land as a new tick, not a redraw of the last
+        // footprints: those were built while the bores were still unknown
+        // and would flash the rake for a frame.
+        if tunnelRevision != tunnelMark { requestTick() }
 
         // Whether this phone is on one of the vehicles it has just drawn.
         //
@@ -3231,6 +3684,8 @@ final class AppModel {
             parts: vehicleShapes.reduce(0) { $0 + $1.parts.count },
             stops: stops.count,
             tracks: tracks.count,
+            routePathPoints: routePathPoints,
+            drawnRoutePoints: drawnRoutePoints,
             renderFps: renderFps,
             ticks: smoothedFrameSeconds > 0 ? 1 / smoothedFrameSeconds : 0,
             targetTicks: 1 / max(0.001, frameInterval.seconds),
@@ -3250,8 +3705,16 @@ final class AppModel {
             // Sampled on its own clock — see `DeviceLoad`, which will not do
             // the syscalls more than once a second whoever asks.
             load: DeviceLoad.sample(),
-            cost: tickCost
+            cost: tickCost,
+            queue: GeoJSONQueueProbe.shared.currentSnapshot()
         )
+        Diagnostics.note(String(
+            format: "fps=%.0f ticks=%.0f/%.0f route=%d/%d veh=%d cost=%.0f",
+            renderFps,
+            smoothedFrameSeconds > 0 ? 1 / smoothedFrameSeconds : 0,
+            1 / max(0.001, frameInterval.seconds),
+            drawnRoutePoints, routePathPoints, vehicles.count, tickCost.total
+        ))
     }
 
     /// How many vehicles may be drawn as shapes in one frame.
@@ -3337,9 +3800,25 @@ final class AppModel {
         return result
     }
 
+    private struct FootprintInput: Equatable {
+        var vehicle: VehicleSnapshot
+        var layout: VehicleLayout
+        var metresPerPoint: Double
+        var pixelsPerPoint: Double
+        var selected: Bool
+        var ringed: Bool
+        var lateral: Double
+        var solid: Bool
+        var extruded: Bool
+        var emergence: Double
+        var bodiesOnly: Bool
+    }
+    @ObservationIgnored private var footprintInputs: [String: FootprintInput] = [:]
+
     private func rebuildShapes(_ candidates: [VehicleSnapshot], for frame: TickFrame) {
         guard frame.shapesPossible else {
             if !vehicleShapes.isEmpty { vehicleShapes = []; shapesByID = [:] }
+            footprintInputs = [:]
             // `emerging` is deliberately kept. Zoom 12.5 is where shapes are
             // allowed at all, and it is also where a long train crosses its own
             // floor — so clearing here would make the one gesture this exists
@@ -3383,6 +3862,7 @@ final class AppModel {
         var built: [VehicleFootprint] = []
         built.reserveCapacity(min(candidates.count, Self.shapeLimit))
         var byID: [String: VehicleFootprint] = [:]
+        var inputs: [String: FootprintInput] = [:]
         // Rebuilt rather than pruned: a vehicle that has left the feed has to
         // leave this too, and rebuilding is one pass over the same list the
         // loop below already walks.
@@ -3391,6 +3871,18 @@ final class AppModel {
         for vehicle in candidates {
             if built.count >= Self.shapeLimit { break }
             let layout = layouts.layout(for: vehicle, modeColour: vehicle.mode.hex)
+            // The fleet query allows for the longest possible train. A short
+            // bus in that margin does not need a footprint outside the view.
+            let bodyArea = BBox(west: vehicle.lon, south: vehicle.lat,
+                                east: vehicle.lon, north: vehicle.lat)
+                .padded(byMetres: layout.length + max(2, frame.metresPerPoint * VehicleShape.minWidthPoints))
+            guard vehicle.id == selectedID || bodyArea.intersects(frame.viewport) else { continue }
+            if frame.needsTunnelCoverage {
+                let tunnelArea = BBox(west: vehicle.lon, south: vehicle.lat,
+                                      east: vehicle.lon, north: vehicle.lat)
+                    .padded(byMetres: layout.length + 2)
+                guard frame.tunnelCoverage?.contains(tunnelArea) == true else { continue }
+            }
             // With no meaningful line behind the point there is nowhere honest
             // to put a body. Leave the dot in place; the point collapse above
             // has already reduced identical elevator runs to one of those.
@@ -3423,6 +3915,19 @@ final class AppModel {
             // being the moment the reader zooms in.
             stillEmerging[vehicle.id] = shown
             guard shown > 0 else { continue }
+            let input = FootprintInput(
+                vehicle: vehicle, layout: layout, metresPerPoint: frame.metresPerPoint,
+                pixelsPerPoint: frame.pixelsPerPoint, selected: vehicle.id == selectedID,
+                ringed: vehicle.id == ringedID, lateral: sideways[vehicle.id] ?? 0,
+                solid: solid, extruded: !frame.bakedModels, emergence: shown,
+                bodiesOnly: frame.standingVehicles.contains(vehicle.id)
+            )
+            inputs[vehicle.id] = input
+            if footprintInputs[vehicle.id] == input, let cached = shapesByID[vehicle.id] {
+                built.append(cached)
+                byID[vehicle.id] = cached
+                continue
+            }
             guard let shape = VehicleShape.footprint(
                 of: vehicle, layout: layout, metresPerPoint: frame.metresPerPoint,
                 pixelsPerPoint: frame.pixelsPerPoint,
@@ -3440,6 +3945,7 @@ final class AppModel {
             byID[vehicle.id] = shape
         }
         emerging = stillEmerging
+        footprintInputs = inputs
         vehicleShapes = built
         shapesByID = byID
     }
@@ -3631,12 +4137,14 @@ final class AppModel {
         switch expected {
         case let .station(board):
             let found = await situations.forStop(ref: board.id, at: now)
+            await waitForPanelPresentation()
             guard selectionIsCurrent(expected, generation: generation),
                   !Task.isCancelled else { return }
             vehicleDisruptions = []
             stopDisruptions = found
         case let .platform(board):
             let found = await situations.forStop(ref: board.id, at: now)
+            await waitForPanelPresentation()
             guard selectionIsCurrent(expected, generation: generation),
                   !Task.isCancelled else { return }
             vehicleDisruptions = []
@@ -3655,8 +4163,11 @@ final class AppModel {
                 // Every stop it calls at, so a notice about a closed stop
                 // reaches the vehicles that will be turned back at it.
                 stopRefs: vehicle.stops.compactMap(\.ref),
+                journeyRefs: [vehicle.journeyRef].compactMap { $0 }
+                    + (vehicle.parts ?? []).compactMap(\.journeyRef),
                 at: now
             )
+            await waitForPanelPresentation()
             guard selectionIsCurrent(expected, generation: generation),
                   !Task.isCancelled else { return }
             stopDisruptions = []
@@ -3678,9 +4189,29 @@ final class AppModel {
         let generation = selectionGeneration
         selectionTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            if let cached = self.selectedVehicle {
+                self.loadFormation(of: cached, expected: expected, generation: generation)
+                self.loadOccupancy(of: cached, expected: expected, generation: generation)
+            }
             await self.refreshSelection(expected, generation: generation)
-            if self.selectionIsCurrent(expected, generation: generation) {
-                self.selectionTask = nil
+            while self.selectionGeneration == generation, !Task.isCancelled,
+                  !self.backgroundWorkSuspended {
+                switch self.selection {
+                case .station, .platform: break
+                default:
+                    self.selectionTask = nil
+                    return
+                }
+                do { try await Task.sleep(for: .seconds(30)) }
+                catch { return }
+                guard self.selectionGeneration == generation, !Task.isCancelled else { return }
+                switch self.selection {
+                case let .station(board):
+                    await self.fillStationBoard(placeId: board.id, at: self.clock.nowSeconds())
+                case let .platform(board):
+                    await self.refreshPlatformBoard(board, generation: generation)
+                default: return
+                }
             }
         }
     }
@@ -3688,7 +4219,12 @@ final class AppModel {
     private func cancelSelectionWork(clearPresentation: Bool) {
         selectionGeneration &+= 1
         selectionTask?.cancel(); selectionTask = nil
+        selectedRouteTask?.cancel(); selectedRouteTask = nil
+        selectedRouteKey = nil
+        selectedRouteRetryAt = .distantPast
         occupancyTask?.cancel(); occupancyTask = nil
+        occupancyRefreshTask?.cancel(); occupancyRefreshTask = nil
+        occupancyFailures = 0
         occupancyRequestGeneration &+= 1
         occupancyVehicleID = nil
         formationTask?.cancel(); formationTask = nil
@@ -3701,8 +4237,11 @@ final class AppModel {
         // cancelled instead of mistaking the old key for a completed answer.
         loadKey = nil
         formationKey = nil
+        formationVehicleID = nil
         panelReadAt = .distantPast
         guard clearPresentation else { return }
+        pendingPanelFold = nil
+        preferredSplitJourneyID = nil
         selectedVehicle = nil
         selectedVehicleMissing = false
         departingVehicle = nil
@@ -3710,9 +4249,11 @@ final class AppModel {
         liveTiming = nil
         formation = nil
         formationState = .notApplicable
+        vehicleSplit = nil
         vehicleDisruptions = []
         stopDisruptions = []
         setSelectedGeometry(nil)
+        selectedGeometryLoading = false
         setSelectedBranches([])
     }
 
@@ -3720,6 +4261,21 @@ final class AppModel {
         generation == selectionGeneration
             && selection == expected
             && !backgroundWorkSuspended
+    }
+
+    /// Same station or platform after a packed preview has already replaced
+    /// the loading shell. `Selection ==` includes the rows, so the original
+    /// expected value would abort the full read the instant the preview lands.
+    private func boardSelectionIsCurrent(station id: String, generation: UInt64) -> Bool {
+        guard generation == selectionGeneration, !backgroundWorkSuspended else { return false }
+        if case let .station(board) = selection { return board.id == id }
+        return false
+    }
+
+    private func boardSelectionIsCurrent(platform id: String, generation: UInt64) -> Bool {
+        guard generation == selectionGeneration, !backgroundWorkSuspended else { return false }
+        if case let .platform(board) = selection { return board.id == id }
+        return false
     }
 
     private func occupancyRequestIsCurrent(
@@ -3742,19 +4298,101 @@ final class AppModel {
             && key == formationKey
     }
 
+    /// Branch work is identified by its own generation rather than by the
+    /// formation key, because it now starts before there is one: the packed
+    /// through-services name both halves offline, and the formation request
+    /// that would set the key has not been answered yet. The generation is
+    /// bumped on every new branch request and on every change of working, so
+    /// it already says everything the key said.
     private func branchRequestIsCurrent(
-        _ request: UInt64, key: FormationKey,
-        expected: Selection, generation: UInt64
+        _ request: UInt64, expected: Selection, generation: UInt64
     ) -> Bool {
         dataMode != .off
             && selectionIsCurrent(expected, generation: generation)
             && request == branchRequestGeneration
-            && key == formationKey
     }
 
     private func refreshSelection(_ expected: Selection, generation: UInt64) async {
         guard selectionIsCurrent(expected, generation: generation),
               !Task.isCancelled else { return }
+        // Map hit testing supplies only names, identifiers and coordinates.
+        // Resolve the timetable for the chosen card, never for every candidate
+        // underneath the finger. Selection has already presented its shell.
+        switch expected {
+        case let .station(loading) where loading.isLoading:
+            let now = clock.nowSeconds()
+            let placeId = loading.id
+            let preview: StationBoard?
+            if let shape = loading.shape {
+                preview = await fleet.stationBoard(osmId: shape, at: now, preview: true)
+            } else {
+                preview = await fleet.stationBoard(placeId: placeId, at: now, preview: true)
+            }
+            await waitForPanelPresentation()
+            guard boardSelectionIsCurrent(station: placeId, generation: generation),
+                  !Task.isCancelled else { return }
+            if let preview, !preview.departures.isEmpty {
+                var board = preview
+                board.isLoading = false
+                board.shape = loading.shape ?? board.shape
+                replace(.station(board))
+            }
+            let found: StationBoard?
+            if let shape = loading.shape {
+                found = await fleet.stationBoard(osmId: shape, at: now)
+            } else {
+                found = await fleet.stationBoard(placeId: placeId, at: now)
+            }
+            await waitForPanelPresentation()
+            guard boardSelectionIsCurrent(station: placeId, generation: generation),
+                  !Task.isCancelled else { return }
+            var board = found ?? preview ?? loading
+            board.isLoading = false
+            board.shape = loading.shape ?? board.shape
+            replace(.station(board))
+            await refreshDisruptions()
+            if boardSelectionIsCurrent(station: placeId, generation: generation), !Task.isCancelled {
+                await fillStationBoard(placeId: board.id, at: clock.nowSeconds())
+            }
+            return
+        case let .platform(loading) where loading.isLoading:
+            let now = clock.nowSeconds()
+            let placeId = loading.id
+            let preview: PlatformBoard?
+            if let shape = loading.shape {
+                preview = await fleet.shapeBoard(osmId: shape, at: now, preview: true)
+            } else {
+                preview = await fleet.plateBoard(id: placeId, at: now, preview: true)
+            }
+            await waitForPanelPresentation()
+            guard boardSelectionIsCurrent(platform: placeId, generation: generation),
+                  !Task.isCancelled else { return }
+            if let preview, !preview.departures.isEmpty {
+                var board = preview
+                board.isLoading = false
+                board.shape = loading.shape ?? board.shape
+                replace(.platform(board))
+            }
+            let found: PlatformBoard?
+            if let shape = loading.shape {
+                found = await fleet.shapeBoard(osmId: shape, at: now)
+            } else {
+                found = await fleet.plateBoard(id: placeId, at: now)
+            }
+            await waitForPanelPresentation()
+            guard boardSelectionIsCurrent(platform: placeId, generation: generation),
+                  !Task.isCancelled else { return }
+            var board = found ?? preview ?? loading
+            board.isLoading = false
+            board.shape = loading.shape ?? board.shape
+            replace(.platform(board))
+            await refreshDisruptions()
+            if boardSelectionIsCurrent(platform: placeId, generation: generation), !Task.isCancelled {
+                await refreshPlatformBoard(board, generation: generation)
+            }
+            return
+        default: break
+        }
         switch expected {
         case .none, .station, .platform, .track, .choices:
             selectedVehicle = nil
@@ -3780,12 +4418,15 @@ final class AppModel {
             departingVehicle = nil
             clearFormation()
             setSelectedGeometry(line.geometry)
+            setSelectedBranches([])
             panelFold = 0
         case let .vehicle(id):
             await loadVehicle(
                 id: id, at: clock.nowSeconds(),
                 expected: expected, generation: generation
             )
+            guard selectionIsCurrent(expected, generation: generation), !Task.isCancelled else { return }
+            scheduleMappedRoute(expected: expected, generation: generation)
         case let .service(id, departure):
             await loadVehicle(
                 id: id, at: clock.nowSeconds(), boardDeparture: departure,
@@ -3793,24 +4434,21 @@ final class AppModel {
             )
             guard selectionIsCurrent(expected, generation: generation),
                   !Task.isCancelled else { return }
-            if let geometry = await fleet.boardJourneyGeometry(
-                id: id, departure: departure
-            ) {
-                guard selectionIsCurrent(expected, generation: generation),
-                      !Task.isCancelled else { return }
-                setSelectedGeometry(geometry)
-                // Keep the Source section in step with the line on the map.
-                // The timetable card was published before the route build so
-                // the sheet remained interactive while this task suspended.
-                if var vehicle = selectedVehicle {
-                    vehicle.geometry = geometry
-                    selectedVehicle = vehicle
-                }
-            }
+            scheduleMappedRoute(boardDeparture: departure, expected: expected, generation: generation)
         }
         guard selectionIsCurrent(expected, generation: generation),
               !Task.isCancelled else { return }
         await refreshDisruptions()
+        if case let .station(board) = expected,
+           selectionIsCurrent(expected, generation: generation), !Task.isCancelled {
+            // Packed Swiss GTFS truncates international trains at the border,
+            // and Basel Bad's DIDOK starts with 85, so a "Swiss-only fill"
+            // hides every ICE. OJP still has the EC at Milano and the ICE at
+            // Basel Bad; always ask.
+            await fillStationBoard(placeId: board.id, at: clock.nowSeconds())
+        } else if case let .platform(board) = expected {
+            await refreshPlatformBoard(board, generation: generation)
+        }
     }
 
     /// How often the vehicle panel may re-read while nothing in it has changed.
@@ -3821,16 +4459,248 @@ final class AppModel {
     private static let panelCadence: TimeInterval = 1
     private var panelReadAt = Date.distantPast
 
+    // These are scheduling state, not view state: moving a sheet must not
+    // invalidate its content just to tell asynchronous publishers to wait.
+    @ObservationIgnored private var panelDragging = false
+    @ObservationIgnored private var panelTransitions = Set<UUID>()
+    @ObservationIgnored private var panelSettlesAt = ContinuousClock.now
+    @ObservationIgnored private(set) var panelMotionActive = false
+
+    /// The follow pill's stop-name roll needs the display at its full rate.
+    /// The map's ordinary follow cap is 60 Hz, which is the model's pace, and
+    /// a 400 ms ease sampled that coarsely is the stutter the roll had.
+    /// Observation-ignored: flipping it must not rebuild the sheet, only
+    /// poke the renderer's display link. See `MapCoordinator.setRenderRate`.
+    @ObservationIgnored var prefersHighFrameRate = false {
+        didSet {
+            guard prefersHighFrameRate != oldValue else { return }
+            onPace?(frameInterval)
+        }
+    }
+    @ObservationIgnored private var panelMotionTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingPanelFold: CGFloat?
+
+    func beginPanelInteraction() {
+        panelDragging = true
+        trackPanelMotion()
+    }
+
+    func beginPanelTransition() -> UUID {
+        let token = UUID()
+        panelTransitions.insert(token)
+        trackPanelMotion()
+        return token
+    }
+
+    func endPanelTransition(_ token: UUID) {
+        guard panelTransitions.remove(token) != nil else { return }
+        trackPanelMotion()
+    }
+
+    func settlePanelPresentation() {
+        panelSettlesAt = ContinuousClock.now.advanced(by: .milliseconds(350))
+        trackPanelMotion()
+    }
+
+    func endPanelInteraction() {
+        panelDragging = false
+        panelSettlesAt = ContinuousClock.now.advanced(by: .milliseconds(250))
+        trackPanelMotion()
+    }
+
+    private func trackPanelMotion() {
+        if !panelMotionActive {
+            panelMotionActive = true
+            onPace?(frameInterval)
+        }
+        panelMotionTask?.cancel()
+        panelMotionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await waitForPanelPresentation()
+            guard !Task.isCancelled else { return }
+            panelMotionActive = false
+            if let fold = pendingPanelFold, selection != .none, panelFold != fold {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { self.panelFold = fold }
+            }
+            pendingPanelFold = nil
+            onPace?(frameInterval)
+            panelMotionTask = nil
+        }
+    }
+
+    /// A custom detent must stay fixed under the user's finger. Measurement
+    /// changes are applied once the native drag and settling animation finish.
+    func updatePanelFold(_ fold: CGFloat) {
+        guard fold.isFinite, fold > 40, !panelDismissalInProgress else { return }
+        switch selection {
+        case .vehicle, .service: break
+        default: return
+        }
+        // The first measurement must wait too: replacing the opening fraction
+        // with a measured height mid-presentation looks like a second opening.
+        if panelMotionActive {
+            pendingPanelFold = fold
+        } else if panelFold != fold {
+            panelFold = fold
+        }
+    }
+
+    private var panelPresentationBusy: Bool {
+        panelDragging || !panelTransitions.isEmpty || panelDismissalInProgress
+            || ContinuousClock.now < panelSettlesAt
+    }
+
+    /// Draw the packed Swiss rails as soon as they exist, then splice in
+    /// whatever Overpass adds. Waiting for the download before the first paint
+    /// is what left an ICE on a chord for twenty seconds.
+    private func publishMappedRoute(
+        id: String, boardDeparture: Timestamp? = nil, onto shownID: String,
+        expected: Selection, generation: UInt64
+    ) async {
+        selectedGeometryLoading = selectedGeometry == nil
+        let local: JourneyGeometry?
+        if let boardDeparture {
+            local = await fleet.boardJourneyGeometry(id: id, departure: boardDeparture)
+        } else {
+            local = await fleet.journeyGeometry(id: id)
+        }
+        guard selectionIsCurrent(expected, generation: generation), !Task.isCancelled,
+              (departingVehicle ?? selectedVehicle)?.id == shownID else { return }
+        selectedGeometryLoading = false
+        if let local { applyRouteGeometry(local, onto: shownID) }
+        guard local == nil || local?.hasUnmappedLeg == true else { return }
+        let remote = await fleet.refineRemoteRoute(id: id, boardDeparture: boardDeparture)
+        guard selectionIsCurrent(expected, generation: generation), !Task.isCancelled,
+              (departingVehicle ?? selectedVehicle)?.id == shownID else { return }
+        if let remote { applyRouteGeometry(remote, onto: shownID) }
+    }
+
+    /// The displayed run can change at a terminus without changing selection.
+    /// Own that route request separately, cancel the incoming run's late answer,
+    /// and retry a missing route without requiring another tap or zoom gesture.
+    private func scheduleMappedRoute(
+        boardDeparture: Timestamp? = nil, expected: Selection, generation: UInt64
+    ) {
+        guard selectionIsCurrent(expected, generation: generation),
+              let shown = departingVehicle ?? selectedVehicle,
+              shown.geometry?.path.count ?? 0 < 2
+                || shown.geometry?.hasUnmappedLeg == true
+                || shown.geometry?.legs.count != shown.stops.count
+        else { return }
+        let key = "\(shown.id)|\(boardDeparture ?? 0)"
+        if key == selectedRouteKey,
+           selectedRouteTask != nil || Date() < selectedRouteRetryAt { return }
+        selectedRouteTask?.cancel()
+        selectedRouteKey = key
+        selectedRouteTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.publishMappedRoute(id: shown.id, boardDeparture: boardDeparture,
+                onto: shown.id, expected: expected, generation: generation)
+            guard !Task.isCancelled,
+                  self.selectionIsCurrent(expected, generation: generation),
+                  self.selectedRouteKey == key else { return }
+            self.selectedRouteTask = nil
+            self.selectedRouteRetryAt = Date().addingTimeInterval(30)
+        }
+    }
+
+    private func applyRouteGeometry(_ geometry: JourneyGeometry, onto id: String) {
+        setSelectedGeometry(geometry)
+        if departingVehicle?.id == id {
+            departingVehicle?.geometry = geometry
+        } else if selectedVehicle?.id == id {
+            selectedVehicle?.geometry = geometry
+        }
+    }
+
+    /// Only presentation waits. Network requests and their service caches keep
+    /// running while UIKit opens or expands the sheet.
+    func waitForPanelPresentation() async {
+        while panelPresentationBusy, !Task.isCancelled, !backgroundWorkSuspended {
+            do { try await Task.sleep(for: .milliseconds(32)) }
+            catch { return }
+        }
+    }
+
     private func loadVehicle(
         id: String, at now: Timestamp, boardDeparture: Timestamp? = nil,
         expected: Selection, generation: UInt64
     ) async {
-        let found = await fleet.journey(
-            id: id, at: now, boardDeparture: boardDeparture
+        // Do not enqueue several actor reads per animation frame for a card
+        // whose text changes once a second. The map keeps its own live ticks.
+        // The sheet animation is not a reason to skip the first packed read:
+        // waiting on it used to leave the spinner up until OJP came back.
+        if selectedVehicle != nil,
+           Date().timeIntervalSince(panelReadAt) < Self.panelCadence {
+            return
+        }
+        // Packed/map object first so the stop list paints without waiting on
+        // through-working joins or OJP. Live delays and extra legs replace it.
+        var found = await fleet.journey(
+            id: id, at: now, boardDeparture: boardDeparture, through: false
         )
+        await waitForPanelPresentation()
         guard selectionIsCurrent(expected, generation: generation),
               !Task.isCancelled else { return }
-        let departing = await outgoing(of: found, at: now)
+        // Also covers board-only services. A terminal snapshot is provisional
+        // until the through/split/outgoing lookups below finish. Keep the
+        // loading view for that first read, then publish the arriving and
+        // departing snapshots together, without a misleading intermediate card.
+        if selectedVehicle == nil, let found, !found.isStandingAtLastStop {
+            selectedVehicle = found
+            setSelectedGeometry(found.geometry)
+            // Board selections have no viewport snapshot to seed these in
+            // scheduleSelectionRefresh. Start their requests before the
+            // animation guard can defer the rest of this card's publication.
+            loadFormation(of: found, expected: expected, generation: generation)
+            loadOccupancy(of: found, expected: expected, generation: generation)
+        }
+        if let through = await fleet.journey(
+            id: id, at: now, boardDeparture: boardDeparture
+        ) {
+            found = through
+        }
+        await waitForPanelPresentation()
+        guard selectionIsCurrent(expected, generation: generation),
+              !Task.isCancelled else { return }
+        // A transient miss (including a run leaving the active fleet) does not
+        // retract a card we already showed. Publishing nil here used to tear
+        // down VehiclePanel, flash a spinner, and lose its local selections.
+        if found == nil { found = selectedVehicle }
+        if boardDeparture == nil {
+            let continuation = await fleet.splitContinuation(
+                of: id, preferredID: preferredSplitJourneyID, at: now
+            )
+            guard selectionIsCurrent(expected, generation: generation), !Task.isCancelled else { return }
+            // Only hop when this working has actually arrived. Retargeting a
+            // train that is still running wipes the panel (selection didSet)
+            // and is what flipped RE1 Domodossola→Bern / Bern→Domodossola.
+            let atBuffers = found?.isStandingAtLastStop ?? false
+            if let continuation, continuation.id != id, atBuffers, !panelDismissalInProgress {
+                let follow = vehicleFollow
+                let navigating = isNavigating
+                isNavigating = true
+                replace(.vehicle(continuation.id))
+                isNavigating = navigating
+                vehicleFollow = follow
+                selectedVehicle = continuation
+                setSelectedGeometry(continuation.geometry)
+                return
+            }
+        }
+        var departing = await outgoing(of: found, at: now)
+        // Once the panel has committed to the outgoing working, don't flip
+        // back because the arriving train's `moving` flag flickered at the
+        // buffers — that swap is the name on the card changing direction.
+        if departing == nil,
+           let held = departingVehicle,
+           let found,
+           found.layover?.id == held.id {
+            departing = await fleet.journey(id: held.id, at: now) ?? held
+        }
+        await waitForPanelPresentation()
         guard selectionIsCurrent(expected, generation: generation),
               !Task.isCancelled else { return }
         // Only where nothing was found *and* nothing is already on the panel: a
@@ -3842,8 +4712,21 @@ final class AppModel {
         // The map highlights whatever the panel is describing. Drawing the run
         // that is over while the panel reads out the one about to leave is two
         // answers to one tap.
-        let geometry = (departing ?? found)?.geometry
-        setSelectedGeometry(geometry)
+        let previous = departingVehicle ?? selectedVehicle
+        let next = departing ?? found
+        if let geometry = next?.geometry, geometry.path.count > 1 {
+            setSelectedGeometry(geometry)
+        } else if Self.sameMappedRun(previous, next), let retained = selectedGeometry {
+            // Viewport snapshots may omit expensive route geometry. Absence
+            // in a refresh is not a retraction of the selected run's route.
+            // A live alias of the same occurrence is the same case: OJP names
+            // RE1 Brig–Bern under a new id and often extra calls, which is not
+            // a different train.
+            if departing != nil { departing?.geometry = retained }
+            else { found?.geometry = retained }
+        } else if next != nil, next?.id != previous?.id {
+            setSelectedGeometry(nil)
+        }
 
         // Held to the cadence unless the panel would actually read differently,
         // and that guard is the whole point of it.
@@ -3865,17 +4748,73 @@ final class AppModel {
         panelReadAt = Date()
         selectedVehicle = found
         departingVehicle = departing
-        // A scheduled page is a timetable, not a live vehicle. Starting the
-        // formation and occupancy requests here made sections appear while the
-        // user was pulling the sheet open, changing its layout mid-gesture.
-        // Selection cleanup already cleared those values; leave the card stable
-        // while the route worker fills in the map independently.
-        guard boardDeparture == nil else { return }
+        scheduleMappedRoute(boardDeparture: boardDeparture, expected: expected, generation: generation)
+        // Before the formation request, and whether or not one is ever
+        // answered. A train that parts is filed as one working ending at the
+        // junction and two beginning there, and the packed through-services
+        // say so offline for every operator in the timetable.
+        if let shown = departing ?? found, let parting = shown.stops.last,
+           dataMode != .off,
+           let packed = await fleet.publishedSplit(
+               of: shown.id, journeyRef: shown.journeyRef, at: parting
+           ),
+           selectionIsCurrent(expected, generation: generation), !Task.isCancelled {
+            loadBranches(
+                packed, named: [], of: shown, excluding: Self.identities(of: shown),
+                expected: expected, generation: generation
+            )
+        }
+        // Scheduled trains need their split destinations before departure too.
+        // Publishers wait for the sheet gesture to settle before changing it.
         loadFormation(
-            of: departing ?? found, arriving: found,
+            of: departing ?? found,
             expected: expected, generation: generation
         )
         loadOccupancy(of: departing ?? found, expected: expected, generation: generation)
+    }
+
+    /// When TripInfo omits the Italian head, ask the packed origin's stop
+    /// events — OJP still lists Milano as PreviousCall on EC 66 there.
+    private func absorbOriginCalls(
+        onto id: String, of vehicle: VehicleSnapshot, already: JourneyTiming?,
+        boardDeparture: Timestamp? = nil
+    ) async -> Int {
+        guard let first = vehicle.stops.first else { return 0 }
+        if let head = already?.calls.first,
+           !Fleet.sameListedStop(head.name, first.name) {
+            return 0
+        }
+        let stopId = first.ref.map {
+            StopRegister.didok(forSloid: $0) ?? StopRegister.stationOf($0)
+        }.flatMap { $0.isEmpty ? nil : $0 } ?? first.ref
+        guard let stopId, !stopId.isEmpty else { return 0 }
+        let moment = Date(timeIntervalSince1970: TimeInterval(first.sched ?? first.dep))
+        let found = await loads.boardJourneys(from: stopId, at: moment, limit: 30)
+        guard let match = found.first(where: { Self.sameWorking(vehicle, $0) }) else {
+            return 0
+        }
+        return await fleet.applyTiming(
+            JourneyTiming(byStop: [:], calls: match.stops), to: id, at: Date(),
+            boardDeparture: boardDeparture
+        )
+    }
+
+    private static func sameWorking(_ vehicle: VehicleSnapshot, _ journey: Journey) -> Bool {
+        if let a = vehicle.journeyRef, let b = journey.journeyRef, a == b { return true }
+        if let a = vehicle.journeyRef, a == journey.id { return true }
+        func digits(_ value: String?) -> String? {
+            guard let value else { return nil }
+            let trimmed = value.filter(\.isNumber).drop { $0 == "0" }
+            return trimmed.isEmpty ? nil : String(trimmed)
+        }
+        guard let vn = digits(vehicle.line),
+              let jn = journey.trainNumber ?? digits(journey.number)
+        else { return false }
+        guard vn == jn else { return false }
+        let line = RelationStore.normaliseRef(vehicle.line)
+        let other = RelationStore.normaliseRef(journey.line)
+        if !line.isEmpty, !other.isEmpty { return line == other || other.hasPrefix(line) || line.hasPrefix(other) }
+        return true
     }
 
     /// Ask how full the vehicle on the panel is.
@@ -3888,6 +4827,8 @@ final class AppModel {
     ) {
         guard dataMode != .off, let vehicle, !vehicle.stops.isEmpty else {
             occupancyTask?.cancel(); occupancyTask = nil
+            occupancyRefreshTask?.cancel(); occupancyRefreshTask = nil
+            occupancyFailures = 0
             occupancyRequestGeneration &+= 1
             occupancyVehicleID = nil
             loadKey = nil
@@ -3901,39 +4842,68 @@ final class AppModel {
         // separately — and 20.7% of a weekday's trips carry none at all, which
         // is a run nothing can be asked about rather than a run that is on time.
         let id = vehicle.id
-        guard occupancyVehicleID != id else { return }
+        let publishedKey = LoadService.Key(vehicle: vehicle)
+        if occupancyVehicleID == id {
+            // A missing published handle can arrive with a later fleet update.
+            // Start it immediately instead of waiting for the retry timer.
+            guard let publishedKey, publishedKey != loadKey, occupancyTask == nil else { return }
+        }
+        let boardDeparture: Timestamp?
+        if case let .service(_, departure) = expected { boardDeparture = departure }
+        else { boardDeparture = nil }
         occupancyTask?.cancel()
+        occupancyRefreshTask?.cancel(); occupancyRefreshTask = nil
         occupancyRequestGeneration &+= 1
         let request = occupancyRequestGeneration
         occupancyVehicleID = id
         occupancyTask = Task { @MainActor [weak self, fleet, loads] in
             guard let self else { return }
+            var refreshAfter: TimeInterval? = 30
             defer {
                 if self.occupancyRequestIsCurrent(
                     request, vehicleID: id, expected: expected, generation: generation
                 ) {
                     self.occupancyTask = nil
+                    if let refreshAfter {
+                        self.scheduleOccupancyRefresh(
+                            after: refreshAfter, request: request, vehicleID: id,
+                            expected: expected, generation: generation
+                        )
+                    }
                 }
             }
-            guard let handle = await fleet.journeyRef(for: id) else {
+            guard await loads.isConfigured else { refreshAfter = nil; return }
+            let key: LoadService.Key?
+            if let published = publishedKey {
+                key = published
+            } else if let handle = await fleet.journeyRef(for: id) {
+                key = LoadService.Key(journeyID: handle.ref, day: handle.day)
+            } else {
+                key = nil
+            }
+            guard let key else {
                 guard self.occupancyRequestIsCurrent(
                     request, vehicleID: id, expected: expected, generation: generation
                 ),
                       !Task.isCancelled else { return }
                 self.vehicleLoad = nil
                 self.liveTiming = nil
+                refreshAfter = 30
                 return
             }
             guard self.occupancyRequestIsCurrent(
                 request, vehicleID: id, expected: expected, generation: generation
             ), !Task.isCancelled
             else { return }
-            let key = LoadService.Key(journeyID: handle.ref, day: handle.day)
-            guard key != self.loadKey else { return }
+            if self.loadKey != key {
+                self.occupancyFailures = 0
+                self.vehicleLoad = nil
+                self.liveTiming = nil
+            }
             self.loadKey = key
-            self.vehicleLoad = nil
 
-            let answer = await loads.load(for: key)
+            let answer = await loads.load(for: key, maxAge: 0)
+            await self.waitForPanelPresentation()
             // The panel may have moved on while this was in flight, and
             // answering the old question over the new one is worse than not
             // answering at all.
@@ -3941,48 +4911,134 @@ final class AppModel {
                 request, vehicleID: id, expected: expected, generation: generation
             ), !Task.isCancelled, self.loadKey == key
             else { return }
-            if case let .load(found) = answer { self.vehicleLoad = found }
+            switch answer {
+            case let .load(found): self.vehicleLoad = found
+            case .none: self.vehicleLoad = nil
+            case .failed:
+                self.occupancyFailures += 1
+                refreshAfter = min(60, 5 * pow(2, Double(min(self.occupancyFailures - 1, 4))))
+                return
+            }
+            self.occupancyFailures = 0
 
             // The same response carries the delays. Folding them onto the
             // stored journey is what turns a timetabled line on the map into a
             // live one — and it is the whole of the network cost of doing so:
             // about five kilobytes, for the one train being looked at.
-            if let timing = await loads.timing(for: key) {
+            let timing = await loads.timing(for: key)
+            guard self.occupancyRequestIsCurrent(
+                request, vehicleID: id, expected: expected, generation: generation
+            ), !Task.isCancelled, self.loadKey == key
+            else { return }
+            let before = self.vehicles.first(where: { $0.id == id })
+            var touched = 0
+            if let timing {
+                touched += await fleet.applyTiming(timing, to: id, at: Date(), boardDeparture: boardDeparture)
+            }
+            // TripInfo can miss a variant (`66-001` vs `66-005`) or only
+            // publish Swiss calls. A stop-event at the packed origin still
+            // carries PreviousCall — Milano before Domodossola on EC 66.
+            touched += await self.absorbOriginCalls(
+                onto: id, of: vehicle, already: timing, boardDeparture: boardDeparture
+            )
+            await self.waitForPanelPresentation()
+            guard self.occupancyRequestIsCurrent(
+                request, vehicleID: id, expected: expected, generation: generation
+            ), !Task.isCancelled, self.loadKey == key
+            else { return }
+            self.liveTiming = touched > 0 ? timing : (timing?.isEmpty == false ? timing : nil)
+            if touched > 0 {
+                await self.requestTickAndWait()
                 guard self.occupancyRequestIsCurrent(
                     request, vehicleID: id, expected: expected, generation: generation
                 ), !Task.isCancelled, self.loadKey == key
                 else { return }
-                let before = self.vehicles.first(where: { $0.id == id })
-                let touched = await fleet.applyTiming(timing, to: id, at: Date())
-                guard self.occupancyRequestIsCurrent(
-                    request, vehicleID: id, expected: expected, generation: generation
-                ), !Task.isCancelled, self.loadKey == key
-                else { return }
-                self.liveTiming = touched > 0 ? timing : nil
-                if touched > 0 {
-                    await self.requestTickAndWait()
+                if let updated = await fleet.journey(
+                    id: id, at: Timestamp(self.clock.nowSeconds()), boardDeparture: boardDeparture
+                ) {
+                    await self.waitForPanelPresentation()
                     guard self.occupancyRequestIsCurrent(
                         request, vehicleID: id, expected: expected, generation: generation
-                    ), !Task.isCancelled, self.loadKey == key
-                    else { return }
-                    // Where the fold has put it, not where the glide has got to
-                    // — see `Fleet.settledPosition`.
-                    let settled = await fleet.settledPosition(
-                        of: id, at: Timestamp(self.clock.nowSeconds())
-                    )
-                    guard self.occupancyRequestIsCurrent(
-                        request, vehicleID: id, expected: expected, generation: generation
-                    ), !Task.isCancelled, self.loadKey == key
-                    else { return }
-                    self.catchCameraUp(to: id, from: before, settlingAt: settled)
+                    ), !Task.isCancelled else { return }
+                    if self.departingVehicle?.id == id {
+                        self.departingVehicle = updated
+                    } else {
+                        self.selectedVehicle = updated
+                    }
+                    if let geometry = updated.geometry {
+                        self.setSelectedGeometry(geometry)
+                    }
                 }
-            } else {
+                let settled = await fleet.settledPosition(
+                    of: id, at: Timestamp(self.clock.nowSeconds())
+                )
                 guard self.occupancyRequestIsCurrent(
                     request, vehicleID: id, expected: expected, generation: generation
                 ), !Task.isCancelled, self.loadKey == key
                 else { return }
+                self.catchCameraUp(to: id, from: before, settlingAt: settled)
+            } else if timing == nil {
                 self.liveTiming = nil
             }
+
+            // A displayed through-train can contain several OJP workings.
+            // The head's response ends at Bern; it cannot update the 646
+            // departure or the calls beyond it. Fetch each continuation under
+            // its own identity and fold it into the existing joined vehicle.
+            // LoadService coalesces/caches these calls; no fleet rebuild or
+            // extra animation-frame work is needed.
+            for part in vehicle.parts ?? [] where part.id != id {
+                guard self.occupancyRequestIsCurrent(
+                    request, vehicleID: id, expected: expected, generation: generation
+                ), !Task.isCancelled else { return }
+                guard let handle = await fleet.journeyRef(for: part.id) else { continue }
+                let partKey = LoadService.Key(journeyID: handle.ref, day: handle.day)
+                let answer = await loads.load(for: partKey, maxAge: 0)
+                await self.waitForPanelPresentation()
+                guard self.occupancyRequestIsCurrent(
+                    request, vehicleID: id, expected: expected, generation: generation
+                ), !Task.isCancelled else { return }
+                if case let .load(found) = answer {
+                    self.vehicleLoad = self.vehicleLoad.map { $0.merging(found) } ?? found
+                }
+                if case .failed = answer {
+                    refreshAfter = 30
+                    continue
+                }
+                guard let timing = await loads.timing(for: partKey) else { continue }
+                guard self.occupancyRequestIsCurrent(
+                    request, vehicleID: id, expected: expected, generation: generation
+                ), !Task.isCancelled else { return }
+                if await fleet.applyTiming(timing, to: part.id, at: Date(), boardDeparture: boardDeparture) > 0 {
+                    self.requestTick()
+                }
+            }
+        }
+    }
+
+    /// A transient failure is not a completed forecast. Retry without needing
+    /// another map tick or a close/reopen. Open transports refresh every 30
+    /// seconds, independently of the map's cache. Selection cancellation owns
+    /// this timer too.
+    private func scheduleOccupancyRefresh(
+        after delay: TimeInterval, request: UInt64, vehicleID: String,
+        expected: Selection, generation: UInt64
+    ) {
+        occupancyRefreshTask?.cancel()
+        occupancyRefreshTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) }
+            catch { return }
+            guard let self else { return }
+            await self.waitForPanelPresentation()
+            guard self.occupancyRequestIsCurrent(
+                request, vehicleID: vehicleID, expected: expected, generation: generation
+            ), !Task.isCancelled else { return }
+            self.occupancyRefreshTask = nil
+            self.occupancyVehicleID = nil
+            self.loadOccupancy(
+                of: self.departingVehicle ?? self.selectedVehicle,
+                expected: expected, generation: generation
+            )
         }
     }
 
@@ -4025,7 +5081,7 @@ final class AppModel {
     /// as often as the card can change and the formation cannot: a train is
     /// re-marshalled between workings, not between frames.
     private func loadFormation(
-        of vehicle: VehicleSnapshot?, arriving: VehicleSnapshot?,
+        of vehicle: VehicleSnapshot?,
         expected: Selection, generation: UInt64
     ) {
         guard dataMode != .off, let vehicle, vehicle.mode == .train,
@@ -4034,120 +5090,102 @@ final class AppModel {
             return
         }
 
-        // The leg the vehicle is on, which is not always the whole run.
-        //
-        // A Swiss service often changes train number partway — an S1 renumbered
-        // at Gümligen, a Regio swapping numbers at Spiez — and `Chains` joins
-        // those into the one vehicle a passenger sees. The formation service
-        // does not: it answers per train number. Asking under the number the run
-        // *started* with returns the formation of a train that finished an hour
-        // ago, or nothing at all, so the leg being stood on is the one to ask
-        // about.
-        let leg = vehicle.parts?.first { $0.start <= vehicle.index && vehicle.index <= $0.end }
-        let origin = leg.map { vehicle.stops[$0.start] } ?? vehicle.stops[0]
-        let key = FormationKey(
-            journeyID: vehicle.formationReference(leg: leg),
-            operationDate: FormationKey.operationDate(of: origin.dep)
-        )
+        let legs = vehicle.formationLegs
+        // The departing leg owns a shared junction stop.
+        let active = legs.last { $0.stops.lowerBound <= vehicle.index } ?? legs.first
+        guard let active else { clearFormation(); return }
+        let key = active.key
         guard key != formationKey else { return }
-        formationTask?.cancel(); formationTask = nil
+        formationTask?.cancel()
         formationRequestGeneration &+= 1
         let request = formationRequestGeneration
         branchTask?.cancel(); branchTask = nil
         branchRequestGeneration &+= 1
+        let sameVehicle = formationVehicleID == vehicle.id
         formationKey = key
-        formation = nil
-        // A train whose id carries no train number, or whose operator is not one
-        // of the eleven, is not a question the service can be asked — so it is
-        // not one the panel should raise.
-        guard let key else {
-            formationState = .notApplicable
-            return
+        formationVehicleID = vehicle.id
+        // Keep the last answer on screen while the next working loads, so
+        // the Formation section and the direction picker do not blink out
+        // at a join. A different train still starts empty.
+        if !sameVehicle {
+            formation = nil
+            formationState = .loading
+            setSelectedBranches([])
         }
-        formationState = .loading
 
-        // Every journey id this vehicle covers. A splitting train's separation
-        // names both halves and one of them is usually this train's own onward
-        // leg, so telling them apart means knowing what "this train" is.
-        var mine = Set([vehicle.id])
-        for part in vehicle.parts ?? [] { mine.insert(part.id) }
-
+        let mine = Self.identities(of: vehicle)
         formationTask = Task { @MainActor [weak self, formations, fleet] in
             guard let self else { return }
             defer {
                 if self.formationRequestIsCurrent(
                     request, key: key, expected: expected, generation: generation
-                ) {
-                    self.formationTask = nil
-                }
+                ) { self.formationTask = nil }
             }
-            let answer = await formations.formation(for: key)
-            // The panel may have moved on to another train while this was in
-            // flight, and answering the old question over the new one is worse
-            // than not answering at all.
-            guard self.formationRequestIsCurrent(
-                request, key: key, expected: expected, generation: generation
-            ), !Task.isCancelled
-            else { return }
-            switch answer {
-            case let .formation(raw):
-                // The portions a splitting train is drawn from name their
-                // destination by UIC and only sometimes in words; the register
-                // has the rest. Asked in one hop, and only about the numbers
-                // that are actually missing a name.
+            var answers: [FormationKey: TrainFormation] = [:]
+            // Show the current working first, then fill both earlier and later
+            // legs. A missing answer for one leg must not hide the others.
+            for wantedKey in [key] + legs.map(\.key).filter({ $0 != key }) {
+                guard !Task.isCancelled else { return }
+                if answers[wantedKey] != nil { continue }
+                let answer = await formations.formation(for: wantedKey)
+                await self.waitForPanelPresentation()
+                guard self.formationRequestIsCurrent(
+                    request, key: key, expected: expected, generation: generation
+                ), !Task.isCancelled else { return }
+                guard case let .formation(raw) = answer else { continue }
+                if await fleet.learnConnections(
+                    raw, for: wantedKey,
+                    of: vehicle.formationReference(leg: legs.first { $0.key == wantedKey }.flatMap { leg in
+                        vehicle.parts?.first { $0.start == leg.stops.lowerBound }
+                    })
+                ) { self.requestTick() }
                 let wanted = Set(raw.stops.flatMap(\.portions).compactMap {
                     $0.destination == nil ? $0.destinationUIC : nil
                 })
                 let names = wanted.isEmpty ? [:] : await fleet.stopNames(uic: wanted)
+                await self.waitForPanelPresentation()
                 guard self.formationRequestIsCurrent(
                     request, key: key, expected: expected, generation: generation
-                ), !Task.isCancelled
-                else { return }
+                ), !Task.isCancelled else { return }
                 let found = raw.naming { names[$0] }
-                self.formation = found
-                self.formationState = .ready(found)
+                answers[wantedKey] = found
 
-                // Write it down. This is the half of the layout database that
-                // is not shipped: what the line usually runs is a guess good
-                // enough to draw from, and this is the train itself. Recorded
-                // against the train number, so the correction outlives both
-                // this panel and this day — and the map is redrawn from it at
-                // once, because the vehicle whose formation was just fetched is
-                // on screen and is at this moment drawn from the guess.
-                let learned = self.layouts.learn(
-                    found, key: LayoutKey(key), at: Date(),
-                    mode: vehicle.mode, category: vehicle.category, line: vehicle.line,
-                    operatorName: vehicle.operatorName, modeColour: vehicle.mode.hex,
-                    slot: self.layouts.slot(for: vehicle)
-                )
-                // At a terminus the panel describes the working the train
-                // *becomes*, and that is the number the formation was fetched
-                // under — but the marker on the map is still the working that
-                // brought it in. Filed under only one of them, the map goes on
-                // drawing the guess for the very train whose formation is on
-                // screen beside it. It is one physical train; file it as both.
-                if let arriving, arriving.id != vehicle.id,
-                   let alsoKnownAs = self.layouts.key(for: arriving) {
-                    self.layouts.learn(
-                        found, key: alsoKnownAs, at: Date(),
-                        mode: arriving.mode, category: arriving.category, line: arriving.line,
-                        operatorName: arriving.operatorName, modeColour: arriving.mode.hex,
-                        // The arriving working's own hour, not the departing
-                        // one's. It is one physical train and two workings, and
-                        // the whole point of a slot is that those are filed
-                        // apart — a set that comes in at 09:58 and goes out at
-                        // 10:04 belongs to both hours, once each.
-                        slot: self.layouts.slot(for: arriving)
+                // Learn the actual working, never the stitched display: its
+                // coaches can change at a join or split.
+                if wantedKey == key {
+                    let learned = self.layouts.learn(
+                        found, key: LayoutKey(key), at: Date(),
+                        mode: vehicle.mode, category: vehicle.category, line: vehicle.line,
+                        operatorName: vehicle.operatorName, modeColour: vehicle.mode.hex,
+                        slot: self.layouts.slot(for: vehicle)
                     )
+                    if learned { self.requestTick() }
+                    if await fleet.absorbFormationStops(found, onto: vehicle.id) {
+                        self.requestTick()
+                    }
                 }
-                if learned { self.requestTick() }
-
+                let covered = legs.compactMap { leg in
+                    answers[leg.key].map { (leg: leg, formation: $0) }
+                }
+                let calls = await fleet.journey(
+                    id: vehicle.id, at: self.clock.nowSeconds()
+                )?.stops ?? vehicle.stops
+                if let combined = TrainFormation.combining(covered, calls: calls) {
+                    self.formation = combined
+                    self.formationState = .ready(combined)
+                }
+            }
+            if let found = self.formation {
+                // The formation's own account of the parting, which is the one
+                // that knows about coaches. Where it has none, the packed
+                // graph's stands: a company outside the eleven that publish
+                // formations still parts its trains.
                 self.loadBranches(
-                    of: found, for: key, of: vehicle, excluding: mine,
+                    found.split ?? self.vehicleSplit, named: found.separation?.branches ?? [],
+                    of: vehicle, excluding: mine,
                     expected: expected, generation: generation
                 )
-            case .none, .failed:
-                self.formation = nil
+            } else {
                 self.formationState = .unavailable
                 self.setSelectedBranches([])
             }
@@ -4204,6 +5242,10 @@ final class AppModel {
                     try? await Task.sleep(for: Self.sweepIdle)
                     continue
                 }
+                if self.cameraStillPausesBackground {
+                    try? await Task.sleep(for: Self.sweepIdle)
+                    continue
+                }
                 let batch = self.formationsWorthLearning(limit: Self.sweepSize)
                 guard !batch.isEmpty else {
                     try? await Task.sleep(for: Self.sweepIdle)
@@ -4238,7 +5280,7 @@ final class AppModel {
             guard shapesByID[vehicle.id] != nil,
                   let key = layouts.key(for: vehicle),
                   !askedFormations.contains(key),
-                  layouts.record(for: key) == nil
+                  layouts.needsFormation(for: key)
             else { continue }
             ranked.append((vehicle, Geo.flatMetres(vehicle.lon, vehicle.lat, midLon, midLat)))
         }
@@ -4250,7 +5292,7 @@ final class AppModel {
         // The leg being run, under the number the service files it by — the
         // same reading `loadFormation` does, and it has to be the same or a
         // formation learned here is never found again.
-        let leg = vehicle.parts?.first { $0.start <= vehicle.index && vehicle.index <= $0.end }
+        let leg = vehicle.parts?.last { $0.start <= vehicle.index && vehicle.index <= $0.end }
         guard let origin = leg.map({ vehicle.stops[$0.start] }) ?? vehicle.stops.first,
               let key = FormationKey(
                   journeyID: vehicle.formationReference(leg: leg),
@@ -4266,6 +5308,9 @@ final class AppModel {
 
         switch await formations.formation(for: key, background: true) {
         case let .formation(raw):
+            let connectionsChanged = await fleet.learnConnections(
+                raw, for: key, of: vehicle.formationReference(leg: leg)
+            )
             let changed = layouts.learn(
                 raw, key: stored, at: Date(), mode: vehicle.mode,
                 category: vehicle.category, line: vehicle.line,
@@ -4274,7 +5319,7 @@ final class AppModel {
             )
             // Only where the drawing actually differs from what is on screen.
             // A confirmation changes nothing to redraw.
-            if changed { requestTick() }
+            if changed || connectionsChanged { requestTick() }
         case .none:
             layouts.noteSilence(key: stored, at: Date())
         case .failed:
@@ -4282,6 +5327,19 @@ final class AppModel {
             // train, so it does not count as having been asked.
             askedFormations.remove(stored)
         }
+    }
+
+    /// Every name this vehicle answers to, its renumbered legs included.
+    ///
+    /// A half that turns out to be one of these is the train being looked at
+    /// rather than the other half of it.
+    private static func identities(of vehicle: VehicleSnapshot) -> Set<String> {
+        var out = Set([vehicle.id, vehicle.journeyRef].compactMap { $0 })
+        for part in vehicle.parts ?? [] {
+            out.insert(part.id)
+            if let ref = part.journeyRef { out.insert(ref) }
+        }
+        return out
     }
 
     /// Fetch the halves of a splitting train that this vehicle is not itself,
@@ -4302,15 +5360,26 @@ final class AppModel {
     /// a destination and a parting station is still enough to recognise the
     /// working that carries it. See `Fleet.onward(from:notBefore:to:mode:at:)`.
     private func loadBranches(
-        of formation: TrainFormation, for key: FormationKey, of vehicle: VehicleSnapshot,
+        _ split: TrainFormation.Split?, named: [TrainFormation.Working],
+        of vehicle: VehicleSnapshot,
         excluding mine: Set<String>, expected: Selection, generation: UInt64
     ) {
-        guard let split = formation.split else {
+        guard let split else {
             branchTask?.cancel(); branchTask = nil
             branchRequestGeneration &+= 1
+            vehicleSplit = nil
             setSelectedBranches([])
             return
         }
+        // Nothing to redo while the same parting is already being worked on.
+        // The formation arriving after the packed graph names the same two
+        // halves is the ordinary case, and re-running it would drop the lines
+        // already drawn and fetch them again.
+        if vehicleSplit == split, branchTask != nil || !selectedBranches.isEmpty {
+            vehicleSplit = split
+            return
+        }
+        vehicleSplit = split
         // Which working carries which portion, where the service says. Not
         // simply the first: at Spiez the RE from Bern parts into 4281 for
         // Domodossola and 6833 for Zweisimmen, and 4281 is the leg the feed has
@@ -4318,7 +5387,14 @@ final class AppModel {
         // first named half drew the line this train was already drawn along and
         // put its own destination up as "the other half", which is a split
         // shown as no split at all.
-        let named = (formation.separation?.branches ?? []).compactMap(\.journeyID)
+        // Who the halves are, from both sources that can say.
+        //
+        // The formation service names them only when it files a `T`
+        // relationship, which is optional and frequently null. The packed
+        // timetable names them for the whole country. Without the second, a
+        // half that changes line number at the split — the Zweisimmen portion
+        // of an RE1 becoming an R11 — fails `onward`'s same-line requirement
+        // and never reaches the direction picker.
         let moment = split.moment.map { Timestamp($0.timeIntervalSince1970) }
             ?? vehicle.stops.last?.arr ?? clock.nowSeconds()
 
@@ -4329,43 +5405,45 @@ final class AppModel {
             guard let self else { return }
             defer {
                 if self.branchRequestIsCurrent(
-                    request, key: key, expected: expected, generation: generation
+                    request, expected: expected, generation: generation
                 ) {
                     self.branchTask = nil
                 }
             }
+            // The packed half of the answer has to be asked for on the actor,
+            // so it joins the formation's names here rather than above.
+            let workings = named + (await fleet.publishedBranches(
+                of: vehicle.id, journeyRef: vehicle.journeyRef
+            ))
+            guard self.branchRequestIsCurrent(
+                request, expected: expected, generation: generation
+            ), !Task.isCancelled else { return }
+
             var found: [RouteBranch] = []
+            // Keyed by the branch's own journey, not by its place in `found`:
+            // the list is put into the advertised order before any of these
+            // answers come back, and an index would then name another half.
+            var routesToLoad: [(vehicle: VehicleSnapshot, departure: Timestamp)] = []
             for portion in split.portions {
                 guard self.branchRequestIsCurrent(
-                    request, key: key, expected: expected, generation: generation
+                    request, expected: expected, generation: generation
                 ), !Task.isCancelled
                 else { return }
                 guard let destination = portion.destination else { continue }
                 // A portion this vehicle is itself carrying on as is already
                 // the line on the map and the stops in the list.
-                if let mineDestination = vehicle.to,
+                if let mineDestination = vehicle.stops.last?.name,
                    Self.sameStop(mineDestination, destination) { continue }
 
-                var other: VehicleSnapshot?
-                for id in named where !mine.contains(id) {
-                    let candidate = await fleet.journey(id: id, at: clock.nowSeconds())
-                    guard self.branchRequestIsCurrent(
-                        request, key: key, expected: expected, generation: generation
-                    ), !Task.isCancelled else { return }
-                    if let candidate, let to = candidate.to, Self.sameStop(to, destination) {
-                        other = candidate
-                        break
-                    }
-                }
-                if other == nil {
-                    other = await fleet.onward(
-                        from: split.stopName, notBefore: moment, to: destination,
-                        mode: vehicle.mode, at: clock.nowSeconds()
-                    )
-                    guard self.branchRequestIsCurrent(
-                        request, key: key, expected: expected, generation: generation
-                    ), !Task.isCancelled else { return }
-                }
+                let other = await fleet.onward(
+                    from: split.stopName, stopUIC: split.stopUIC,
+                    notBefore: moment, to: destination, destinationUIC: portion.destinationUIC,
+                    mode: vehicle.mode, operatorName: vehicle.operatorName, line: vehicle.line,
+                    workings: workings, at: clock.nowSeconds()
+                )
+                guard self.branchRequestIsCurrent(
+                    request, expected: expected, generation: generation
+                ), !Task.isCancelled else { return }
                 guard let other, !mine.contains(other.id) else { continue }
 
                 // A working that starts at the parting has nothing to cut; one
@@ -4375,21 +5453,148 @@ final class AppModel {
                     Self.branch(of: $0, stops: other.stops, from: split.stopName)
                 }
                 let calls = Self.calls(of: other, from: split.stopName)
+                if cut == nil, let departure = calls.first?.dep {
+                    routesToLoad.append((other, departure))
+                }
                 found.append(RouteBranch(
                     path: cut?.path ?? [], stops: cut?.stops ?? [], calls: calls,
                     exact: other.geometry?.source == .osmRoute,
+                    geometry: other.geometry,
                     destination: other.to ?? destination, journeyID: other.id,
                     coaches: portion.fromPosition...max(portion.fromPosition, portion.toPosition),
                     splitAt: split.stopName
                 ))
             }
+            // The halves the service named and gave no coach goal for.
+            //
+            // A goal is a statement about coaches and the service does not
+            // always make one: RE1 4177 files all twelve of its coaches to
+            // Domodossola and still parts at Spiez into RE1 4277 and R11 6829,
+            // saying so as a `T` relationship and in the packed
+            // through-services. Those names are the whole of the evidence for
+            // the Zweisimmen half, and without this loop it was simply absent
+            // — no line on the map, no stops in the list, and a picker with one
+            // direction in it for a train advertising two.
+            for working in workings {
+                guard self.branchRequestIsCurrent(
+                    request, expected: expected, generation: generation
+                ), !Task.isCancelled
+                else { return }
+                if let id = working.journeyID, mine.contains(id) { continue }
+                let other = await fleet.onward(
+                    from: split.stopName, stopUIC: split.stopUIC,
+                    notBefore: moment, to: nil,
+                    mode: vehicle.mode, operatorName: vehicle.operatorName,
+                    // Named outright, so the same-line requirement is not the
+                    // check that is keeping this honest — and it is exactly the
+                    // check the Zweisimmen half fails, because it becomes an
+                    // R11 where the trunk was an RE1.
+                    line: nil, workings: [working], at: clock.nowSeconds()
+                )
+                guard self.branchRequestIsCurrent(
+                    request, expected: expected, generation: generation
+                ), !Task.isCancelled else { return }
+                guard let other, !mine.contains(other.id),
+                      !found.contains(where: { $0.journeyID == other.id })
+                else { continue }
+                let destination = other.to ?? other.stops.last?.name
+                if let destination, found.contains(where: {
+                    Self.sameStop($0.destination ?? "", destination)
+                }) { continue }
+                let cut = other.geometry.flatMap {
+                    Self.branch(of: $0, stops: other.stops, from: split.stopName)
+                }
+                let calls = Self.calls(of: other, from: split.stopName)
+                if cut == nil, let departure = calls.first?.dep {
+                    routesToLoad.append((other, departure))
+                }
+                found.append(RouteBranch(
+                    path: cut?.path ?? [], stops: cut?.stops ?? [], calls: calls,
+                    exact: other.geometry?.source == .osmRoute,
+                    geometry: other.geometry,
+                    destination: destination, journeyID: other.id,
+                    // Only where a goal named this half. A range invented to
+                    // fill the column would put coach numbers on the picker
+                    // that nobody published.
+                    coaches: split.portions.first {
+                        guard let named = $0.destination, let destination else { return false }
+                        return Self.sameStop(named, destination)
+                    }.map { $0.fromPosition...max($0.fromPosition, $0.toPosition) },
+                    splitAt: split.stopName
+                ))
+            }
+            for portion in split.portions {
+                guard let destination = portion.destination else { continue }
+                if found.contains(where: { Self.sameStop($0.destination ?? "", destination) }) {
+                    continue
+                }
+                guard Self.sameStop(destination, split.stopName) else { continue }
+                let call = vehicle.stops.first { Self.sameStop($0.name, split.stopName) }
+                found.append(RouteBranch(
+                    path: [], stops: [], calls: call.map { [$0] } ?? [],
+                    exact: false, geometry: nil,
+                    destination: destination, journeyID: nil,
+                    coaches: portion.fromPosition...max(portion.fromPosition, portion.toPosition),
+                    splitAt: split.stopName
+                ))
+            }
+            // In the order the train itself advertises them. "Domodossola (I)
+            // | Zweisimmen" is the operator's own ordering, it is what the
+            // title over the card reads, and it decides which half the picker
+            // opens on — which should be the one the reader tapped, not
+            // whichever source happened to name its working first.
+            found = Self.advertised(order: found, on: vehicle.to)
             // The panel may have moved on while this was in flight.
+            await self.waitForPanelPresentation()
             guard self.branchRequestIsCurrent(
-                request, key: key, expected: expected, generation: generation
+                request, expected: expected, generation: generation
             ), !Task.isCancelled
             else { return }
             self.setSelectedBranches(found)
+            // Stops can be read immediately. The timetable-only branches get
+            // their mapped path as the route worker finishes, without waiting
+            // for another formation request or another tap.
+            for pending in routesToLoad {
+                let geometry = await fleet.boardJourneyGeometry(
+                    id: pending.vehicle.id, departure: pending.departure
+                )
+                await self.waitForPanelPresentation()
+                guard self.branchRequestIsCurrent(
+                    request, expected: expected, generation: generation
+                ), !Task.isCancelled else { return }
+                guard let geometry, let cut = Self.branch(
+                    of: geometry, stops: pending.vehicle.stops, from: split.stopName
+                ), let index = found.firstIndex(where: { $0.journeyID == pending.vehicle.id })
+                else { continue }
+                found[index].path = cut.path
+                found[index].stops = cut.stops
+                found[index].exact = geometry.source == .osmRoute
+                found[index].geometry = geometry
+                self.setSelectedBranches(found)
+            }
         }
+    }
+
+    /// The halves in the order the headsign names them.
+    ///
+    /// Stable, and anything the headsign does not mention keeps its place at
+    /// the back rather than being dropped: a headsign is a label and the
+    /// branches are workings the feed named, so the label does not get to
+    /// decide which of them exist.
+    private static func advertised(order branches: [RouteBranch], on headsign: String?) -> [RouteBranch] {
+        guard let headsign, headsign.contains("|") else { return branches }
+        let parts = headsign.split(separator: "|").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        func rank(_ branch: RouteBranch) -> Int {
+            guard let destination = branch.destination,
+                  let index = parts.firstIndex(where: { sameStop($0, destination) })
+            else { return parts.count }
+            return index
+        }
+        return branches.enumerated()
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
     }
 
     /// Whether two names are one place written two ways.
@@ -4437,6 +5642,7 @@ final class AppModel {
         guard selectedBranches != branches else { return }
         selectedBranches = branches
         selectedGeometryRevision &+= 1
+        onMapOverlays?()
     }
 
     private func clearFormation() {
@@ -4445,8 +5651,10 @@ final class AppModel {
         branchTask?.cancel(); branchTask = nil
         branchRequestGeneration &+= 1
         formationKey = nil
+        formationVehicleID = nil
         formation = nil
         formationState = .notApplicable
+        vehicleSplit = nil
         setSelectedBranches([])
     }
 
@@ -4454,6 +5662,27 @@ final class AppModel {
         guard selectedGeometry != geometry else { return }
         selectedGeometry = geometry
         selectedGeometryRevision &+= 1
+        onMapOverlays?()
+    }
+
+    /// The same operating run under a different public id, including a chained
+    /// vehicle and the live alias of one of its workings.
+    private static func sameMappedRun(_ a: VehicleSnapshot?, _ b: VehicleSnapshot?) -> Bool {
+        guard let a, let b else { return false }
+        if a.id == b.id { return true }
+        var previous = Set<String>()
+        var next = Set<String>()
+        func collect(_ vehicle: VehicleSnapshot, into ids: inout Set<String>) {
+            ids.insert(vehicle.id)
+            if let ref = vehicle.journeyRef { ids.insert(ref) }
+            for part in vehicle.parts ?? [] {
+                ids.insert(part.id)
+                if let ref = part.journeyRef { ids.insert(ref) }
+            }
+        }
+        collect(a, into: &previous)
+        collect(b, into: &next)
+        return !previous.isDisjoint(with: next)
     }
 
     /// Whether two snapshots of one journey would put the same words on the
@@ -4497,8 +5726,7 @@ final class AppModel {
     private func outgoing(of vehicle: VehicleSnapshot?, at now: Timestamp) async -> VehicleSnapshot? {
         guard let vehicle,
               let next = vehicle.layover?.id,
-              !vehicle.moving,
-              vehicle.index == vehicle.stops.count - 1,
+              vehicle.isStandingAtLastStop,
               let end = vehicle.stops.last, now >= end.arr
         else { return nil }
         return await fleet.journey(id: next, at: now)
@@ -4533,11 +5761,48 @@ final class AppModel {
     /// without scrolling.
     private static let choicesPerKind = 4
 
+    /// The map owns the touch anchor and presents a compact picker there.
+    var onMapChoices: (([TapChoice]) -> Void)?
+
+    private func presentMapChoices(_ options: [TapChoice]) {
+        if let onMapChoices { onMapChoices(options) }
+        else { selection = .choices(options) }
+    }
+
+    /// Visible vehicle bodies get first refusal, before resolving any boards.
+    @discardableResult
+    func selectVehicle(at hits: [VehicleTap.Hit]) -> Bool {
+        let wanted = Set(hits.map(\.id))
+        guard !wanted.isEmpty else { return false }
+        let byID = Dictionary(vehicles.lazy.filter { wanted.contains($0.id) }.map { ($0.id, $0) },
+                              uniquingKeysWith: { first, _ in first })
+        let candidates = VehicleTap.candidates(hits.filter { byID[$0.id] != nil })
+        guard let first = candidates.first else { return false }
+        if candidates.count == 1 {
+            if selection == .vehicle(first.id), panelDismissalInProgress {
+                // Same subject, new intent: queue a reopen after UIKit finishes
+                // dismissing instead of letting onDismiss erase this tap.
+                selectionRevision &+= 1
+                vehicleFollow = .centred
+            }
+            else if selection == .vehicle(first.id) { tappedOpenVehicle() }
+            else { selection = .vehicle(first.id) }
+        } else {
+            presentMapChoices(candidates.compactMap { hit in
+                byID[hit.id].map { TapChoice.vehicle($0, distance: hit.distance) }
+            })
+        }
+        return true
+    }
+
     func handleTap(
         lon: Double, lat: Double, metresPerPoint: Double,
         platformShapes: [String] = [], stationShapes: [String] = [],
-        stopDots: [String] = [], solidTaps: [Coord] = []
+        stopDots: [String] = [], solidTaps: [Coord] = [], vehiclesChecked: Bool = false,
+        interaction: UInt64? = nil
     ) async {
+        let interaction = interaction ?? beginSelectionInteraction()
+        guard selectionInteractionIsCurrent(interaction) else { return }
         let now = clock.nowSeconds()
 
         // What OpenRailwayMap has drawn under the finger, resolved before
@@ -4550,6 +5815,7 @@ final class AppModel {
         // because the reach below floors at 25 metres and at platform zoom that
         // is half the screen. The slab was unselectable at any zoom.
         let footprint = await firstShapeBoard(platformShapes, at: now)
+        guard selectionInteractionIsCurrent(interaction) else { return }
 
         // About a finger's width, in metres on the ground — except where the
         // finger is standing on a drawn platform. Then the markers are not being
@@ -4576,8 +5842,10 @@ final class AppModel {
         var best = await bestTap(
             lon: lon, lat: lat, at: now, reach: reach, plateReach: plateReach,
             metresPerPoint: metresPerPoint, footprint: footprint,
-            stationShapes: stationShapes, stopDots: stopDots, solidTaps: solidTaps
+            stationShapes: stationShapes, stopDots: stopDots, solidTaps: solidTaps,
+            vehiclesChecked: vehiclesChecked
         )
+        guard selectionInteractionIsCurrent(interaction) else { return }
 
         // A tap on the vehicle that is already open is not a re-selection. The
         // panel is already showing it, and writing the same selection back does
@@ -4620,8 +5888,9 @@ final class AppModel {
             let options = await tapChoices(
                 lon: lon, lat: lat, at: now, reach: reach, plateReach: plateReach,
                 platformShapes: platformShapes, stationShapes: stationShapes,
-                stopDots: stopDots, solidTaps: solidTaps
+                stopDots: stopDots, solidTaps: solidTaps, vehiclesChecked: vehiclesChecked
             )
+            guard selectionInteractionIsCurrent(interaction) else { return }
             // A codeless forecourt marker can be the same interchange as the
             // railway station beside it. Once the choice list has folded that
             // redundant marker into its parent, make the single-answer path
@@ -4650,7 +5919,7 @@ final class AppModel {
                 ambiguous = options.count > 1
             }
             if ambiguous {
-                selection = .choices(Self.ordered(options, first: best))
+                presentMapChoices(Self.ordered(options, first: best))
                 return
             }
         }
@@ -4664,14 +5933,7 @@ final class AppModel {
         }
 
         selection = best
-        // Drawn first, improved after. A stop the national feed does not carry
-        // — a funicular, a small operator — has an empty board here and a
-        // perfectly full one at the mirror, so an empty board is worth one
-        // small request before it is believed. Not on the way in: a stop with
-        // no service left today should not wait on the network to say so.
-        if case let .station(board) = best, board.departures.isEmpty {
-            await fillStationFromMirror(placeId: board.id, at: now)
-        }
+
     }
 
     /// The list a picker shows: nearest first, and whatever the ranking picked
@@ -4700,7 +5962,7 @@ final class AppModel {
         lon: Double, lat: Double, at now: Timestamp,
         reach: Double, plateReach: Double,
         platformShapes: [String], stationShapes: [String], stopDots: [String],
-        solidTaps: [Coord] = []
+        solidTaps: [Coord] = [], vehiclesChecked: Bool = false
     ) async -> [TapChoice] {
         var out: [TapChoice] = []
         var seen = Set<String>()
@@ -4726,7 +5988,7 @@ final class AppModel {
         // against the head — the same distance `nearestVehicle` uses, so a tap
         // on the eighth coach lists that train and not the bus behind it.
         var byDistance: [(vehicle: VehicleSnapshot, distance: Double)] = []
-        for vehicle in vehicles {
+        for vehicle in vehicles where !vehiclesChecked {
             let d = distance(to: vehicle, lon: lon, lat: lat, lifted: solidTaps)
             if d <= reach { byDistance.append((vehicle, d)) }
         }
@@ -4738,13 +6000,13 @@ final class AppModel {
         // Drawn platforms. No distance to give: the renderer answered because
         // the touch was inside the shape, which is as near as anything gets.
         for id in platformShapes.prefix(Self.choicesPerKind) {
-            guard let board = await fleet.shapeBoard(osmId: id, at: now) else { continue }
+            guard let board = await fleet.shapeBoard(osmId: id, at: now, loadingOnly: true) else { continue }
             add(.platform(board, kind: .area, distance: 0))
         }
 
         // Kerb plates, from where they are drawn.
         for plate in nearbyPlates(lon: lon, lat: lat, within: plateReach, limit: Self.choicesPerKind) {
-            guard let board = await fleet.plateBoard(id: plate.stop.id, at: now) else { continue }
+            guard let board = await fleet.plateBoard(id: plate.stop.id, at: now, loadingOnly: true) else { continue }
             add(.platform(
                 board, kind: .marker,
                 distance: Geo.flatMetres(plate.lon, plate.lat, lon, lat)
@@ -4755,7 +6017,7 @@ final class AppModel {
         // resolved by the OSM id the shape carries rather than by whichever
         // station happens to be nearest.
         for id in (stopDots + stationShapes).prefix(Self.choicesPerKind * 2) {
-            guard let board = await fleet.stationBoard(osmId: id, at: now) else { continue }
+            guard let board = await fleet.stationBoard(osmId: id, at: now, loadingOnly: true) else { continue }
             add(.station(board, rail: true, distance: 0))
         }
 
@@ -4764,7 +6026,7 @@ final class AppModel {
             lon: lon, lat: lat, within: reach, limit: Self.choicesPerKind
         ) { $0.dotDrawn(at: zoom) }
         for place in places {
-            guard let board = await fleet.stationBoard(placeId: place.id, at: now) else { continue }
+            guard let board = await fleet.stationBoard(placeId: place.id, at: now, loadingOnly: true) else { continue }
             // `stationBoard` may promote a forecourt stop such as
             // “Mülenen, Bahnhof” to its railway parent. Describe the board we
             // are actually offering, not the child row that led us to it.
@@ -4829,7 +6091,7 @@ final class AppModel {
         lon: Double, lat: Double, at now: Timestamp,
         reach: Double, plateReach: Double, metresPerPoint: Double,
         footprint: PlatformBoard?, stationShapes: [String], stopDots: [String],
-        solidTaps: [Coord] = []
+        solidTaps: [Coord] = [], vehiclesChecked: Bool = false
     ) async -> Selection {
         // Nearest wins, rather than vehicles always winning.
         //
@@ -4842,7 +6104,7 @@ final class AppModel {
         // A vehicle still gets a small edge, because it is drawn as the larger
         // marker and is the thing that moves — if the two are within a fifth of
         // each other, the dot is what was meant.
-        let vehicle = nearestVehicle(lon: lon, lat: lat, within: reach, lifted: solidTaps)
+        let vehicle = vehiclesChecked ? nil : nearestVehicle(lon: lon, lat: lat, within: reach, lifted: solidTaps)
         // To the body that was drawn, which is how `nearestVehicle` picked it.
         // Measured to the head instead, the two disagreed: a tap on the eighth
         // coach chose that intercity and then weighed it as four hundred metres
@@ -4878,7 +6140,7 @@ final class AppModel {
         // the more specific answer.
         if plateDistance > metresPerPoint * Self.underFingerPoints {
             for id in stopDots {
-                guard let board = await fleet.stationBoard(osmId: id, at: now) else { continue }
+                guard let board = await fleet.stationBoard(osmId: id, at: now, loadingOnly: true) else { continue }
                 return .station(board)
             }
         }
@@ -4886,13 +6148,13 @@ final class AppModel {
         // plates are drawn, "which bay" is the question being asked — the
         // station is one dot and it has sixty-seven of them.
         if let plate, plateDistance <= placeDistance,
-           let board = await fleet.plateBoard(id: plate.stop.id, at: now) {
+           let board = await fleet.plateBoard(id: plate.stop.id, at: now, loadingOnly: true) {
             return .platform(board)
         }
-        if let place, let board = await fleet.stationBoard(placeId: place.id, at: now) {
+        if let place, let board = await fleet.stationBoard(placeId: place.id, at: now, loadingOnly: true) {
             return .station(board)
         }
-        if let plate, let board = await fleet.plateBoard(id: plate.stop.id, at: now) {
+        if let plate, let board = await fleet.plateBoard(id: plate.stop.id, at: now, loadingOnly: true) {
             return .platform(board)
         }
         // The drawn platform, before falling back to a marker that is merely
@@ -4920,7 +6182,7 @@ final class AppModel {
         // whichever station happens to be nearest. That guess is how a tap on
         // Zytglogge came back Marzili.
         for id in stationShapes {
-            guard let board = await fleet.stationBoard(osmId: id, at: now) else { continue }
+            guard let board = await fleet.stationBoard(osmId: id, at: now, loadingOnly: true) else { continue }
             return .station(board)
         }
 
@@ -4941,7 +6203,7 @@ final class AppModel {
         let stationReach = min(max(90, metresPerPoint * Self.stationReachPoints), Self.stationReachCap)
         if let station = await fleet.stopPlaces.nearest(
             lon: lon, lat: lat, within: stationReach, matching: { $0.rail && $0.dotDrawn(at: zoom) }
-        ), let board = await fleet.stationBoard(placeId: station.id, at: now) {
+        ), let board = await fleet.stationBoard(placeId: station.id, at: now, loadingOnly: true) {
             return .station(board)
         }
 
@@ -4967,25 +6229,61 @@ final class AppModel {
     /// is a shape the register cannot name.
     private func firstShapeBoard(_ ids: [String], at now: Timestamp) async -> PlatformBoard? {
         for id in ids {
-            if let board = await fleet.shapeBoard(osmId: id, at: now) { return board }
+            if let board = await fleet.shapeBoard(osmId: id, at: now, loadingOnly: true) { return board }
         }
         return nil
     }
 
     /// The plate nearest a point, measured where it is drawn.
-    /// Ask the mirror about a stop the feed had nothing for, and re-read the
-    /// board if it answered.
+    /// Ask OJP (and the mirror) for workings the packed timetable truncated,
+    /// and re-read the board if anything new arrived.
     ///
     /// Guarded on the selection still being the same stop: the request takes a
     /// moment, and in that time the user may well have tapped something else.
-    private func fillStationFromMirror(placeId: String, at now: Timestamp) async {
-        guard dataMode == .all else { return }
-        guard await fleet.fillFromMirror(placeId: placeId, at: now) else { return }
-        guard case let .station(current) = selection, current.id == placeId else { return }
+    private func fillStationBoard(placeId: String, at now: Timestamp) async {
+        guard dataMode != .off, !backgroundWorkSuspended else { return }
+        let expected = selection
+        let generation = selectionGeneration
+        let stopRef = StopRegister.didok(forSloid: placeId) ?? placeId
+        let extra = await loads.boardJourneys(from: stopRef, limit: 80, maxAge: 0)
+        if Task.isCancelled { return }
+        if !extra.isEmpty { await fleet.ingestBoardFill(extra) }
+        if Task.isCancelled { return }
+        if dataMode == .all { _ = await fleet.fillFromMirror(placeId: placeId, at: now) }
+        guard selectionIsCurrent(expected, generation: generation), !Task.isCancelled,
+              case let .station(current) = selection, current.id == placeId else { return }
         guard let better = await fleet.stationBoard(placeId: placeId, at: now),
               !better.departures.isEmpty
         else { return }
-        replace(.station(better))
+        await waitForPanelPresentation()
+        // After the last hop: a tap on a departure must not be overwritten by
+        // a board that was already in flight when the row was pressed.
+        guard !Task.isCancelled,
+              case let .station(still) = selection, still.id == placeId
+        else { return }
+        var updated = better
+        updated.shape = still.shape
+        replace(.station(updated))
+    }
+
+    private func refreshPlatformBoard(_ board: PlatformBoard, generation: UInt64) async {
+        guard dataMode != .off, !backgroundWorkSuspended else { return }
+        let expected = Selection.platform(board)
+        let station = StopRegister.stationOf(board.id)
+        let stopRef = StopRegister.didok(forSloid: station) ?? station
+        let extra = await loads.boardJourneys(from: stopRef, limit: 80, maxAge: 0)
+        guard selectionIsCurrent(expected, generation: generation), !Task.isCancelled else { return }
+        if !extra.isEmpty { await fleet.ingestBoardFill(extra) }
+        let found: PlatformBoard?
+        if let shape = board.shape {
+            found = await fleet.shapeBoard(osmId: shape, at: clock.nowSeconds())
+        } else {
+            found = await fleet.plateBoard(id: board.id, at: clock.nowSeconds())
+        }
+        await waitForPanelPresentation()
+        guard selectionIsCurrent(expected, generation: generation), !Task.isCancelled,
+              let found else { return }
+        replace(.platform(found))
     }
 
     /// Which station each drawn blob belongs to, for the map's merge.
@@ -5023,16 +6321,10 @@ final class AppModel {
     /// Through `push`, so Back returns to the list rather than closing the
     /// sheet. The list exists because the first guess might be wrong, and a
     /// wrong guess you cannot back out of is worse than no list at all.
-    func choose(_ option: TapChoice) {
-        push(option.selection)
-        // The same top-up a tap that landed straight on this stop would get.
-        // The list is built from boards resolved before it was shown, and a
-        // stop the national feed does not carry has an empty one — so without
-        // this, going through the picker was the one route to a stop that
-        // never asked the mirror.
-        guard case let .station(board) = option.selection, board.departures.isEmpty
-        else { return }
-        Task { await fillStationFromMirror(placeId: board.id, at: clock.nowSeconds()) }
+    func choose(_ option: TapChoice, fromMap: Bool = false) {
+        if fromMap { selection = option.selection }
+        else { push(option.selection) }
+
     }
 
     /// Open the panel for whatever is running nearest a point. Debug only; see
@@ -5101,11 +6393,40 @@ final class AppModel {
         return best
     }
 
-    func select(journey entry: BoardEntry) async {
+    func select(journey entry: BoardEntry) {
         if entry.running {
             push(.vehicle(entry.id))
         } else {
             push(.service(entry.id, departure: entry.departure))
+        }
+    }
+
+    /// `-pinLiveActivity 1`: wait until a board or a vehicle is open, then pin
+    /// it. The lock-screen preview cannot depend on a swipe the simulator
+    /// will not perform on its own.
+    private func pinDebugLiveActivity() async {
+        let kind = UserDefaults.standard.string(forKey: "pinLiveActivity")?.lowercased() ?? ""
+        for _ in 0..<240 {
+            if Task.isCancelled { return }
+            let now = clock.nowSeconds()
+            if kind != "arrival", case let .station(board) = selection {
+                if let entry = board.departures.first(where: { !$0.terminates && $0.departure >= now - 30 })
+                    ?? board.departures.first(where: { !$0.terminates }) {
+                    await liveActivities.watch(
+                        entry: entry, station: board.name, showing: .departure, now: now
+                    )
+                    return
+                }
+            }
+            if kind != "departure", let vehicle = departingVehicle ?? selectedVehicle {
+                let upcoming = vehicle.stops.last { $0.displayedArrival > now && !$0.cancelled }
+                    ?? vehicle.stops.last { !$0.cancelled }
+                if let stop = upcoming {
+                    await liveActivities.watchArrival(vehicle: vehicle, stop: stop, now: now)
+                    return
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(250))
         }
     }
 
@@ -5173,16 +6494,35 @@ final class AppModel {
         }
     }
 
+    /// Open the title/cached board first; the actor can fill its rows later.
+    private func openStationBoard(id: String, name: String, point: Coord) async {
+        let now = clock.nowSeconds()
+        let cached = history.reversed().compactMap { item -> StationBoard? in
+            if case let .station(board) = item, board.id == id { return board }
+            return nil
+        }.first
+        var initial = cached ?? .loading(id: id, name: name, at: point, now: now)
+        initial.isLoading = true
+        push(.station(initial))
+        onFocus?(point, max(zoom, 14))
+    }
+
+    /// Open the railway station named by a distant city label.
+    func openCityStation(named name: String, near centre: Coord, interaction: UInt64) async {
+        guard selectionInteractionIsCurrent(interaction), CityStation.isEnabled(at: zoom),
+              let station = await fleet.cityStation(named: name, near: centre),
+              selectionInteractionIsCurrent(interaction), CityStation.isEnabled(at: zoom) else { return }
+        // A map tap starts a new selection trail, just like a station marker.
+        selection = .station(.loading(id: station.id, name: station.name,
+            at: Coord(lon: station.lon, lat: station.lat), now: clock.nowSeconds()))
+        onFocus?(Coord(lon: station.lon, lat: station.lat), 14)
+    }
+
     /// Open a station the search found.
     func open(station: StopPlace) async {
         isSearching = false
-        let now = clock.nowSeconds()
-        onFocus?(Coord(lon: station.lon, lat: station.lat), max(zoom, 14))
-        guard let board = await fleet.stationBoard(placeId: station.id, at: now) else { return }
-        push(.station(board))
-        if board.departures.isEmpty {
-            await fillStationFromMirror(placeId: station.id, at: now)
-        }
+        await openStationBoard(id: station.id, name: station.name,
+                               point: Coord(lon: station.lon, lat: station.lat))
     }
 
     /// Open a service the search found.
@@ -5192,8 +6532,12 @@ final class AppModel {
     /// ten to five, and the reason the hit carries a coordinate at all.
     func open(vehicle hit: VehicleHit) async {
         isSearching = false
-        onFocus?(Coord(lon: hit.lon, lat: hit.lat), max(zoom, 12))
         push(.vehicle(hit.id))
+        if isFollowingVehicle {
+            onZoom?(max(zoom, 12))
+        } else {
+            onFocus?(Coord(lon: hit.lon, lat: hit.lat), max(zoom, 12))
+        }
     }
 
     /// Open the board for the stop a **call** names.
@@ -5207,18 +6551,36 @@ final class AppModel {
     ///
     /// Falls back to the coordinate only where the feed gave the call no ref.
     func selectStation(call: Call) async {
-        let now = clock.nowSeconds()
         let stationId = StopRegister.stationOf(call.ref)
-        if !stationId.isEmpty, let board = await fleet.stationBoard(placeId: stationId, at: now) {
-            let place = await fleet.stopPlaces.place(id: stationId)
-            onFocus?(Coord(lon: place?.lon ?? call.lon, lat: place?.lat ?? call.lat), max(zoom, 14))
-            push(.station(board))
-            if board.departures.isEmpty {
-                await fillStationFromMirror(placeId: stationId, at: now)
-            }
+        if !stationId.isEmpty {
+            await openStationBoard(id: stationId, name: call.name,
+                                   point: Coord(lon: call.lon, lat: call.lat))
             return
         }
         await selectStation(lon: call.lon, lat: call.lat)
+    }
+
+    /// Open a board service on the existing interactive map and panel stack.
+    /// Reading its calls does not select or follow its vehicle.
+    func openRoute(entry: BoardEntry) async {
+        let interaction = beginSelectionInteraction()
+        guard let snapshot = await fleet.journey(id: entry.id, at: entry.departure,
+                                                 boardDeparture: entry.departure),
+              selectionInteractionIsCurrent(interaction) else { return }
+        var line = RouteLine(entry: entry, calls: snapshot.stops, geometry: snapshot.geometry)
+        push(.line(line))
+        setSelectedGeometry(line.geometry)
+        if let geometry = line.geometry { onFrameRoute?(geometry.path) }
+        guard line.geometry == nil else { return }
+        let generation = selectionGeneration
+        let geometry = await fleet.boardJourneyGeometry(id: entry.id, departure: entry.departure)
+        guard !Task.isCancelled, selectionGeneration == generation,
+              case .line(let open) = selection, open.id == line.id,
+              !panelDismissalInProgress else { return }
+        line.geometry = geometry
+        replace(.line(line))
+        setSelectedGeometry(geometry)
+        if let geometry { onFrameRoute?(geometry.path) }
     }
 
     /// Open a whole line, from a row that named it.
@@ -5234,9 +6596,30 @@ final class AppModel {
     /// resting height on a push, so the line is being framed against the map
     /// the reader is about to see.
     func openRoute(relation id: Int32) async {
-        guard let line = await fleet.routeLine(relationId: id) else { return }
+        let interaction = beginSelectionInteraction()
+        // Packed geometry first. Waiting on Overpass is what left "lines
+        // through here" spinning for seconds on a Swiss RE1 that was already
+        // in `routes.bin`.
+        guard var line = await fleet.routeLine(relationId: id) else { return }
+        line = await fleet.enrichRouteLine(line, at: clock.nowSeconds())
+        guard selectionInteractionIsCurrent(interaction) else { return }
         onFrameRoute?(line.geometry?.path ?? [])
         push(.line(line))
+        let generation = selectionGeneration
+        let fetched = await OSMRouteClient.shared.fetch(relationId: id)
+        guard !Task.isCancelled, selectionGeneration == generation else { return }
+        if !fetched.isEmpty { await fleet.overlayRoutes(fetched) }
+        guard selectionGeneration == generation,
+              case .line(let open) = selection, open.id == .relation(id) else { return }
+        guard var improved = await fleet.routeLine(relationId: id) else { return }
+        improved = await fleet.enrichRouteLine(improved, at: clock.nowSeconds())
+        guard !Task.isCancelled, selectionGeneration == generation,
+              !panelDismissalInProgress else { return }
+        onFrameRoute?(improved.geometry?.path ?? [])
+        // `RouteLine ==` is by id, so this assignment does not tear the panel
+        // down; it just replaces the payload and the drawn line.
+        replace(.line(improved))
+        setSelectedGeometry(improved.geometry)
     }
 
     /// Open the board for one stop on a drawn line.
@@ -5249,16 +6632,8 @@ final class AppModel {
             await selectStation(lon: stop.lon, lat: stop.lat)
             return
         }
-        let now = clock.nowSeconds()
-        guard let board = await fleet.stationBoard(placeId: placeId, at: now) else {
-            await selectStation(lon: stop.lon, lat: stop.lat)
-            return
-        }
-        onFocus?(Coord(lon: stop.lon, lat: stop.lat), max(zoom, 14))
-        push(.station(board))
-        if board.departures.isEmpty {
-            await fillStationFromMirror(placeId: placeId, at: now)
-        }
+        await openStationBoard(id: placeId, name: stop.name,
+                               point: Coord(lon: stop.lon, lat: stop.lat))
     }
 
     /// Open the board for the stop nearest a point.
@@ -5266,15 +6641,11 @@ final class AppModel {
     /// Reached from a call in the vehicle panel, which is the question a reader
     /// actually has next: this train stops there at 05:41 — what else does?
     func selectStation(lon: Double, lat: Double) async {
-        let now = clock.nowSeconds()
-        guard let place = await fleet.stopPlaces.nearest(lon: lon, lat: lat, within: 400),
-              let board = await fleet.stationBoard(placeId: place.id, at: now)
-        else { return }
-        onFocus?(Coord(lon: place.lon, lat: place.lat), max(zoom, 14))
-        push(.station(board))
-        if board.departures.isEmpty {
-            await fillStationFromMirror(placeId: place.id, at: now)
-        }
+        let interaction = beginSelectionInteraction()
+        guard let place = await fleet.stopPlaces.nearest(lon: lon, lat: lat, within: 400) else { return }
+        guard selectionInteractionIsCurrent(interaction) else { return }
+        await openStationBoard(id: place.id, name: place.name,
+                               point: Coord(lon: place.lon, lat: place.lat))
     }
 
     /// The railway network inside the viewport, for the overlay.
@@ -5285,6 +6656,12 @@ final class AppModel {
     /// reservations and yard sidings at that scale are a grey haze over every
     /// city and hide the thing they are drawn on top of.
     private(set) var tracks: [RailNet.TrackLine] = []
+    private(set) var tracksRevision = 0
+    private var trackOverlay: RailNet.TrackOverlay?
+    private var trackRefreshTask: Task<Void, Never>?
+    private var trackRefreshPending = false
+    private var trackRefreshGeneration: UInt64 = 0
+    private var trackMainLineMask: UInt8?
     private var tracksViewport: BBox?
     private var tracksMask: UInt8 = 0
     private var tracksZoom: Double = 0
@@ -5385,82 +6762,144 @@ final class AppModel {
     /// under a mountain", and that question is asked whether or not the
     /// overlay is on. See `TunnelIndex`.
     private(set) var tunnels: [[Coord]] = []
+    private(set) var tunnelStations: [Coord] = []
     /// Bumped whenever `tunnels` is replaced, so the map can tell whether the
     /// index it built from them is still the right one without comparing a few
     /// thousand coordinates every frame.
     private(set) var tunnelRevision = 0
     private var tunnelsViewport: BBox?
-    private var tunnelsZoom = 0.0
+    /// Fetch bores before bodies appear, so a pinch through 12.5 does not
+    /// draw a rake and then replace it with the marker.
+    private static let tunnelFetchZoom = 11.0
 
     func refreshTunnelsIfNeeded() async {
         if trackTunnelBit == 0 { trackTunnelBit = await fleet.trackKindBit("tunnel") }
-        // Only where a vehicle would be drawn as a solid at all. Further out
-        // than that a train is a dot, a dot has no height, and a dot on a
-        // mountain is where the railway is — which is the truth as far as a
-        // plan view is concerned.
-        guard detailedVehicles, solidVehicles, ghostTunnels, trackTunnelBit != 0,
-              zoom >= VehicleShape.solidMinZoom - 0.6
+        // Needed before a body is drawn. Keep the last fetch through a short
+        // pinch-out so zooming back in does not wipe occupancy and flash.
+        guard detailedVehicles, ghostTunnels, trackTunnelBit != 0,
+              zoom >= Self.tunnelFetchZoom
         else {
-            if !tunnels.isEmpty { tunnels = []; tunnelRevision += 1; tunnelsViewport = nil }
+            if zoom < Self.tunnelFetchZoom, tunnelsViewport != nil {
+                tunnels = []
+                tunnelStations = []
+                tunnelRevision += 1
+                tunnelsViewport = nil
+            }
             return
         }
-        if abs(zoom - tunnelsZoom) < 1, let held = tunnelsViewport,
-           held.contains(lon: viewport.west, lat: viewport.south),
-           held.contains(lon: viewport.east, lat: viewport.north) {
-            return
-        }
+        // The fleet query includes noses one train length beyond the view;
+        // tunnel classification also needs the body behind each of those noses.
+        // A percentage-only margin collapses at close zoom and makes the shape
+        // coverage guard replace an otherwise visible train with its dot.
+        let bodyMargin = 2 * VehicleShape.longestVehicleMetres + 2
+        let required = viewport.padded(byMetres: bodyMargin)
+        if let held = tunnelsViewport, held.contains(required) { return }
         // Generously, and more generously than the track overlay is. A tunnel
         // is only useful whole: fetched to the edge of the screen, the
         // Lötschberg comes back as the two kilometres of it that happen to be
         // in view, its "portals" are wherever the box was cut, and a train
         // would be hung off an elevation taken from the middle of a mountain.
-        let generous = viewport.turned().padded(by: 1.5)
-        tunnels = await fleet.trackLines(
+        let generous = viewport.turned().padded(by: 1.5).padded(byMetres: bodyMargin)
+        let lines = await fleet.trackLines(
             in: generous, kindMask: trackTunnelBit
         ).map(\.points)
+        let stations = await fleet.tunnelStationPoints(in: generous)
+        guard !Task.isCancelled, detailedVehicles, ghostTunnels,
+              zoom >= Self.tunnelFetchZoom else { return }
+        tunnels = lines
+        tunnelStations = stations
         tunnelRevision += 1
         tunnelsViewport = generous
-        tunnelsZoom = zoom
+    }
+
+    /// Camera changes start this independently of timetable expansion and ticks.
+    /// One worker serves all callers; movement during a query gets a fresh pass
+    /// over the latest viewport instead of queuing every intermediate camera.
+    private func requestTrackRefresh() {
+        guard !isLoading, !backgroundWorkSuspended else { return }
+        trackRefreshPending = true
+        guard trackRefreshTask == nil else { return }
+        trackRefreshGeneration &+= 1
+        let generation = trackRefreshGeneration
+        trackRefreshTask = Task(priority: .userInitiated) { @MainActor [weak self] in
+            guard let self else { return }
+            repeat {
+                self.trackRefreshPending = false
+                await self.loadTracksIfNeeded()
+                guard !Task.isCancelled, !self.backgroundWorkSuspended,
+                      generation == self.trackRefreshGeneration else { return }
+            } while self.trackRefreshPending
+            self.trackRefreshTask = nil
+        }
     }
 
     func refreshTracksIfNeeded() async {
-        if trackTramBit == 0 { trackTramBit = await fleet.trackKindBit("tram") }
-        if trackTunnelBit == 0 { trackTunnelBit = await fleet.trackKindBit("tunnel") }
-        // Nothing to build while OpenRailwayMap's own lines are the ones being
-        // drawn: the segments would be uploaded, tessellated and then covered.
+        requestTrackRefresh()
+        await trackRefreshTask?.value
+    }
+
+    private static func trackDetailBand(_ zoom: Double) -> Int {
+        zoom >= 13 ? 3 : zoom >= 11 ? 2 : zoom >= 9 ? 1 : 0
+    }
+
+    private func loadTracksIfNeeded() async {
+        guard !Task.isCancelled, !backgroundWorkSuspended else { return }
+        // Update source visibility immediately, including the automatic ORM
+        // handover outside graph coverage, without waiting for a vehicle frame.
+        onMapOverlays?()
         guard ownTracksDrawn, trackOpacity > 0.01, zoom >= 6 else {
-            if !tracks.isEmpty { tracks = [] ; tracksViewport = nil }
+            if !tracks.isEmpty {
+                tracks = []
+                tracksViewport = nil
+                tracksRevision &+= 1
+                onMapOverlays?()
+            }
             return
         }
-        // Only when the view has actually moved. The overlay is thousands of
-        // segments and does not change between frames; rebuilding it fifteen
-        // times a second would spend the whole budget on redrawing the same
-        // rails.
-        let wantedMask: UInt8 = zoom < 11 ? await fleet.mainLineMask() : 0
-        if wantedMask == tracksMask, abs(zoom - tracksZoom) < 1, let held = tracksViewport,
-           held.contains(lon: viewport.west, lat: viewport.south),
-           held.contains(lon: viewport.east, lat: viewport.north) {
+        if trackOverlay == nil {
+            let snapshot = await fleet.trackOverlay()
+            guard !Task.isCancelled, !backgroundWorkSuspended else { return }
+            if snapshot.isReady, trackOverlay == nil { trackOverlay = snapshot }
+        }
+        guard let snapshot = trackOverlay else { return }
+        trackTramBit = snapshot.kindBit("tram")
+        trackTunnelBit = snapshot.kindBit("tunnel")
+        trackMainLineMask = snapshot.kindBit("heavy") | snapshot.kindBit("narrow")
+        let box = viewport
+        let requestedZoom = zoom
+        let mask = requestedZoom < 11 ? (trackMainLineMask ?? 0) : 0
+        if mask == tracksMask,
+           Self.trackDetailBand(requestedZoom) == Self.trackDetailBand(tracksZoom),
+           let held = tracksViewport,
+           held.contains(lon: box.west, lat: box.south),
+           held.contains(lon: box.east, lat: box.north) {
             return
         }
-        let generous = viewport.turned().padded(by: 0.4)
-        let mask = zoom < 11 ? await fleet.mainLineMask() : 0
-        // The mask changes what is drawn, so crossing the threshold has to
-        // rebuild even when the viewport has not moved.
-        if mask != tracksMask { tracksViewport = nil }
-        tracksMask = mask
-        // Detail is a function of zoom, so a zoom change must rebuild even when
-        // the viewport is still inside the box last fetched.
-        if abs(zoom - tracksZoom) >= 1 { tracksViewport = nil }
-        tracksZoom = zoom
-        // How much detail is worth drawing, by how far back the map is.
+        let generous = box.turned().padded(by: 0.4)
         let (minLength, tolerance): (Double, Double) =
-            zoom >= 13 ? (0, 0)
-            : zoom >= 11 ? (60, 4)
-            : zoom >= 9 ? (250, 15)
+            requestedZoom >= 13 ? (0, 0)
+            : requestedZoom >= 11 ? (60, 4)
+            : requestedZoom >= 9 ? (250, 15)
             : (900, 60)
-        tracks = await fleet.trackLines(
-            in: generous, kindMask: mask, minLength: minLength, simplify: tolerance
-        )
+        let worker = Task.detached(priority: .userInitiated) {
+            snapshot.lines(in: generous, kindMask: mask,
+                           minLength: minLength, simplify: tolerance)
+        }
+        let lines = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        guard !Task.isCancelled, !backgroundWorkSuspended,
+              ownTracksDrawn, trackOpacity > 0.01, zoom >= 6,
+              (zoom < 11 ? (trackMainLineMask ?? 0) : 0) == mask,
+              Self.trackDetailBand(zoom) == Self.trackDetailBand(requestedZoom),
+              generous.contains(viewport) else { return }
+        tracks = lines
+        tracksMask = mask
+        tracksZoom = requestedZoom
         tracksViewport = generous
+        tracksRevision &+= 1
+        onMapOverlays?()
     }
 }

@@ -31,16 +31,18 @@ public struct RouteStop: Sendable, Equatable, Identifiable {
     }
 }
 
-/// A whole line, from the mapped routes rather than from the feed.
+/// A whole route, from a mapped relation or a station-board service.
 ///
 /// The counterpart of `ServingLine`, which says only that a line calls here.
 /// This is the answer to the obvious next question — *where does it go?* — and
 /// it can be given at any hour, because a relation describes the network rather
 /// than what happens to be running on it.
 public struct RouteLine: Sendable, Identifiable {
-    /// The OSM relation, which is one *direction* of a line — and often one
-    /// working of it. See the note on `ServingLine`.
-    public var id: Int32
+    public enum ID: Sendable, Hashable {
+        case relation(Int32)
+        case service(String, Timestamp)
+    }
+    public var id: ID
     public var ref: String
     public var mode: Mode
     /// The line's name, or where it runs between.
@@ -54,8 +56,25 @@ public struct RouteLine: Sendable, Identifiable {
     public var geometry: JourneyGeometry?
 }
 
+extension RouteLine {
+    /// Keep station identity and repeated calls on loops while presenting a
+    /// service as a route without its live timing or vehicle position.
+    public init(entry: BoardEntry, calls: [Call], geometry: JourneyGeometry?) {
+        let publicCalls = calls.filter { !StopNaming.isTechnical($0.name) }
+        let stops = publicCalls.enumerated().map { index, call in
+            RouteStop(id: index, name: StopNaming.display(call.name),
+                      placeId: call.ref.map { StopRegister.stationOf($0) },
+                      lon: call.lon, lat: call.lat, rail: entry.mode == .train || entry.mode == .metro)
+        }
+        self.init(id: .service(entry.id, entry.departure), ref: entry.line, mode: entry.mode,
+                  headline: entry.to ?? "", operatorName: nil,
+                  from: stops.first?.name ?? entry.from, to: stops.last?.name ?? entry.to,
+                  stops: stops, geometry: geometry)
+    }
+}
+
 extension RouteLine: Equatable {
-    /// On the relation alone.
+    /// On route identity alone, including the occurrence for a board service.
     ///
     /// For the same reason `TapChoice` compares on its id: this travels as a
     /// `Selection`, which is compared on every write several times a second,
@@ -78,7 +97,7 @@ extension RelationStore {
     /// is a gap in the mapping rather than a reason to draw nothing. The map
     /// skips those beads and draws the line either way.
     public func wholeRoute(of relation: RouteRelation, calls: [Call]) -> JourneyGeometry? {
-        let raw = path(of: relation).toArray()
+        let raw = pathCoords(of: relation)
         guard raw.count > 1 else { return nil }
         let (path, cuts) = calls.isEmpty
             ? (raw, [Int?]())
@@ -129,8 +148,11 @@ extension Fleet {
         guard mode == .train else {
             return stopPlaces.nearest(lon: point.lon, lat: point.lat, within: reach)
         }
-        return stopPlaces.nearest(lon: point.lon, lat: point.lat, within: reach, matching: \.rail)
-            ?? stopPlaces.nearest(lon: point.lon, lat: point.lat, within: Self.unregisteredRailReach)
+        if let place = stopPlaces.nearest(lon: point.lon, lat: point.lat, within: reach, matching: \.rail)
+            ?? stopPlaces.nearest(lon: point.lon, lat: point.lat, within: Self.unregisteredRailReach) {
+            return place
+        }
+        return register.nearestForeign(lon: point.lon, lat: point.lat, within: reach)
     }
 
     /// How far a railway call may be from a stop place that is not marked as a
@@ -150,41 +172,111 @@ extension Fleet {
         let mode = Mode(osmRoute: relation.route)
         let reach = Self.nameReach(for: mode)
 
+        let points = relations.stopCoords(of: relation)
+        let overlayNames = relations.overlay(id: relation.id)?.stopNames ?? []
         var stops: [RouteStop] = []
         var calls: [Call] = []
         var previous: String?
-        for point in relations.stops(of: relation) {
-            guard let place = namePlace(point, mode: mode, within: reach) else { continue }
+        for (index, point) in points.enumerated() {
+            let named = overlayNames.indices.contains(index) ? overlayNames[index] : nil
+            let place = namePlace(point, mode: mode, within: reach)
+            let name = StopNaming.display(place?.name ?? named ?? "")
+            guard !name.isEmpty else { continue }
+            let identity = place?.id ?? name
             // Consecutive only: a station mapped as several nodes is one call,
             // and a loop that comes back to where it started is two.
-            if place.id == previous { continue }
-            previous = place.id
+            if identity == previous { continue }
+            previous = identity
 
             stops.append(RouteStop(
-                id: stops.count, name: place.name, placeId: place.id,
-                // The stop place's own point, because this is what the camera
-                // is sent to and what a board is opened at.
-                lon: place.lon, lat: place.lat, rail: place.rail
+                id: stops.count, name: name, placeId: place?.id,
+                lon: place?.lon ?? point.lon, lat: place?.lat ?? point.lat,
+                rail: place?.rail ?? (mode == .train)
             ))
-            // The mapped node, because this is what the path is cut at. A
-            // station centre is not on the tracks and would land the cut in a
-            // car park.
             calls.append(Call(
-                key: "\(relation.id):\(calls.count)", name: place.name,
+                key: "\(relation.id):\(calls.count)", name: name,
                 lat: point.lat, lon: point.lon, arr: 0, dep: 0
             ))
         }
 
         return RouteLine(
-            id: relation.id,
+            id: .relation(relation.id),
             ref: relation.ref ?? "",
             mode: mode,
-            headline: relation.name ?? "\(relation.from ?? "?") → \(relation.to ?? "?")",
+            headline: RouteNaming.headline(
+                name: relation.name, from: relation.from, to: relation.to
+            ) ?? "",
             operatorName: relation.operatorName,
-            from: relation.from,
-            to: relation.to,
+            from: relation.from.map(StopNaming.display),
+            to: relation.to.map(StopNaming.display),
             stops: stops,
             geometry: relations.wholeRoute(of: relation, calls: calls)
         )
+    }
+
+    /// Prefer a timetable working of this line when the mapped relation only
+    /// named a stub — ICE 60 clipped to Basel Bad and Müllheim.
+    public func enrichRouteLine(_ line: RouteLine, at now: Timestamp) -> RouteLine {
+        var line = line
+        line.headline = StopNaming.displayRoute(line.headline)
+        line.from = line.from.map(StopNaming.display)
+        line.to = line.to.map(StopNaming.display)
+        line.stops = line.stops.map { stop in
+            var stop = stop
+            stop.name = StopNaming.display(stop.name)
+            return stop
+        }
+        guard line.mode == .train, line.stops.count < 4 else { return line }
+
+        let wanted = RelationStore.normaliseRef(line.ref)
+        guard !wanted.isEmpty else { return line }
+
+        var extra: [Journey] = []
+        for placeId in line.stops.prefix(2).compactMap(\.placeId) {
+            var keys: Set<String> = [placeId]
+            if let sloid = StopRegister.sloid(forDidok: placeId) { keys.insert(sloid) }
+            if let didok = StopRegister.didok(forSloid: placeId) { keys.insert(didok) }
+            extra.append(contentsOf: scheduled(at: keys, from: now, filling: 0, of: 80))
+        }
+        extra.append(contentsOf: callers(matchingAnyOf: [line.ref]))
+        extra.append(contentsOf: boardFillJourneys().filter { Self.lineMatches($0, wanted: wanted) })
+
+        let matching = extra.filter { Self.lineMatches($0, wanted: wanted) }
+        guard let best = matching.max(by: { $0.stops.count < $1.stops.count }),
+              best.stops.count > line.stops.count
+        else { return line }
+
+        var stops: [RouteStop] = []
+        var previous: String?
+        for call in best.stops {
+            let name = StopNaming.display(call.name)
+            guard !name.isEmpty else { continue }
+            let placeId = call.ref.map {
+                StopRegister.didok(forSloid: $0) ?? StopRegister.stationOf($0)
+            }
+            let identity = placeId ?? name
+            if identity == previous { continue }
+            previous = identity
+            stops.append(RouteStop(
+                id: stops.count, name: name, placeId: placeId,
+                lon: call.lon, lat: call.lat, rail: true
+            ))
+        }
+        if stops.count > line.stops.count { line.stops = stops }
+        return line
+    }
+
+    static func lineMatches(_ journey: Journey, wanted: String) -> Bool {
+        guard !wanted.isEmpty else { return false }
+        let line = RelationStore.normaliseRef(journey.line)
+        if line == wanted { return true }
+        let cat = RelationStore.normaliseRef(journey.category)
+        let num = RelationStore.normaliseRef(journey.number)
+        if !cat.isEmpty, wanted.hasPrefix(cat) {
+            let rest = String(wanted.dropFirst(cat.count))
+            if rest == num || rest == line { return true }
+        }
+        let catNum = cat + num
+        return !catNum.isEmpty && catNum == wanted
     }
 }

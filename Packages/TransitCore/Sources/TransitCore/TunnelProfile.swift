@@ -60,9 +60,20 @@ public struct TunnelIndex: Sendable {
     /// Each wagon is faded on its own distance, so a rake is swallowed
     /// coach by coach rather than switching as a block.
     public static let fadeMetres = 36.0
+    /// A hiding stretch shorter than this is left drawn.
+    ///
+    /// About two coaches and a gap. A short cover that only swallows one
+    /// wagon at a time reads as a glitch, and the few dozen metres of bore
+    /// between an underground platform and daylight would blink a whole rake
+    /// off the moment it left the station and straight back on at the portal.
+    public static let minHideMetres = 80.0
     /// Ends this close are the same vertex, for welding split runs back
     /// together. See `weld`.
     public static let joinMetres = 8.0
+    /// Platform points do not carry the platform's length. Keep a platform-sized
+    /// section of its tunnel track visible, without opening the entire bore.
+    public static let stationHalfLength = 220.0
+    private static let stationTrackReach = 60.0
 
     /// One tunnel: its centreline, and how far along it each vertex is.
     public struct Bore: Sendable {
@@ -77,6 +88,8 @@ public struct TunnelIndex: Sendable {
         /// vertices; without a box to reject it against, every bus in Bern
         /// would walk the length of it twice a frame.
         public var box: BBox
+        /// Platform sections along this bore, in metres from its entrance.
+        public var stations: [ClosedRange<Double>] = []
         public var length: Double { run.last ?? 0 }
         /// The two portals, which are the two ends.
         public var entrance: Coord { points.first ?? Coord(lon: 0, lat: 0) }
@@ -125,8 +138,39 @@ public struct TunnelIndex: Sendable {
         public var heading: Double
     }
 
-    public init(_ runs: [[Coord]]) {
+    public init(_ runs: [[Coord]], stations: [Coord] = []) {
         bores = Self.makeBores(Self.weld(runs))
+        for index in bores.indices {
+            let bore = bores[index]
+            var ranges: [ClosedRange<Double>] = []
+            for station in stations where bore.box.contains(lon: station.lon, lat: station.lat) {
+                var nearest = Self.stationTrackReach
+                var along: Double?
+                for i in 1..<bore.points.count {
+                    let hit = Geo.projectOnSegment(
+                        lon: station.lon, lat: station.lat,
+                        a: bore.points[i - 1], b: bore.points[i]
+                    )
+                    guard hit.distance < nearest else { continue }
+                    nearest = hit.distance
+                    along = bore.run[i - 1] + Geo.metres(bore.points[i - 1], hit.foot)
+                }
+                if let along {
+                    let start = max(0, along - Self.stationHalfLength)
+                    let end = min(bore.length, along + Self.stationHalfLength)
+                    ranges.append(start...end)
+                }
+            }
+            var merged: [ClosedRange<Double>] = []
+            for range in ranges.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+                if let last = merged.last, range.lowerBound <= last.upperBound {
+                    merged[merged.count - 1] = last.lowerBound...max(last.upperBound, range.upperBound)
+                } else {
+                    merged.append(range)
+                }
+            }
+            bores[index].stations = merged
+        }
     }
 
     /// Stitch tunnel polylines that share an endpoint into longer bores.
@@ -297,10 +341,43 @@ public struct TunnelIndex: Sendable {
         return hit
     }
 
+    /// A tunnel section that should conceal a vehicle. The original bore stays
+    /// intact for elevation estimates; station exceptions only affect visibility.
+    public func hiding(at point: Coord, heading: Double? = nil) -> Inside? {
+        guard var hit = onTrack(point, heading: heading) else { return nil }
+        guard let span = Self.hiddenSpan(along: hit.along, in: bores[hit.bore]) else {
+            return nil
+        }
+        hit.fromPortal = min(hit.along - span.lowerBound, span.upperBound - hit.along)
+        return hit
+    }
+
+    /// The run of tunnel that would conceal a wagon here, if that run is long
+    /// enough to be worth disappearing into.
+    ///
+    /// Portals and station sections are openings. A wagon between two of
+    /// those is underground; a wagon in a station section is not; and a wagon
+    /// in a gap shorter than `minHideMetres` is treated as not either.
+    static func hiddenSpan(along: Double, in bore: Bore) -> ClosedRange<Double>? {
+        var left = 0.0
+        var right = bore.length
+        for station in bore.stations {
+            if station.contains(along) { return nil }
+            if station.upperBound <= along {
+                left = max(left, station.upperBound)
+            }
+            if station.lowerBound >= along {
+                right = min(right, station.lowerBound)
+            }
+        }
+        guard right - left >= minHideMetres else { return nil }
+        return left...right
+    }
+
     /// How hidden a wagon at this point is: 0 in the open, 1 once it is
     /// far enough inside to vanish. See `fadeMetres`.
     public func fade(at point: Coord, heading: Double? = nil) -> Double {
-        guard let hit = onTrack(point, heading: heading) else { return 0 }
+        guard let hit = hiding(at: point, heading: heading) else { return 0 }
         return Self.fade(hit.fromPortal)
     }
 

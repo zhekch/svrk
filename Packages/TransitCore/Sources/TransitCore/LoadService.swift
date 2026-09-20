@@ -101,6 +101,15 @@ public actor LoadService {
             self.day = day
         }
 
+        /// A board can show tomorrow's run without adding it to the live map
+        /// fleet. Use that snapshot's reference and service day, not a lookup
+        /// of today's instance under the same timetable row ID.
+        public init?(vehicle: VehicleSnapshot) {
+            guard let ref = vehicle.journeyRef, !ref.isEmpty,
+                  let first = vehicle.stops.first else { return nil }
+            self.init(journeyID: ref, day: Self.day(of: first.sched ?? first.dep))
+        }
+
         /// The operating day for a journey that started at `start`.
         public static func day(of start: Timestamp) -> String {
             var calendar = Calendar(identifier: .gregorian)
@@ -134,8 +143,10 @@ public actor LoadService {
     /// `background` marks a request nobody is waiting for: answered from the
     /// cache like any other, but it will not spend the last of the minute's
     /// budget and gives up rather than queueing behind a full window.
-    public func load(for key: Key, background: Bool = false) async -> Answer {
-        if let held = cache[key], Date().timeIntervalSince(held.at) < Self.ttl {
+    /// Open cards pass `maxAge: 0` on opening and each poll; in-flight requests
+    /// still coalesce, and reading their timing half costs no second request.
+    public func load(for key: Key, background: Bool = false, maxAge: TimeInterval = 240) async -> Answer {
+        if let held = cache[key], Date().timeIntervalSince(held.at) < min(Self.ttl, maxAge) {
             return held.answer
         }
         // A panel re-read while its first request is still open is one request.
@@ -302,8 +313,49 @@ public actor LoadService {
         }
     }
 
-    static func stopEventRequest(stopPlace: String, limit: Int, now: Date = Date()) -> String {
+    /// Whole workings leaving one stop, for a board the packed timetable
+    /// truncated at the border.
+    ///
+    /// Asked in the foreground: somebody just opened the board, and the Swiss
+    /// snapshot at Milano is RE80 without the EC. Cached per stop so a second
+    /// tap inside a minute does not spend another of the fifty. A visible
+    /// board can bypass this hold with `maxAge: 0` for its live polling.
+    public func boardJourneys(
+        from stopPlace: String, at moment: Date = Date(), limit: Int = 50, maxAge: TimeInterval = 90
+    ) async -> [Journey] {
+        guard configured, !stopPlace.isEmpty else { return [] }
+        let cacheKey = "\(stopPlace)|\(Int(moment.timeIntervalSince1970) / 120)"
+        if let held = boardCache[cacheKey], Date().timeIntervalSince(held.at) < min(Self.boardTTL, maxAge) {
+            return held.journeys
+        }
+        do {
+            let body = Data(
+                Self.stopEventRequest(
+                    stopPlace: stopPlace, limit: limit, now: moment, includeCalls: true
+                ).utf8
+            )
+            let data = try await client.post(OTDClient.ojp, body: body)
+            asked += 1
+            let journeys = OJPTimings.stopEventJourneys(data)
+            boardCache[cacheKey] = (journeys: journeys, at: Date())
+            return journeys
+        } catch {
+            lastError = String(describing: error)
+            return []
+        }
+    }
+
+    private var boardCache: [String: (journeys: [Journey], at: Date)] = [:]
+    static let boardTTL: TimeInterval = 90
+
+    static func stopEventRequest(
+        stopPlace: String, limit: Int, now: Date = Date(), includeCalls: Bool = false
+    ) -> String {
         let stamp = ISO8601DateFormatter().string(from: now)
+        let calls = includeCalls ? "true" : "false"
+        let atStop = includeCalls
+            ? "<DepArrTime>\(stamp)</DepArrTime>"
+            : ""
         return """
         <?xml version="1.0" encoding="UTF-8"?>
         <OJP xmlns="http://www.vdv.de/ojp" xmlns:siri="http://www.siri.org.uk/siri" version="2.0">
@@ -313,12 +365,12 @@ public actor LoadService {
         <siri:RequestorRef>\(OTDClient.userAgent)</siri:RequestorRef>
         <OJPStopEventRequest>
         <siri:RequestTimestamp>\(stamp)</siri:RequestTimestamp>
-        <Location><PlaceRef><StopPlaceRef>\(escape(stopPlace))</StopPlaceRef></PlaceRef></Location>
+        <Location><PlaceRef><StopPlaceRef>\(escape(stopPlace))</StopPlaceRef></PlaceRef>\(atStop)</Location>
         <Params>
         <NumberOfResults>\(limit)</NumberOfResults>
         <StopEventType>departure</StopEventType>
-        <IncludePreviousCalls>false</IncludePreviousCalls>
-        <IncludeOnwardCalls>false</IncludeOnwardCalls>
+        <IncludePreviousCalls>\(calls)</IncludePreviousCalls>
+        <IncludeOnwardCalls>\(calls)</IncludeOnwardCalls>
         <IncludeRealtimeData>true</IncludeRealtimeData>
         </Params>
         </OJPStopEventRequest>
@@ -401,12 +453,12 @@ enum OJPLoad {
         return out
     }
 
-    /// Every `<name>…</name>` in `text`. Non-nesting, which holds for all three
-    /// elements this reads.
+    /// Every `<name …>…</name>` in `text`. Attributes such as xml:lang on
+    /// quay Text elements must not make an otherwise valid element disappear.
     static func blocks(_ text: Substring, _ name: String) -> [Substring] {
         var out: [Substring] = []
         var cursor = text.startIndex
-        while let open = text.range(of: "<\(name)>", range: cursor..<text.endIndex),
+        while let open = opening(text, name, from: cursor),
               let close = text.range(of: "</\(name)>", range: open.upperBound..<text.endIndex) {
             out.append(text[open.upperBound..<close.lowerBound])
             cursor = close.upperBound
@@ -415,9 +467,37 @@ enum OJPLoad {
     }
 
     static func first(_ text: Substring, _ name: String) -> String? {
-        guard let open = text.range(of: "<\(name)>"),
+        guard let open = opening(text, name, from: text.startIndex),
               let close = text.range(of: "</\(name)>", range: open.upperBound..<text.endIndex)
         else { return nil }
         return String(text[open.upperBound..<close.lowerBound])
+    }
+
+    static func opening(_ text: Substring, _ name: String, from start: String.Index) -> Range<String.Index>? {
+        var cursor = start
+        search: while let prefix = text.range(of: "<\(name)", range: cursor..<text.endIndex) {
+            cursor = prefix.upperBound
+            guard cursor < text.endIndex else { return nil }
+            guard text[cursor] == ">" || text[cursor].isWhitespace else { continue }
+            var quote: Character?
+            var index = cursor
+            while index < text.endIndex {
+                let c = text[index]
+                if let quoted = quote {
+                    if c == quoted { quote = nil }
+                } else if c == "\"" || c == "'" {
+                    quote = c
+                } else if c == ">" {
+                    if text[text.index(before: index)] == "/" {
+                        cursor = text.index(after: index)
+                        continue search // Empty element; do not consume a later sibling.
+                    }
+                    return prefix.lowerBound..<text.index(after: index)
+                }
+                index = text.index(after: index)
+            }
+            return nil
+        }
+        return nil
     }
 }

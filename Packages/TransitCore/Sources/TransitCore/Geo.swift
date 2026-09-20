@@ -15,6 +15,10 @@ public struct Coord: Equatable, Hashable, Sendable, Codable {
         self.lon = lon
         self.lat = lat
     }
+
+    /// `(0, 0)` is how an unplaced call is written throughout the pipeline.
+    /// That point is in the Gulf of Guinea, not on any network this app draws.
+    public var isPlaced: Bool { lat != 0 || lon != 0 }
 }
 
 /// A west/south/east/north bounding box.
@@ -33,6 +37,16 @@ public struct BBox: Hashable, Sendable, Codable {
 
     public func contains(lon: Double, lat: Double) -> Bool {
         lat >= south && lat <= north && lon >= west && lon <= east
+    }
+
+    /// Whether every edge of `other` sits inside this box.
+    ///
+    /// Used to decide whether a viewport is already covered by a region the
+    /// timetable has expanded, so a pan that has not left that region does not
+    /// spend another pass building journeys it already holds.
+    public func contains(_ other: BBox) -> Bool {
+        other.west >= west && other.east <= east
+            && other.south >= south && other.north <= north
     }
 
     /// Whether the two boxes overlap at all.
@@ -112,16 +126,101 @@ public struct BBox: Hashable, Sendable, Codable {
             east: midLon + lon, north: midLat + lat
         )
     }
+
+    /// Intersection with a square of `maxMetres` around `center`.
+    ///
+    /// Used to cut a tilted camera's unprojected box down from "the horizon"
+    /// to a look-ahead the fleet query and overlays can actually walk. If the
+    /// intersection is empty — the unprojected quad missed the camera centre,
+    /// which happens when only the bottom of a steep view lands on the globe —
+    /// the square itself is the answer, so the query still has somewhere to
+    /// look.
+    public func clamped(around center: Coord, maxMetres: Double) -> BBox {
+        let cap = BBox(
+            west: center.lon, south: center.lat,
+            east: center.lon, north: center.lat
+        ).padded(byMetres: maxMetres)
+        let west = max(self.west, cap.west)
+        let south = max(self.south, cap.south)
+        let east = min(self.east, cap.east)
+        let north = min(self.north, cap.north)
+        guard west < east, south < north else { return cap }
+        return BBox(west: west, south: south, east: east, north: north)
+    }
 }
 
 public enum Geo {
     static let earthRadius = 6_371_000.0
     /// Metres per degree of latitude. Constant enough at this scale; the
     /// original uses the same figure throughout.
-    static let metresPerDegree = 111_320.0
+    public static let metresPerDegree = 111_320.0
+
+    /// Pitch above which a camera's top edge unprojects toward the horizon
+    /// and the axis-aligned box around it is no longer a viewport. Below this
+    /// the unprojected quad is already the screen and must not be capped —
+    /// zoom 8 looking straight down is a picture of the country.
+    public static let tiltLookAheadPitch = 6.0
+
+    /// How far a tilted camera may load, in metres on the ground.
+    ///
+    /// Unprojecting the top of a 60° view reaches the horizon. The fleet
+    /// query, the overlays and — via fog — the basemap's 3D objects walk
+    /// that box. Capped here: kilometres of track ahead of a followed train,
+    /// not the next canton. Grows with pitch (more ground in the frustum)
+    /// and with metres-per-point (a wider map). Hard ceiling 8 km.
+    public static func tiltedLookAheadMetres(
+        metresPerPoint: Double, screenHeight: Double, pitch: Double
+    ) -> Double {
+        let pitchRad = toRad(min(max(pitch, 0), 75))
+        let along = metresPerPoint * max(screenHeight, 1)
+            * (1.15 + 2.8 * tan(pitchRad))
+        return min(8_000, max(700, along))
+    }
 
     @inline(__always) public static func toRad(_ degrees: Double) -> Double { degrees * .pi / 180 }
     @inline(__always) public static func toDeg(_ radians: Double) -> Double { radians * 180 / .pi }
+
+    /// Where the sun is in the sky at a place, in degrees.
+    ///
+    /// `elevation` is above the horizon (negative at night). `hourAngle` is
+    /// negative in the morning and positive in the afternoon, so the same
+    /// altitude can be told apart as dawn or dusk. NOAA solar-position
+    /// approximation, good to a fraction of a degree — plenty for lighting.
+    public static func sunPosition(
+        at date: Date, latitude: Double, longitude: Double
+    ) -> (elevation: Double, hourAngle: Double) {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let dayOfYear = Double(calendar.ordinality(of: .day, in: .year, for: date) ?? 1)
+        let parts = calendar.dateComponents([.hour, .minute, .second], from: date)
+        let hour = Double(parts.hour ?? 0)
+            + Double(parts.minute ?? 0) / 60
+            + Double(parts.second ?? 0) / 3600
+
+        let gamma = 2 * Double.pi / 365 * (dayOfYear - 1 + (hour - 12) / 24)
+        let eqTime = 229.18 * (
+            0.000075
+            + 0.001868 * cos(gamma) - 0.032077 * sin(gamma)
+            - 0.014615 * cos(2 * gamma) - 0.040849 * sin(2 * gamma)
+        )
+        let decl = (
+            0.006918
+            - 0.399912 * cos(gamma) + 0.070257 * sin(gamma)
+            - 0.006758 * cos(2 * gamma) + 0.000907 * sin(2 * gamma)
+            - 0.002697 * cos(3 * gamma) + 0.00148 * sin(3 * gamma)
+        )
+        var trueSolar = hour * 60 + eqTime + 4 * longitude
+        trueSolar = trueSolar.truncatingRemainder(dividingBy: 1440)
+        if trueSolar < 0 { trueSolar += 1440 }
+        var hourAngle = trueSolar / 4 - 180
+        if hourAngle < -180 { hourAngle += 360 }
+
+        let latR = toRad(latitude)
+        let haR = toRad(hourAngle)
+        let cosZenith = sin(latR) * sin(decl) + cos(latR) * cos(decl) * cos(haR)
+        let zenith = acos(min(1, max(-1, cosZenith)))
+        return (90 - toDeg(zenith), hourAngle)
+    }
 
     /// Haversine distance in metres.
     public static func metres(_ aLon: Double, _ aLat: Double, _ bLon: Double, _ bLat: Double) -> Double {
@@ -134,6 +233,63 @@ public enum Geo {
 
     public static func metres(_ a: Coord, _ b: Coord) -> Double {
         metres(a.lon, a.lat, b.lon, b.lat)
+    }
+
+    /// A single step longer than this, *and* much longer than the rest of the
+    /// path, is a stitch jump rather than track.
+    ///
+    /// OSM railway vertices are tens to hundreds of metres apart. A hop of
+    /// thirty kilometres is two member ways concatenated across a gap. A
+    /// uniformly coarse path — a three-point overlay of Frankfurt–Basel — is
+    /// not: every step is long, none is an outlier.
+    public static let mappedJumpMetres = 30_000.0
+
+    /// Whether any vertex is the unplaced sentinel. A single one turns a Swiss
+    /// polyline into a meridian through the Gulf of Guinea.
+    public static func hasUnplaced(_ path: [Coord]) -> Bool {
+        path.contains { !$0.isPlaced }
+    }
+
+    /// Drop sentinel vertices. Neighbours of a removed point are *not* joined
+    /// with a chord: that chord would be the Africa line this exists to stop.
+    public static func withoutUnplaced(_ path: [Coord]) -> [Coord] {
+        path.filter(\.isPlaced)
+    }
+
+    /// Whether `path` contains a vertex-to-vertex hop that cannot be real track.
+    ///
+    /// Two points are a chord, not a stitch error. A jump is a long step
+    /// *inside* a polyline that otherwise follows the rails. A sentinel
+    /// vertex is always a jump, including on a two-point chord to Null Island.
+    public static func hasJump(_ path: [Coord], over metres: Double = mappedJumpMetres) -> Bool {
+        guard !hasUnplaced(path) else { return true }
+        guard path.count >= 3 else { return false }
+        var steps: [Double] = []
+        steps.reserveCapacity(path.count - 1)
+        for i in 1..<path.count {
+            steps.append(flatMetres(path[i - 1].lon, path[i - 1].lat, path[i].lon, path[i].lat))
+        }
+        let long = steps.filter { $0 > metres }
+        guard !long.isEmpty else { return false }
+        let sorted = steps.sorted()
+        let median = sorted[sorted.count / 2]
+        let outlier = max(metres, median * 20)
+        return long.contains { $0 > outlier }
+    }
+
+    /// Whether a mapped slice could be the rails between two stops.
+    ///
+    /// Alpine railways bend, so the path may be longer than the geodesic; three
+    /// copies of the same corridor stitched end to end may not. A jump inside
+    /// the slice is never plausible.
+    public static func plausibleRoute(
+        _ path: [Coord], from: Coord, to: Coord,
+        maxDetour: Double = 2.5, extraMetres: Double = 15_000
+    ) -> Bool {
+        guard path.count >= 2, from.isPlaced, to.isPlaced, !hasJump(path) else { return false }
+        let along = length(of: path)
+        let direct = max(1, metres(from, to))
+        return along <= max(direct * maxDetour, direct + extraMetres)
     }
 
     /// Flat-earth distance in metres, scaled at `b`'s latitude.
@@ -562,5 +718,252 @@ extension Geo {
             return (first, last)
         }
         return nil
+    }
+}
+
+extension Geo {
+    /// Chaikin's corner-cutting for an open polyline.
+    ///
+    /// One iteration is the cheap version of what a vector-tile renderer does
+    /// when it turns a simplified centreline into a stroke: keep the endpoints,
+    /// replace every kink with a pair of points a quarter of the way along the
+    /// two edges. Railway and tram alignments do not actually turn on a node,
+    /// so the result reads as a curve rather than a chain of chords.
+    public static func chaikin(_ points: [Coord], iterations: Int = 1) -> [Coord] {
+        guard points.count >= 3, iterations > 0 else { return points }
+        var current = points
+        for _ in 0 ..< iterations {
+            var next: [Coord] = []
+            next.reserveCapacity(max(4, current.count * 2))
+            next.append(current[0])
+            for index in 0 ..< current.count - 1 {
+                let from = current[index]
+                let to = current[index + 1]
+                next.append(
+                    Coord(
+                        lon: 0.75 * from.lon + 0.25 * to.lon,
+                        lat: 0.75 * from.lat + 0.25 * to.lat
+                    )
+                )
+                next.append(
+                    Coord(
+                        lon: 0.25 * from.lon + 0.75 * to.lon,
+                        lat: 0.25 * from.lat + 0.75 * to.lat
+                    )
+                )
+            }
+            next.append(current[current.count - 1])
+            current = next
+        }
+        return current
+    }
+
+    /// Concatenate polylines whose endpoints fall within `metres` of each other.
+    ///
+    /// `RailNet.lines` stops at every junction, so a single visual corridor
+    /// arrives as many short runs that share a node. A unique neighbour is
+    /// always the continuation, even through a hairpin. Several neighbours is
+    /// a fork: only the straightest arm is taken, and only if it actually
+    /// continues rather than branching off, so a siding cannot steal the
+    /// main line.
+    public static func join(
+        _ lines: [[Coord]],
+        within metres: Double,
+        maxForkTurn: Double = 80
+    ) -> [[Coord]] {
+        struct Piece {
+            var points: [Coord]
+            var used = false
+        }
+        var pieces = lines.filter { $0.count >= 2 }.map { Piece(points: $0) }
+        guard pieces.count > 1 else { return pieces.map(\.points) }
+
+        func turn(_ a: Double, _ b: Double) -> Double {
+            let delta = abs(a - b).truncatingRemainder(dividingBy: 360)
+            return min(delta, 360 - delta)
+        }
+
+        func candidates(at: Coord) -> [(index: Int, atStart: Bool)] {
+            var found: [(Int, Bool)] = []
+            for (index, piece) in pieces.enumerated() where !piece.used {
+                let start = piece.points[0]
+                let end = piece.points[piece.points.count - 1]
+                if flatMetres(at.lon, at.lat, start.lon, start.lat) <= metres {
+                    found.append((index, true))
+                }
+                if flatMetres(at.lon, at.lat, end.lon, end.lat) <= metres {
+                    found.append((index, false))
+                }
+            }
+            return found
+        }
+
+        func pick(at: Coord, incoming: Double) -> (index: Int, atStart: Bool)? {
+            let found = candidates(at: at)
+            guard !found.isEmpty else { return nil }
+            if found.count == 1 { return found[0] }
+            var best: (Int, Bool, Double)?
+            for (index, atStart) in found {
+                let pts = pieces[index].points
+                let outgoing = atStart
+                    ? bearing(pts[0], pts[1])
+                    : bearing(pts[pts.count - 1], pts[pts.count - 2])
+                let delta = turn(incoming, outgoing)
+                if delta <= maxForkTurn, best == nil || delta < best!.2 {
+                    best = (index, atStart, delta)
+                }
+            }
+            return best.map { ($0.0, $0.1) }
+        }
+
+        func append(_ chain: inout [Coord], piece: [Coord], atStart: Bool) {
+            let extra = atStart ? piece : Array(piece.reversed())
+            if chain.isEmpty {
+                chain = extra
+                return
+            }
+            chain.append(contentsOf: extra.dropFirst())
+        }
+
+        var joined: [[Coord]] = []
+        joined.reserveCapacity(pieces.count)
+        for index in pieces.indices where !pieces[index].used {
+            pieces[index].used = true
+            var chain = pieces[index].points
+            while chain.count >= 2 {
+                let incoming = bearing(chain[chain.count - 2], chain[chain.count - 1])
+                guard let next = pick(at: chain[chain.count - 1], incoming: incoming) else { break }
+                pieces[next.index].used = true
+                append(&chain, piece: pieces[next.index].points, atStart: next.atStart)
+            }
+            chain.reverse()
+            while chain.count >= 2 {
+                let incoming = bearing(chain[chain.count - 2], chain[chain.count - 1])
+                guard let next = pick(at: chain[chain.count - 1], incoming: incoming) else { break }
+                pieces[next.index].used = true
+                append(&chain, piece: pieces[next.index].points, atStart: next.atStart)
+            }
+            chain.reverse()
+            if chain.count >= 2 { joined.append(chain) }
+        }
+        return joined
+    }
+
+    /// The contiguous slice of `points` that covers `box`, grown from `index`.
+    ///
+    /// One run, not the clipped fragments: `line-trim-offset` is a fraction of
+    /// a single feature, so the vehicle's visible path has to stay one
+    /// LineString. Vertices just outside the box are kept so the line meets
+    /// the frame rather than stopping a pixel short.
+    public static func window(
+        _ points: [Coord], around index: Int, inside box: BBox
+    ) -> (lo: Int, hi: Int)? {
+        guard points.count >= 2 else { return nil }
+        let seed = min(max(0, index), points.count - 1)
+        var lo = seed
+        var hi = seed
+        while lo > 0, box.contains(lon: points[lo - 1].lon, lat: points[lo - 1].lat) {
+            lo -= 1
+        }
+        while hi < points.count - 1, box.contains(lon: points[hi + 1].lon, lat: points[hi + 1].lat) {
+            hi += 1
+        }
+        if lo > 0 { lo -= 1 }
+        if hi < points.count - 1 { hi += 1 }
+        guard hi > lo else { return nil }
+        return (lo, hi)
+    }
+
+    /// All visible portions of a route, including re-entries and segments
+    /// crossing the view whose endpoints are both outside it. The selected
+    /// vehicle may be elsewhere; it must not choose which route section draws.
+    public static func visibleWindow(_ points: [Coord], inside box: BBox) -> (lo: Int, hi: Int)? {
+        guard points.count >= 2 else { return nil }
+        var first: Int?
+        var last = 0
+        for index in 0..<(points.count - 1) {
+            guard clipSegment(from: points[index], to: points[index + 1], box: box) != nil else { continue }
+            if first == nil { first = index }
+            last = index + 1
+        }
+        return first.map { ($0, last) }
+    }
+
+    /// Split a polyline at the edges of an axis-aligned box and keep the
+    /// interior runs. A long corridor can then be stored whole and only the
+    /// visible slice decoded for a watch camera.
+    public static func clipped(_ points: [Coord], to box: BBox) -> [[Coord]] {
+        guard points.count >= 2 else { return [] }
+        var result: [[Coord]] = []
+        var current: [Coord] = []
+
+        func push(_ point: Coord) {
+            if let last = current.last,
+               abs(last.lon - point.lon) < 0.000_000_1,
+               abs(last.lat - point.lat) < 0.000_000_1 {
+                return
+            }
+            current.append(point)
+        }
+
+        func finish() {
+            if current.count >= 2 { result.append(current) }
+            current.removeAll(keepingCapacity: true)
+        }
+
+        for index in 0 ..< points.count - 1 {
+            let from = points[index]
+            let to = points[index + 1]
+            guard let clipped = clipSegment(from: from, to: to, box: box) else {
+                finish()
+                continue
+            }
+            push(clipped.start)
+            push(clipped.end)
+            let endedAtDestination =
+                abs(clipped.end.lon - to.lon) < 0.000_000_1
+                && abs(clipped.end.lat - to.lat) < 0.000_000_1
+            if !endedAtDestination { finish() }
+        }
+        finish()
+        return result
+    }
+
+    /// Liang–Barsky clip of one segment against `box`. Nil means the segment
+    /// misses the box entirely.
+    public static func clipSegment(
+        from: Coord,
+        to: Coord,
+        box: BBox
+    ) -> (start: Coord, end: Coord)? {
+        var t0 = 0.0
+        var t1 = 1.0
+        let deltaLon = to.lon - from.lon
+        let deltaLat = to.lat - from.lat
+
+        func clip(_ p: Double, _ q: Double) -> Bool {
+            if abs(p) < 1e-18 { return q >= 0 }
+            let r = q / p
+            if p < 0 {
+                if r > t1 { return false }
+                if r > t0 { t0 = r }
+            } else {
+                if r < t0 { return false }
+                if r < t1 { t1 = r }
+            }
+            return true
+        }
+
+        guard clip(-deltaLon, from.lon - box.west),
+              clip(deltaLon, box.east - from.lon),
+              clip(-deltaLat, from.lat - box.south),
+              clip(deltaLat, box.north - from.lat),
+              t0 <= t1
+        else { return nil }
+
+        return (
+            Coord(lon: from.lon + t0 * deltaLon, lat: from.lat + t0 * deltaLat),
+            Coord(lon: from.lon + t1 * deltaLon, lat: from.lat + t1 * deltaLat)
+        )
     }
 }

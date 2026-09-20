@@ -38,6 +38,8 @@ public struct Call: Sendable, Codable, Equatable {
     /// tells two runs of a reused trip number apart, which a delayed live time
     /// cannot do because it moves between one poll and the next.
     public var sched: Timestamp?
+    /// Immutable booked arrival, used when a later feed reports only a delay.
+    public var scheduledArrival: Timestamp?
     /// The letter this app assigned to an unsigned kerb. Kept apart from
     /// `platform` so nothing that matches a reported platform against the
     /// register can ever match against a letter we invented.
@@ -77,7 +79,8 @@ public struct Call: Sendable, Codable, Equatable {
         sched: Timestamp? = nil,
         assigned: String? = nil,
         cancelled: Bool = false,
-        extra: Bool = false
+        extra: Bool = false,
+        scheduledArrival: Timestamp? = nil
     ) {
         self.key = key
         self.ref = ref
@@ -92,12 +95,33 @@ public struct Call: Sendable, Codable, Equatable {
         self.observed = observed
         self.note = note
         self.sched = sched
+        self.scheduledArrival = scheduledArrival ?? (delay == nil || delay == 0 ? arr : nil)
         self.assigned = assigned
         self.cancelled = cancelled
         self.extra = extra
     }
 
     public var coord: Coord { Coord(lon: lon, lat: lat) }
+
+    /// `(0, 0)` is how an unplaced call is written. It is not a stop.
+    public var isPlaced: Bool { lat != 0 || lon != 0 }
+
+    /// Departure the passenger should plan for. `dep` is already the live time
+    /// when a stop-time update has been folded in.
+    public var expectedDeparture: Timestamp { dep }
+
+    /// Arrival has already been normalised at ingestion. Guessing another
+    /// delay here makes the card disagree with the map, especially at dwells.
+    public var expectedArrival: Timestamp { min(arr, dep) }
+
+    /// Clock time the next-stop line should share with the call list.
+    ///
+    /// A halt of two minutes or less is printed as one time down the list —
+    /// the departure. Naming a different arrival beside it reads as if the
+    /// delay was ignored.
+    public var displayedArrival: Timestamp {
+        dep - arr <= 120 ? expectedDeparture : expectedArrival
+    }
 }
 
 /// Where a leg's drawn geometry came from, per leg.
@@ -202,6 +226,20 @@ public struct JourneyGeometry: Sendable, Codable, Equatable {
     /// pass has run, so the draw loop can tell a corridor path from a finished
     /// one without rebuilding it to find out.
     public var refined: Bool
+
+    /// Nothing on the packed Swiss network described this run, so the path is
+    /// still the chord between stops. That is the case worth asking Overpass
+    /// about — see `OSMRouteClient`.
+    public var isUnmapped: Bool {
+        source == .straight
+            || (!legSources.isEmpty && legSources.allSatisfy { $0 == .chord })
+    }
+
+    /// At least one stop-to-stop hop is still a chord, so a selected vehicle
+    /// is worth an Overpass lookup even when the Swiss legs already routed.
+    public var hasUnmappedLeg: Bool {
+        source == .straight || legSources.contains(.chord)
+    }
 
     public init(
         path: [Coord], legs: [Int], source: GeometrySource, mixed: Bool,
@@ -315,6 +353,11 @@ public final class Journey: @unchecked Sendable {
     /// already on the map as the working that brought it in, the early
     /// appearance is simply skipped. See `Positioning.preDepartureLead`.
     public var heldUntil: Timestamp?
+    /// A detached portion is already present when its sibling departs, even
+    /// if its own departure is later than the normal pre-departure window.
+    public var splitAppearance: Timestamp?
+    /// Published departing portions of a split; rebuilt with the physical fleet.
+    public var splitContinuations: [String] = []
 
     /// Where the last position query found this vehicle.
     ///
@@ -340,13 +383,11 @@ public final class Journey: @unchecked Sendable {
     /// sees, and it is the correction being right rather than anything being
     /// wrong.
     ///
-    /// So the correction is kept and spent over the next fraction of a second
-    /// instead of all at once. Held in *seconds of this journey's own
-    /// schedule* rather than in metres: a shift in the timetable is exactly
-    /// what a re-time is, so winding the clock forward by it reproduces the
-    /// old position precisely, and letting that wind-forward decay to zero
-    /// walks the vehicle along its own path to the new one. It cannot leave
-    /// the rails, cannot overshoot, and needs nothing from the geometry.
+    /// Small backward corrections are absorbed by slowing progress until the
+    /// updated timetable catches up. Substantial changes still settle briefly
+    /// so the marker does not conceal a real delay. The correction is held in
+    /// seconds of this journey's schedule: winding its clock reproduces the
+    /// previously drawn position without moving the vehicle off its rails.
     public var settle: Settle?
 
     /// A correction in flight. See `Journey.settle`.
@@ -359,11 +400,15 @@ public final class Journey: @unchecked Sendable {
         public var from: Double
         /// How long the glide lasts.
         public var over: Double
+        /// Near the next arrival, a linear clock correction can finish on
+        /// time without briefly running the displayed clock backwards.
+        public var linear: Bool
 
-        public init(seconds: Double, from: Double, over: Double) {
+        public init(seconds: Double, from: Double, over: Double, linear: Bool = false) {
             self.seconds = seconds
             self.from = from
             self.over = over
+            self.linear = linear
         }
     }
 
@@ -479,6 +524,7 @@ public final class Journey: @unchecked Sendable {
         // whole `Call`, which is six reference-counted strings, and this walks
         // every call of every running journey.
         for index in stops.indices {
+            guard stops[index].isPlaced else { continue }
             let lon = stops[index].lon, lat = stops[index].lat
             if lon < west { west = lon }
             if lon > east { east = lon }
@@ -496,5 +542,268 @@ public final class Journey: @unchecked Sendable {
         geometry = nil
         legsFromRoute = 0
         legsFromGraph = 0
+        callHull = nil
+        drawnBox = nil
+    }
+
+    /// Fold calls the packed timetable omitted onto either end of the run.
+    ///
+    /// Swiss GTFS cuts international trains at the border. OJP still publishes
+    /// the rest: Milano *before* Domodossola on a northbound EC, Stresa and
+    /// Milano *after* it on a southbound one. The old join only adopted a
+    /// tail, so opening EC 66 never showed where it had come from.
+    @discardableResult
+    public func absorb(extras: [Call], resolve: (String, String?) -> Place?) -> Bool {
+        guard !extras.isEmpty, !stops.isEmpty else { return false }
+
+        var unique: [Call] = []
+        for extra in extras {
+            if unique.contains(where: {
+                Self.sameListedStop($0, extra) && abs($0.dep - extra.dep) < 180
+            }) { continue }
+            unique.append(extra)
+        }
+        guard !unique.isEmpty else { return false }
+
+        func placed(_ extra: Call) -> Call? {
+            var call = extra
+            call.name = StopNaming.display(extra.name)
+            if let ref = extra.ref, let place = resolve(ref, extra.platform),
+               place.lat != 0 || place.lon != 0 {
+                call.lat = place.lat
+                call.lon = place.lon
+                if call.name.isEmpty || call.name == ref {
+                    call.name = StopNaming.display(place.name)
+                }
+                call.platform = extra.platform ?? place.platform
+                call.precise = place.precise
+                call.assigned = place.assigned
+            }
+            // OJP TripInfo and formation lists mint extras at `(0, 0)` and
+            // ask the register to fill them in. A miss used to keep the
+            // sentinel, and GeometryBuilder then drew a chord through the
+            // Gulf of Guinea — the 40,000 km/h meridian on a selected IC.
+            guard call.isPlaced else { return nil }
+            return call
+        }
+
+        var grew = false
+        if let first = stops.first,
+           let at = unique.firstIndex(where: { Self.sameListedStop(first, $0) }),
+           at > unique.startIndex {
+            let head = unique[unique.startIndex..<at].compactMap(placed)
+            if !head.isEmpty {
+                stops.insert(contentsOf: head, at: 0)
+                if let newFirst = stops.first {
+                    from = newFirst.name
+                    start = newFirst.dep
+                }
+                if var parts {
+                    let n = head.count
+                    for i in parts.indices {
+                        parts[i].start += n
+                        parts[i].end += n
+                    }
+                    parts[0].start = 0
+                    parts[0].from = stops.first?.name ?? parts[0].from
+                    self.parts = parts
+                }
+                grew = true
+            }
+        }
+
+        if let last = stops.last,
+           let at = unique.lastIndex(where: { Self.sameListedStop(last, $0) }),
+           unique.index(after: at) < unique.endIndex {
+            let tail = unique[unique.index(after: at)...].compactMap(placed)
+            if !tail.isEmpty {
+                stops.append(contentsOf: tail)
+                if let newLast = stops.last {
+                    to = newLast.name
+                    end = newLast.arr
+                }
+                if var parts, let index = parts.indices.last {
+                    parts[index].end = stops.count - 1
+                    parts[index].to = stops.last?.name ?? parts[index].to
+                    self.parts = parts
+                }
+                grew = true
+            }
+        }
+
+        // Extra calls in the *middle* of a printed run — SBB's "exceptional
+        // stop" — only when the source marked the call extra. Head and tail
+        // above are the rest of an international train GTFS cut at the
+        // border; those are scheduled, just not packed. A richer feed also
+        // lists passing times, empty formation stations and GTFS-RT
+        // Durchfahrt: sitting between two timetable calls is not enough.
+        if let first = stops.first, let last = stops.last {
+            let lo = min(first.dep, first.arr)
+            let hi = max(last.dep, last.arr)
+            for extra in unique.compactMap(placed) {
+                if StopNaming.isTechnical(extra.name) { continue }
+                if extra.cancelled || !extra.extra { continue }
+                if stops.contains(where: { Self.sameListedStop($0, extra) }) { continue }
+                let at = extra.dep
+                guard at > lo, at < hi else { continue }
+                var call = extra
+                call.extra = true
+                let index = stops.firstIndex(where: { $0.dep > at }) ?? stops.count
+                if var parts {
+                    for i in parts.indices {
+                        if parts[i].start >= index { parts[i].start += 1 }
+                        if parts[i].end >= index { parts[i].end += 1 }
+                    }
+                    self.parts = parts
+                }
+                stops.insert(call, at: index)
+                grew = true
+            }
+        }
+
+        if grew { invalidateGeometry() }
+        return grew
+    }
+
+    /// Names and identifiers the two sources use for one foreign station.
+    /// "Domodossola (I)" is the register; OJP and formation say "Domodossola".
+    private static func sameListedStop(_ a: Call, _ b: Call) -> Bool {
+        if Self.sameStopName(a.name, b.name) { return true }
+        guard let ar = a.ref, let br = b.ref else { return false }
+        let ac = StopRegister.scheduledStopPointCode(ar)
+            ?? (ar.allSatisfy(\.isNumber) ? ar : nil)
+            ?? StopRegister.didok(forSloid: ar)
+        let bc = StopRegister.scheduledStopPointCode(br)
+            ?? (br.allSatisfy(\.isNumber) ? br : nil)
+            ?? StopRegister.didok(forSloid: br)
+        if let ac, let bc { return ac == bc }
+        return StopRegister.stationOf(ar) == StopRegister.stationOf(br)
+            && !StopRegister.stationOf(ar).isEmpty
+    }
+
+    private static func sameStopName(_ a: String, _ b: String) -> Bool {
+        func squash(_ name: String) -> String {
+            name.folding(options: [.diacriticInsensitive, .caseInsensitive],
+                         locale: Locale(identifier: "en_US"))
+                .filter { $0.isLetter || $0.isNumber }
+        }
+        if squash(a) == squash(b) { return true }
+        func core(_ name: String) -> String {
+            var text = name
+            if let paren = text.lastIndex(of: "(") { text = String(text[..<paren]) }
+            return squash(text)
+        }
+        return core(a) == core(b)
+    }
+
+    /// The line as a passenger reads it.
+    ///
+    /// Three independent feed habits have to be undone here, or a board lists
+    /// the same vehicle twice:
+    ///
+    /// - GTFS pads long-distance numbers (`EC000066`); the live feed and the
+    ///   plate say `EC66`.
+    /// - The stationboard mirror and OJP glue the product letter onto a local
+    ///   service (`T` + `3` → `T3`, `B` + `17` → `B17`) while GTFS files the
+    ///   number the vehicle actually wears. Tram 3 is `3`. S12 stays `S12`:
+    ///   on rail the letter *is* the published name.
+    /// - Panorama-express feeds glue `PE` onto the named train (`PE` + `GEX`
+    ///   → `PEGEX`, `PE` + `GPX` → `PEGPX`) and sometimes the train number
+    ///   onto that (`GPX4068`). The plate is `GEX` / `GPX`.
+    public static func publishedLine(_ raw: String?, mode: Mode? = nil) -> String {
+        guard let raw else { return "" }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let compact = trimmed.uppercased().filter { $0.isLetter || $0.isNumber }
+        if let panorama = panoramaProduct(compact) { return panorama }
+        guard let firstDigit = compact.firstIndex(where: \.isNumber) else { return trimmed }
+        let digits = String(compact[firstDigit...])
+        guard digits.allSatisfy(\.isNumber) else { return trimmed }
+        let letters = String(compact[..<firstDigit])
+        let number = trimZeros(digits)
+        if let mode, let stripped = stripLocalPrefix(letters, number: number, mode: mode) {
+            return stripped
+        }
+        return letters + number
+    }
+
+    /// Named through-trains jointly filed by more than one company. `PE` is
+    /// the quality prefix, not a second line.
+    private static let panoramaProducts = ["GEX", "GPX", "BEX", "VAE"]
+
+    static func panoramaProduct(_ compact: String) -> String? {
+        var s = compact
+        if s.hasPrefix("PE"), s.count > 2 {
+            let rest = String(s.dropFirst(2))
+            if panoramaProducts.contains(where: { rest.hasPrefix($0) }) { s = rest }
+        }
+        for mark in panoramaProducts
+        where s == mark || (s.hasPrefix(mark) && s.dropFirst(mark.count).allSatisfy(\.isNumber)) {
+            return mark
+        }
+        return nil
+    }
+
+    public static func isPanoramaProduct(_ product: String) -> Bool {
+        let key = publishedLine(product)
+        return key == "PE" || panoramaProducts.contains(key)
+    }
+
+    /// Where this working actually terminates. A through-headsign past the
+    /// last booked call (GEX `Brig Bahnhofplatz` on a trip that ends at Chur)
+    /// is not a destination this vehicle reaches. A *short* headsign naming a
+    /// junction the train still has to pass (RE1 `Spiez` on a run that
+    /// continues to Brig) is not either — that is the last remaining call.
+    public static func reachedDestination(_ journey: Journey, from index: Int = 0) -> String? {
+        guard journey.stops.indices.contains(index) else {
+            return journey.to.map(StopNaming.display)
+        }
+        let remaining = journey.stops[index...]
+        let last = remaining.last.map { StopNaming.display($0.name) }
+        guard let advertised = journey.to.map(StopNaming.display), !advertised.isEmpty else {
+            return last
+        }
+        if let last, StopNaming.sameBoardDestination(last, advertised) {
+            return advertised
+        }
+        // Packed RE1 trips end at Spiez and still advertise the split:
+        // "Brig | Zweisimmen". That is the passenger destination, not a
+        // through-headsign past this working (GEX "Brig Bahnhofplatz" on a
+        // trip that ends at Chur has no pipe and does not reach Brig).
+        if advertised.contains("|") {
+            return advertised
+        }
+        return last
+    }
+
+    /// Product letters that are the mode, not the line. Longest first so
+    /// `TRAM3` loses `TRAM` rather than stopping at `T`.
+    private static let localLinePrefixes: [Mode: [String]] = [
+        .tram: ["TRAM", "STR", "NFT", "TN", "T"],
+        .bus: ["BUS", "NFB", "NFO", "EXB", "RUB", "CAR", "RUF", "KB", "TX", "B"],
+        .boat: ["SCH", "FAE", "KAT", "BAT"],
+    ]
+
+    private static func stripLocalPrefix(
+        _ letters: String, number: String, mode: Mode
+    ) -> String? {
+        guard let prefixes = localLinePrefixes[mode] else { return nil }
+        for prefix in prefixes where letters == prefix {
+            return number
+        }
+        return nil
+    }
+
+    /// What a line plate shows. An extra with no published number still needs a
+    /// word on the chip; an empty plate reads as a missing badge, not a service.
+    public static func badgeLine(_ raw: String?, extra: Bool = false, mode: Mode? = nil) -> String {
+        let published = publishedLine(raw, mode: mode)
+        if !published.isEmpty { return published }
+        return extra ? "ext" : published
+    }
+
+    static func trimZeros(_ text: String) -> String {
+        let trimmed = text.drop { $0 == "0" }
+        return trimmed.isEmpty ? "0" : String(trimmed)
     }
 }

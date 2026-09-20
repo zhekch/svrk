@@ -1,0 +1,316 @@
+Grok findings — PerformanceFix step 0
+Date: 2026-09-20
+Device: Zhenya’s iPhone (iPhone 16, iPhone17,3), UDID 00008140-0002715A0AA2801C, USB
+Build: Debug, com.kexts.swisstransit, installed via Device Hub / devicectl
+Source plan: PerformanceFix/pasted-content-id-4ff1-when-following-polymorphic-zebra.md
+  “### 0. Measure — confirm the queue latency directly”
+
+==============================================================================
+Verdict
+==============================================================================
+
+The followed vehicle’s point patch (dot + line number on source
+`transit-vehicles`) is landing inside the display frame it was issued for.
+
+On this phone, in this working tree, Mapbox’s serial GeoJSON queue is not
+adding multi-frame delay to that write.
+
+The plan’s own criterion:
+
+  “Expect p50 well over one frame and a long p95 tail. If it comes back
+   inside a frame, the diagnosis above is wrong and steps 1–2 should not
+   be built.”
+
+For the flat-case path (followed dot / line number) on a lightly tilted
+follow, that bar is not met.
+
+The tilted-case path (3D wagons) was measured in a second run at pitch 60.
+See “3D wagons” below. Landed wagon patches are often still inside a frame
+at p50, but 73 % of wagon writes never get their own load event — wagons
+visually update at ~16 Hz while the camera runs at 60 Hz. That is the
+tilted-case problem, and it is batching / queue occupancy, not a multi-frame
+p50 on the events that do land.
+
+==============================================================================
+How it was measured
+==============================================================================
+
+Instrumentation (gated on `-frameProbe YES`):
+
+  GeoJSONQueueProbe in SwissTransit/App/Diagnostics.swift
+  - stamps dataId on GeoJSON writes as kind:CACurrentMediaTime-or-displayTime
+  - follow point uses CADisplayLink.targetTimestamp, as the plan specified
+    (dataId = "fp:<targetTimestamp>")
+  - fleet whole-source rewrite uses CACurrentMediaTime ("fv:<now>")
+  - onSourceDataLoaded reports the dataId back; latency = now − stamped time
+  - p50/p95 logged once a second and shown on the diagnostics overlay
+    as the `queue` row
+  - samples persisted on device as
+    Library/Application Support/queue-latency.txt
+    Library/Application Support/queue-latency.jsonl
+
+Writes stamped:
+
+  fp  followFrame → updateGeoJSONSourceFeatures(transit-vehicles)
+      the followed vehicle’s own point, display-rate
+  fs  follow-source rebuild / wagon+lamp point patches
+      (never fired in this run)
+  fv  drawVehicles whole-collection rewrite of transit-vehicles
+  vs  whole-collection transit-vehicle-shapes rewrite
+      (never fired in this run)
+
+Launch (after a first attempt at zoom 17 left the viewport empty):
+
+  -frameProbe YES
+  -showDiagnostics YES
+  -startLat 46.94809
+  -startLon 7.44744
+  -startZoom 14
+  -selectVehicle 1
+  -openService IC
+
+The app selected IC 8 (Chur → Lausanne), auto-followed, and the follow
+camera held zoom 17 with 3D wagons.
+
+Negative fp latency is expected with targetTimestamp: the stamp is the time
+the frame is *due*, typically ~16 ms in the future when the display-link
+callback runs. Negative means the patch landed before that deadline.
+At 60 Hz, p50 of −11 ms vs target ≈ 5–6 ms after enqueue.
+
+==============================================================================
+Follow session
+==============================================================================
+
+Train:     IC 8, Chur → Lausanne, SBB
+Speed:     ~106–129 km/h during the run
+Next stop: Bern, then ~20 min out
+Camera:    follow-lock, zoom 17, ~0.41 m/pt, 3D wagons visible, map tilted
+Duration:  ~2 minutes of follow; last 60 s pulled as the summary window
+Panel:     60 Hz iPhone 16 (not ProMotion)
+
+Overlay during steady follow (native screenshot 20:11):
+
+  fps             60
+  ticks           30 / 30
+  cost            ~7–8 ms  (fleet ~6, shape 0.1, push ~1, rest 0.2)
+  queue           fp -11/-9ms 8615/8624 · fv 0/2ms 4336/4344
+  cpu             ~3 %
+  thermal         nominal
+  battery         80 %, charging
+
+FrameProbe `missed=` lines could not be pulled from the unified log over
+USB. The overlay holding 60 fps / 30 ticks is the on-device stand-in.
+This was a Debug build. Queue wait is inside Mapbox, so Debug vs Release
+should not change the round-trip much; main-thread occupancy would.
+
+==============================================================================
+Numbers
+==============================================================================
+
+One-second flushes: 266
+Last on-device line (queue-latency.txt):
+
+  queue fp win sent=61 landed=60 p50=-11.1 p95=-7.0 max=29.4 tot 8615/8624
+        fv win sent=31 landed=29 p50=0.3  p95=2.6  max=4.7  tot 4336/4344
+
+Follow point (fp) — vs CADisplayLink.targetTimestamp
+  sent / landed     8624 / 8615
+  coalesced away    9  (0.1 %)
+  rolling p50       -11.1 ms
+  rolling p95       -8.6 ms
+  rolling max       29.4 ms in the last ~300 samples
+  session worst     56.7 ms  (first seconds, camera catch-up)
+  active 1 s windows with landings: 143
+    per-window p50  median -11.3 ms   min -13.8   max -10.8
+    per-window p95  median  -9.3 ms   min -10.4   max  30.6
+    per-window max  median  -7.3 ms   worst 56.7
+    windows with p50 > 16.7 ms (1 frame):  0 / 143
+    windows with p95 > 16.7 ms:            1 / 143
+    windows with p95 > 33 ms:              0 / 143
+
+  Rate ~60 Hz while the train was moving, so followFrame was rewriting the
+  point every display refresh, which is the load the diagnosis describes.
+
+Fleet whole rewrite (fv) — vs enqueue (CACurrentMediaTime)
+  sent / landed     4344 / 4336
+  coalesced away    8
+  rolling p50       0.3 ms
+  rolling p95       2.4 ms
+  rolling max       6.7 ms
+  active 1 s windows: 236
+    per-window p50  median 0.4 ms   min 0.2   max 27.3
+    per-window p95  median 3.1 ms   min 0.5   max 27.3
+    per-window max  median 4.2 ms   worst 33.1
+    windows with p50 > 16.7 ms:  1 / 236
+    windows with p95 > 16.7 ms:  1 / 236
+    windows with p95 > 33 ms:    0 / 236
+
+  Rate ~30 Hz, matching the model tick, not a 60 Hz whole-fleet storm
+  behind the follow patches.
+
+Follow shape (fs) and vehicle-shapes (vs)
+  never stamped. sent = 0 for the whole session.
+
+==============================================================================
+What this means
+==============================================================================
+
+1. Flat case (dot + line number) — not the serial-queue story
+   The followed point is patched at 60 Hz into the shared fleet source,
+   exactly as the plan describes. Those patches come back on
+   onSourceDataLoaded inside the same frame. They are not queuing up
+   behind whole-fleet parses. Almost every stamp gets its own load event.
+
+   So “the camera and body arrive on time; the dot and number arrive late
+   and irregularly” is not what this phone is doing, at least not because
+   of GeoJSON queue wait.
+
+2. Fleet rewrites are cheap here
+   A full transit-vehicles rewrite lands in a fraction of a millisecond
+   p50, a few milliseconds p95. They are not occupying the serial queue
+   long enough to bury the follow patches.
+
+3. Occasional tail, not a steady lag
+   One 57 ms spike at follow start (camera catch-up). Once settled, worst
+   follow-point sample in the rolling window was 29 ms (~2 frames), and
+   p95 stayed before the deadline in 142 of 143 seconds. That is not the
+   “lags back every frame” picture.
+
+4. 3D wagons — measured in the second run (see below)
+   This first follow did not stamp wagon writes (`fs`/`fw` never fired)
+   because solids were not forced on. The pitch-60 run did. Short version:
+   wagons are on the async path, written ~57 Hz, only ~16 Hz get a load
+   event. Landed p50 is often inside a frame; the missing events are the
+   finding.
+
+5. Working tree already skips redundant point writes
+   followFrame only calls updateGeoJSONSourceFeatures when the feature
+   actually changed. For this moving IC that still meant ~60 writes/s,
+   so the skip did not hide the load. It would hide it for a standing
+   train.
+
+==============================================================================
+What I did not measure
+==============================================================================
+
+- Release configuration (FrameProbe’s preferred build for occupancy)
+- FrameProbe missed-refresh count (unified log not readable over USB)
+- Simulator vs device (device only, as asked)
+
+==============================================================================
+Artifacts
+==============================================================================
+
+On the Mac, from this session:
+
+  /tmp/svrk-queue/queue-latency-60s.txt
+  /tmp/svrk-queue/queue-latency-60s.jsonl     (266 one-second flushes, first run)
+  /tmp/svrk-queue/iphone-60s.png              (native screenshot at 20:11)
+  /tmp/svrk-queue/iphone-z14.png              (IC 8 just after follow took)
+  /tmp/svrk-queue/queue-latency-wagons-60s.txt
+  /tmp/svrk-queue/queue-latency-wagons-60s.jsonl   (156 flushes, pitch-60 run)
+  /tmp/svrk-queue/iphone-wagons-t45.png
+  /tmp/svrk-queue/iphone-wagons-60s.png            (20:25, fps 47, thermal serious)
+
+On the phone, while this build is installed:
+
+  Library/Application Support/queue-latency.txt
+  Library/Application Support/queue-latency.jsonl
+
+The probe remains in the app, off unless `-frameProbe YES`.
+`fw` is the 3D-wagon band. The overlay `queue` row shows it when
+`-showDiagnostics YES` is on.
+
+==============================================================================
+3D wagons (second run, 2026-09-20 20:22–20:25)
+==============================================================================
+
+Same phone, Debug build, after stamping wagon GeoJSON writes as `fw`
+with the follow display-link timestamp. Launch:
+
+  -frameProbe YES -showDiagnostics YES -solidVehicles 1
+  -startLat 46.94809 -startLon 7.44744
+  -startZoom 14 -startPitch 60
+  -selectVehicle 1 -openService IC
+
+Followed IC 8 Chur → Lausanne again, ~130 km/h, zoom 17, pitch 60,
+16 baked wagon meshes, follow-lock. Solids were on for 129 of 156
+one-second windows. The phone went to thermal state `serious`
+(CPU ~96 %, battery 80 % charging). fps started at 60 and sagged
+to 47 by 20:25.
+
+Wagon writes (kind `fw`) — vs CADisplayLink.targetTimestamp
+  sent / landed     7373 / 2026
+  coalesced away    5347  (72.5 %)
+  write rate        ~57 Hz  (tick rebuilds ~16/s + display patches ~31/s)
+  land rate         ~16 Hz
+  rolling p50       6.6 ms     (of events that landed)
+  rolling p95       31.0 ms
+  rolling max       68.0 ms
+  active 1 s windows with landings: 129
+    per-window p50  median  -1.9 ms   min -5.3   max 27.6
+    per-window p95  median  11.4 ms   min -4.2   max 38.1
+    windows with p50 > 16.7 ms:  27 / 129
+    windows with p95 > 16.7 ms:  46 / 129
+    windows with p95 > 33 ms:     7 / 129
+
+  Last on-device line:
+    fw win sent=47 landed=15 p50=27.6 p95=32.1 max=32.9 tot 2026/7373
+    wagons draws=47 solids=47 rebuilds=16 patches=31 pts=16
+
+  Trace summed over the session:
+    draws=7588  solids=7392  rebuilds=2081  patches=5342  pts=16
+
+What this means for wagons
+
+1. They are on the async path, at display rate.
+   fill-translate slides the 2D footprint. The 16 wagon point features
+   are rewritten through updateGeoJSONSource / updateGeoJSONSourceFeatures
+   on the follow source. That is exactly the split the plan describes.
+
+2. Mapbox coalesces them.
+   The SDK’s own note on updateGeoJSONSourceFeatures: when parses are
+   already queued, partial updates apply in batches and only the most
+   recent dataId comes back. 73 % of wagon stamps never appear as their
+   own onSourceDataLoaded. The camera moves at 60 Hz; the wagons that
+   land do so at ~16 Hz. That is “lags back” even when the landed p50
+   is inside a frame — the other four writes in each batch never show.
+
+3. Landed p50 is not “well over one frame.”
+   Median window p50 is −1.9 ms (before the display deadline). Rolling
+   p50 is 6.6 ms. The plan’s numeric bar for “the diagnosis is confirmed”
+   is not met on the events that return. p95 is the more honest wagon
+   number: 31 ms rolling, and 46 of 129 seconds had p95 over a frame.
+
+4. The rest of the serial queue is busier when solids are up.
+   vs (whole-collection 3D shapes for everyone else) always lands
+   (2085/2085) but p95 median 16.5 ms, spikes to 85–131 ms.
+   fv rolling p50 14.4 / p95 34.1 — much slower than the first run’s
+   0.3 / 2.4 ms.
+   fp, which was inside a frame when the map was not at 60°, is no
+   longer: rolling p50 22.1 / p95 37.0 under this load, 30 of 132
+   seconds with p50 over a frame.
+
+5. Thermal.
+   `serious` thermal, fps 47, tick cost 17 ms with fleet 13 ms at the
+   end of the run. A 60° follow of a 16-wagon IC is not a free probe
+   of queue latency alone; the main thread and the renderer are also
+   in the way.
+
+==============================================================================
+Recommendation (updated after the wagon run)
+==============================================================================
+
+Do not start plan step 1 on the strength of “the follow point is late
+because of the GeoJSON queue.” On a mild follow that number is inside
+a frame. At 60° it degrades, but as a side-effect of load, not as the
+primary split.
+
+Step 2 is the one this wagon measurement supports: 3D wagons are on
+the async GeoJSON path, they are written ~57 times a second, and only
+~16 of those writes become a load event. Putting them on synchronous
+`model-translation` (or a ModelSource) is the change that would make
+the body land on the same frame as the camera and the footprint.
+
+Do not read landed p50 of 6.6 ms as “wagons are fine.” The missing
+73 % of load events is the measurement.

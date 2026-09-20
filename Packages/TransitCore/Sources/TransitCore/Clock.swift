@@ -28,6 +28,20 @@ public final class Clock: @unchecked Sendable {
 
     public func nowSeconds() -> Timestamp { Int(now()) }
 
+    /// The printed clock minute, same as `HH:mm`. Keep the raw seconds for
+    /// positioning; 15:30:40 prints as 15:30, matching SBB and a DateFormatter.
+    /// Delay badges still round on their own — a 40-second slip is not a
+    /// reason to show 15:31.
+    public static func displayMinute(_ stamp: Timestamp) -> Timestamp {
+        Timestamp(stamp / 60) * 60
+    }
+
+    /// Whole minutes between the two printed clocks. 15:30 at 15:07 is 23,
+    /// even when the live estimate is 15:30:40.
+    public static func remainingMinutes(until stamp: Timestamp, from now: Timestamp) -> Int {
+        (displayMinute(stamp) - displayMinute(now)) / 60
+    }
+
     /// Re-anchor so the current virtual instant is preserved across changes.
     private func reanchor() {
         anchorVirtual = now()

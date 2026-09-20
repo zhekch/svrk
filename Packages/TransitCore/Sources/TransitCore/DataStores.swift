@@ -87,16 +87,21 @@ public final class StopPlaceStore: @unchecked Sendable {
         var built: [Cell: [Int]] = [:]
         var identifiers: [String: Int] = [:]
         identifiers.reserveCapacity(loaded.count)
-        var names: [String] = []
-        names.reserveCapacity(loaded.count)
         for (i, place) in loaded.enumerated() {
             built[Self.cell(place.lon, place.lat), default: []].append(i)
             identifiers[place.id] = i
-            names.append(StopPlaceStore.fold(place.name))
         }
         grid = built
         byID = identifiers
-        folded = names
+        // Folded names are for the search box, not the map. A launch never
+        // searches, and folding 33,000 names with diacritic stripping was
+        // work the first frame did not need.
+        folded = []
+    }
+
+    private func ensureFolded() {
+        guard folded.count != places.count else { return }
+        folded = places.map { StopPlaceStore.fold($0.name) }
     }
 
     /// Names as they are compared: no case, no diacritics.
@@ -190,7 +195,10 @@ public final class StopPlaceStore: @unchecked Sendable {
     }
 
     public func place(id: String) -> StopPlace? {
-        guard let index = byID[id] else { return nil }
+        // Calls use SLOIDs; stop places use UIC/DIDOK numbers. Resolve this
+        // exact identity here so every caller avoids a nearest-stop fallback.
+        let index = byID[id] ?? StopRegister.didok(forSloid: id).flatMap { byID[$0] }
+        guard let index else { return nil }
         return places[index]
     }
 
@@ -228,6 +236,7 @@ public final class StopPlaceStore: @unchecked Sendable {
         guard needle.count >= 2 else { return [] }
         let tokens = needle.split(separator: " ").map(String.init)
         guard !tokens.isEmpty else { return [] }
+        ensureFolded()
 
         var scored: [(place: StopPlace, rank: Int, score: Int, distance: Double)] = []
         for i in 0..<places.count {

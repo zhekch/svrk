@@ -63,15 +63,15 @@ struct FeedActivity: Equatable {
     }
 }
 
-/// What the feed is doing, and the key for the coloured vehicle markers.
+/// What the feed is doing, and which modes are on the map.
 ///
-/// The two live together because they are what one tap on the status pill has
-/// to answer. The pill is the only thing on the map that reports on the
-/// network, and a pill that read "no fleet" with a legend of dot colours behind
-/// it left the actual question — why is there no fleet — with nowhere to be
-/// asked.
+/// One tap on the status pill has to answer both: why the fleet looks the way
+/// it does, and which of those vehicles the map is allowed to draw. Mode
+/// visibility used to live in Settings, four taps from the map it affects.
 struct VehicleLegend: View {
     var activity = FeedActivity()
+    var hiddenModes: Set<Mode> = []
+    var onToggleMode: ((Mode) -> Void)?
     private let modes = Mode.allCases
 
     var body: some View {
@@ -89,32 +89,49 @@ struct VehicleLegend: View {
 
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 10) {
                 ForEach(modes, id: \.rawValue) { mode in
-                    Label {
-                        Text(mode.label)
-                    } icon: {
-                        Circle().fill(mode.color).frame(width: 11, height: 11)
-                    }
-                    .font(.callout)
+                    ModeVisibilityRow(
+                        mode: mode,
+                        hidden: hiddenModes.contains(mode),
+                        action: onToggleMode.map { toggle in { toggle(mode) } }
+                    )
                 }
             }
-
-            Divider()
-
-            Label("Live data off", systemImage: "circle.fill")
-                .foregroundStyle(.gray)
-            Label("Live data available", systemImage: "circle.fill")
-                .foregroundStyle(.green)
-            Label("Refreshing live data", systemImage: "circle.fill")
-                .foregroundStyle(.yellow)
-            Label("Drawing a stored fleet — the last refresh failed", systemImage: "circle.fill")
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-            Label("No live data available", systemImage: "circle.fill")
-                .foregroundStyle(.red)
         }
         .font(.caption)
         .padding(18)
         .frame(width: 320, alignment: .leading)
+    }
+}
+
+/// One mode on the legend. Tap the row; the circle greys out when that mode
+/// is off the map. No switch — the colour *is* the control.
+private struct ModeVisibilityRow: View {
+    let mode: Mode
+    let hidden: Bool
+    var action: (() -> Void)?
+
+    var body: some View {
+        let row = Label {
+            Text(mode.label)
+                .foregroundStyle(hidden ? Color.secondary : Color.primary)
+        } icon: {
+            Circle()
+                .fill(hidden ? Color.secondary.opacity(0.4) : mode.color)
+                .frame(width: 11, height: 11)
+        }
+        .font(.callout)
+
+        if let action {
+            Button(action: action) {
+                row
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+                .buttonStyle(.plain)
+                .accessibilityValue(hidden ? "Hidden" : "Shown")
+        } else {
+            row
+        }
     }
 }
 
@@ -133,20 +150,7 @@ private struct FeedActivityReadout: View {
 
             if activity.dataMode != .off, activity.progress.isRunning { running }
 
-            VStack(alignment: .leading, spacing: 4) {
-                row("Fleet", fleet)
-                row("Source", source)
-                if activity.status.refreshSeconds > 0 {
-                    row("Last refresh took", FeedActivity.seconds(activity.status.refreshSeconds))
-                }
-                if activity.status.bytes > 0 {
-                    row("Last download", FeedActivity.bytes(activity.status.bytes))
-                }
-                if activity.status.failures > 0 {
-                    row("Failed refreshes", "\(activity.status.failures)")
-                }
-                if let budget { row("Budget", budget) }
-            }
+            row("Fleet", fleet)
 
             ForEach(warnings, id: \.self) { warning in
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
@@ -170,14 +174,11 @@ private struct FeedActivityReadout: View {
         }
     }
 
-    /// The figures that only exist while something is in flight.
+    /// The figure that moves while something is in flight.
     ///
-    /// Two of them, deliberately. The download is the compressed response —
-    /// twelve megabytes, and what the data allowance is charged — and the read
-    /// is the hundred megabytes of XML that comes out of it. Reporting only the
-    /// second made a 12 MB fetch claim it had pulled 100 MB; reporting only the
-    /// first would hide where a slow refresh actually spends its time, because
-    /// the gap between the two *is* the answer.
+    /// The compressed body, which is what the data allowance is charged. The
+    /// decompressed XML is several times larger and used to be reported as the
+    /// download, which is how a 12 MB fetch claimed it had pulled 100 MB.
     @ViewBuilder private var running: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let fraction = downloadFraction {
@@ -189,9 +190,6 @@ private struct FeedActivityReadout: View {
             switch activity.progress.phase {
             case .receiving:
                 row("Downloaded", downloaded)
-                row("Read", read)
-            case .indexing:
-                row("Read", read)
             case let .waiting(seconds):
                 Text("""
                 The live feed allows two calls a minute. The next slot opens in \
@@ -224,26 +222,19 @@ private struct FeedActivityReadout: View {
         return "\(text) · \(FeedActivity.rate(rate))"
     }
 
-    private var read: String {
-        let bytes = FeedActivity.bytes(activity.progress.parsed)
-        return "\(bytes) XML · \(activity.progress.journeys) journeys"
-    }
-
     private var fleet: String {
-        activity.status.journeys == 0
+        let count = activity.status.journeys == 0
             ? "nothing loaded"
             : "\(activity.status.journeys) journeys · \(activity.status.vehicles) running"
-    }
-
-    /// Where what is drawn came from, and how old it is.
-    ///
-    /// A replayed snapshot used to report the moment it was replayed, so a
-    /// fleet from breakfast said it had refreshed a second ago.
-    private var source: String {
-        guard let at = activity.status.refreshedAt else { return activity.status.source }
+        // A stored snapshot is the case the old colour key called "drawing a
+        // stored fleet". Age belongs on this line; a live feed a few minutes
+        // old is just the cadence.
+        guard activity.status.source == "cache", let at = activity.status.refreshedAt else {
+            return count
+        }
         let age = Date().timeIntervalSince(at)
-        let name = activity.status.source == "cache" ? "stored snapshot" : "live feed"
-        return age < 90 ? "\(name), just now" : "\(name), \(FeedActivity.seconds(age)) old"
+        guard age >= 90 else { return count }
+        return "\(count) · \(FeedActivity.seconds(age)) old"
     }
 
     private var tint: Color {
@@ -253,20 +244,6 @@ private struct FeedActivityReadout: View {
         case .idle: return activity.status.journeys > 0 ? .green : .red
         default: return .yellow
         }
-    }
-
-    /// What the platform says is left, in its own words.
-    private var budget: String? {
-        guard activity.dataMode != .off else { return nil }
-        guard let limits = activity.limits else { return nil }
-        var parts: [String] = []
-        if let remaining = limits.remaining, let limit = limits.limit {
-            parts.append("\(remaining) of \(limit) calls left today")
-        }
-        if limits.perMinute > 0 {
-            parts.append("\(limits.inLastMinute)/\(limits.perMinute) this minute")
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private var warnings: [String] {
@@ -332,7 +309,10 @@ private struct FeedActivityReadout: View {
     status.refreshSeconds = 352
     status.bytes = 104 << 20
 
-    return VehicleLegend(activity: FeedActivity(progress: progress, status: status, interval: 300))
+    return VehicleLegend(
+        activity: FeedActivity(progress: progress, status: status, interval: 300),
+        hiddenModes: [.bus, .other]
+    )
         .padding()
         .preferredColorScheme(.dark)
 }

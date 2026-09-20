@@ -1458,45 +1458,20 @@ extension VehicleShape {
     /// and the two are drawn together. Only the baked models are free of it.
     public static let modelExaggeration = 1.45
 
-    /// Where a vehicle stops being a flat drawing and becomes a solid.
+    /// How far vehicles have stood up as 3D models, 0 to 1.
     ///
-    /// Two conditions, and both have to hold, because either alone is wrong.
-    /// **Pitch**, because a solid seen from directly overhead is a flat drawing
-    /// with worse edges — everything the height buys is bought by looking along
-    /// it. **Zoom**, because at any distance the third dimension is smaller
-    /// than a pixel and all it can do is thicken the vehicle into a blob.
-    ///
-    /// Returned as a fraction rather than a switch so the two drawings can
-    /// cross-fade: the flat shape carries `1 - solidity` of its own alpha and
-    /// the solid carries `solidity` of the layer's, so tilting the map lifts
-    /// the vehicles up out of their own footprints instead of swapping one
-    /// picture for another.
-    public static func solidity(pitch: Double, zoom: Double) -> Double {
-        let tilted = min(1, max(0, (pitch - solidMinPitch) / solidFullPitch))
-        let near = min(1, max(0, (zoom - solidMinZoom) / solidFullZoom))
-        return tilted * near
+    /// Zoom only. The 2D footprint is no longer drawn; past `solidMinZoom` a
+    /// vehicle is a mesh, including on a flat camera. Pitch used to gate this
+    /// so a plan view kept the plan; that handover is now dot → model.
+    public static func solidity(pitch _: Double, zoom: Double) -> Double {
+        min(1, max(0, (zoom - solidMinZoom) / solidFullZoom))
     }
 
-    /// Where the change begins, and how much further it takes to finish.
-    ///
-    /// **Any tilt at all.** This used to wait for twenty-two degrees, on the
-    /// reasoning that below it a map still reads as a plan and the height buys
-    /// nothing. What that missed is that the reader tilting the map *at all* is
-    /// the reader asking to see the third dimension, and answering with the
-    /// flat drawing for the first twenty-two degrees of the gesture is
-    /// answering a different question — the vehicles were the last thing on the
-    /// map to stand up, after the buildings and after the ground. So the ramp
-    /// starts at nothing and is over in two degrees: a map lying exactly flat
-    /// keeps the plan, and a map that has been tilted has solids.
-    ///
-    /// Zoom 14 because the width floor already keeps a body seven points
-    /// across, and two metres of exaggerated height is still a couple of
-    /// points at that scale — far enough out that a valley of trains is
-    /// trains, not a field of dots waiting for one more pinch. Further than
-    /// that a three-metre body is under a pixel tall even doubled, and a
-    /// solid can only thicken the vehicle into a blob.
+    /// Same floor as `minZoom`: the zoom at which a vehicle stops being a
+    /// dot. The ramp is a little over one zoom so a pinch does not pop a
+    /// valley of meshes in a single frame.
     public static let solidMinPitch = 0.0
     public static let solidFullPitch = 2.0
-    public static let solidMinZoom = 14.0
+    public static let solidMinZoom = minZoom
     public static let solidFullZoom = 1.2
 }

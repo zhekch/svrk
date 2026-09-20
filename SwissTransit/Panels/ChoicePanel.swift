@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import TransitCore
 
 // What to do when the finger landed on more than one thing.
@@ -40,8 +41,8 @@ struct TapChoice: Identifiable {
 
     let id: String
     let kind: Kind
-    /// What opening it selects. Boards are resolved before the list is built —
-    /// a row that cannot answer is a row that should not have been offered.
+    /// What opening it selects. Place identity is resolved before the list is
+    /// built; its departures load only if the user opens that place.
     let selection: Selection
     let title: String
     let subtitle: String?
@@ -53,6 +54,8 @@ struct TapChoice: Identifiable {
     let rail: Bool?
     /// Metres from the tap to whatever was drawn. What the list is sorted by.
     let distance: Double
+    var badge: String? = nil
+    var destination: String? = nil
 }
 
 extension TapChoice: Equatable {
@@ -68,7 +71,7 @@ extension TapChoice: Equatable {
 
 extension TapChoice {
     static func vehicle(_ snapshot: VehicleSnapshot, distance: Double) -> TapChoice {
-        let name = [snapshot.category, snapshot.line]
+        let name = [snapshot.isTurningAround ? nil : snapshot.category, snapshot.displayLine]
             .compactMap { $0 }
             .filter { !$0.isEmpty }
         // "S 12" rather than "S S12": the feed files a line both ways round and
@@ -85,11 +88,13 @@ extension TapChoice {
             kind: .vehicle,
             selection: .vehicle(snapshot.id),
             title: title.isEmpty ? snapshot.mode.label : title,
-            subtitle: snapshot.to.map { "to \($0)" },
+            subtitle: snapshot.displayDestination.map { "to \($0)" },
             symbol: snapshot.mode.symbol,
             tint: snapshot.mode.color,
             rail: nil,
-            distance: distance
+            distance: distance,
+            badge: snapshot.displayLine.isEmpty ? nil : snapshot.displayLine,
+            destination: snapshot.displayDestination
         )
     }
 
@@ -132,6 +137,75 @@ extension TapChoice {
     }
 }
 
+extension TapChoice {
+    var menuTitle: String {
+        switch selection {
+        case let .platform(board):
+            if board.stationOnly { return board.name }
+            let noun = board.rail ? "Platform" : "Stop"
+            if let code = board.code, !code.isEmpty { return "\(noun) \(code)" }
+            if let assigned = board.assigned { return "\(noun) \(assigned)" }
+            return noun
+        case .vehicle:
+            return destination ?? title
+        default:
+            return title
+        }
+    }
+
+    /// Native menus accept an image per action. Keep the line's colour and
+    /// number in that image, leaving the single text line for its destination.
+    @MainActor var menuImage: UIImage? {
+        guard let badge else { return UIImage(systemName: symbol) }
+        let font = UIFont.systemFont(ofSize: 15, weight: .bold)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: UIColor.white]
+        let text = badge as NSString
+        let measured = text.size(withAttributes: attributes)
+        let size = CGSize(width: max(26, measured.width + 10), height: 26)
+        return UIGraphicsImageRenderer(size: size).image { _ in
+            UIColor(tint).setFill()
+            UIBezierPath(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 6).fill()
+            text.draw(at: CGPoint(x: (size.width - measured.width) / 2, y: (size.height - measured.height) / 2),
+                      withAttributes: attributes)
+        }.withRenderingMode(.alwaysOriginal)
+    }
+}
+
+/// Native popover fallback for iOS 17.0–17.3, before controls could open their
+/// primary menu programmatically. Current systems use UIButton's UIMenu.
+final class MapChoicePopover: UITableViewController, UIPopoverPresentationControllerDelegate {
+    private let options: [TapChoice]
+    private let choose: (TapChoice) -> Void
+
+    init(options: [TapChoice], choose: @escaping (TapChoice) -> Void) {
+        self.options = options
+        self.choose = choose
+        super.init(style: .plain)
+        modalPresentationStyle = .popover
+        popoverPresentationController?.delegate = self
+        tableView.rowHeight = 48
+        tableView.tableFooterView = UIView()
+    }
+
+    @MainActor required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { options.count }
+
+    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let option = options[indexPath.row]
+        let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+        cell.textLabel?.text = option.menuTitle
+        cell.textLabel?.numberOfLines = 1
+        cell.imageView?.image = option.menuImage
+        cell.imageView?.tintColor = .secondaryLabel
+        return cell
+    }
+
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) { choose(options[indexPath.row]) }
+
+    func adaptivePresentationStyle(for controller: UIPresentationController, traitCollection: UITraitCollection) -> UIModalPresentationStyle { .none }
+}
+
 /// The list itself: one row per thing, nearest first.
 struct ChoicePanel: View {
     @Bindable var model: AppModel
@@ -151,6 +225,8 @@ struct ChoicePanel: View {
             }
         }
         .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .menuAnimation(value: options.map(\.id))
         .navigationTitle("What did you mean?")
         .navigationBarTitleDisplayMode(.inline)
     }

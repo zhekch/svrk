@@ -98,7 +98,7 @@ public final class StopRegister: @unchecked Sendable {
 
     // MARK: - Loading
 
-    public func load(stopsFile: URL, foreignFile: URL?) throws {
+    public func load(stopsFile: URL, foreignFile: URL?, spatial: Bool = true) throws {
         var reader = BinaryReader(try MappedFile(url: stopsFile))
         try reader.expect(magic: "SVSTOPS_", version: 1)
         let strings = try reader.readStringTable()
@@ -118,12 +118,21 @@ public final class StopRegister: @unchecked Sendable {
             )
         }
         table = newTable
-        buildIndex()
+        // The spatial index (grid, letters, platform codes) is only needed for
+        // plates and "near me". A launch that is about to draw one viewport
+        // places calls through `table` and can leave this until the map is up.
+        if spatial { buildIndex() }
 
         if let foreignFile {
             try? loadForeign(foreignFile)
         }
         isReady = true
+    }
+
+    /// Build the platform grid, if `load` skipped it.
+    public func buildSpatialIndex() {
+        guard index.isEmpty, !table.isEmpty else { return }
+        buildIndex()
     }
 
     private func loadForeign(_ url: URL) throws {
@@ -375,6 +384,17 @@ public final class StopRegister: @unchecked Sendable {
         return "ch:1:sloid:\(number)"
     }
 
+    /// The place-register identity of a Swiss station or platform SLOID.
+    /// Generated sector references carry the same station identity.
+    public static func didok(forSloid ref: String) -> String? {
+        let station = stationOf(ref)
+        let prefix = "ch:1:sloid:"
+        guard station.hasPrefix(prefix) else { return nil }
+        let number = station.dropFirst(prefix.count)
+        guard !number.isEmpty, number.count <= 5, number.allSatisfy(\.isNumber) else { return nil }
+        return "85" + String(repeating: "0", count: 5 - number.count) + number
+    }
+
     /// Case and spacing only. Anything cleverer starts inventing equivalences.
     static func normaliseName(_ name: String?) -> String? {
         guard let name else { return nil }
@@ -533,6 +553,29 @@ public final class StopRegister: @unchecked Sendable {
         return ref[ref.startIndex...colon] + trimmed
     }
 
+    /// Nearest station in the OpenStreetMap UIC supplement.
+    ///
+    /// Those rows are not in the platform grid — they are stations abroad,
+    /// not kerbs — so a mapped stop node past the border has to be named by
+    /// walking this table. A tap on a line is one relation, not a frame, and
+    /// the table is small enough to scan.
+    public func nearestForeign(lon: Double, lat: Double, within metres: Double) -> StopPlace? {
+        guard isReady, metres > 0, !foreign.isEmpty else { return nil }
+        var best: StopPlace?
+        var bestDistance = metres
+        for (id, row) in foreign {
+            let d = Geo.flatMetres(row.lon, row.lat, lon, lat)
+            if d < bestDistance {
+                bestDistance = d
+                best = StopPlace(
+                    id: id, name: row.name, lon: row.lon, lat: row.lat,
+                    rail: true, kerbs: 0
+                )
+            }
+        }
+        return best
+    }
+
     /// `ch:1:ScheduledStopPoint:8301003` → `8301003`.
     ///
     /// SIRI-ET names a stop by SLOID wherever there is one, and by a plain
@@ -541,7 +584,9 @@ public final class StopRegister: @unchecked Sendable {
     /// those stations by exactly that, so this is the same
     /// identifier-to-identifier join the SLOID path is, on the other identifier.
     private func lookupForeign(ref: String, name: String?) -> (row: Row?, fromSupplement: Bool) {
-        guard let code = Self.scheduledStopPointCode(ref) else { return (nil, false) }
+        let code = Self.scheduledStopPointCode(ref)
+            ?? (ref.allSatisfy(\.isNumber) ? ref : nil)
+        guard let code else { return (nil, false) }
 
         // The register keeps first refusal.
         if let row = table[code] { return (row, false) }

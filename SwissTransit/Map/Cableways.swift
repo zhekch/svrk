@@ -170,6 +170,22 @@ enum Cableways {
             trace(rope: &rope)
             try style.addLayer(rope)
         }
+        hideBasemapAerialways(style)
+    }
+
+    /// The Streets/Satellite styles draw OSM aerialway ways of their own.
+    /// Those are the second black cable beside this app's rope: OSM maps many
+    /// gondolas as two parallel ways, and the basemap drapes them on the
+    /// terrain while the rope sits at haul height. Hide them once our source
+    /// is in the style; our ids do not contain `aerialway`.
+    static func hideBasemapAerialways(_ style: MapboxMap) {
+        for layer in style.allLayerIdentifiers {
+            let id = layer.id.lowercased()
+            guard id.contains("aerialway") || id.contains("aerial-way") else { continue }
+            try? style.setLayerProperty(
+                for: layer.id, property: "visibility", value: "none"
+            )
+        }
     }
 
     /// What both rope layers look like, which is everything but their height.

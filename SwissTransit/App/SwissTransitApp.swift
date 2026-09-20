@@ -12,6 +12,13 @@ struct SwissTransitApp: App {
         if let token = Secrets.mapboxAccessToken {
             MapboxOptions.accessToken = token
         }
+        // Background refresh for pinned departures has to be registered here,
+        // not in `start()`: iOS can launch the process for a BGAppRefreshTask
+        // before the map has finished reading the timetable.
+        LiveActivityController.registerBackgroundTask()
+        // Before the first frame, because the window worth explaining is the
+        // launch one. Does nothing unless `-frameProbe YES` is on the scheme.
+        FrameProbe.shared.startIfRequested()
     }
 
     var body: some Scene {

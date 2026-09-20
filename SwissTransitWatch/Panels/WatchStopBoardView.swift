@@ -120,41 +120,53 @@ struct WatchStopBoardView: View {
         _ entries: [WatchStationDeparture],
         showing: WatchBoardShowing
     ) -> [WatchDepartureGroup] {
-        struct Key: Hashable {
-            var mode: String
-            var line: String
-            var place: String
+        func sameService(_ a: WatchStationDeparture, _ b: WatchStationDeparture) -> Bool {
+            guard a.mode == b.mode else { return false }
+            let mode = Mode(rawValue: a.mode)
+            guard Journey.publishedLine(a.line, mode: mode)
+                    == Journey.publishedLine(b.line, mode: mode)
+            else { return false }
+            return StopNaming.sameBoardDestination(
+                a.place(showing: showing), b.place(showing: showing)
+            )
         }
 
-        func normalized(_ value: String) -> String {
-            value.trimmingCharacters(in: .whitespacesAndNewlines)
-                .folding(
-                    options: [.caseInsensitive, .diacriticInsensitive],
-                    locale: Locale(identifier: "en_US")
-                )
-        }
-
-        var buckets: [Key: [WatchStationDeparture]] = [:]
-        var order: [Key] = []
+        var groups: [WatchDepartureGroup] = []
         for departure in entries.sorted(by: {
             $0.eventTime(showing: showing) < $1.eventTime(showing: showing)
         }) {
-            let key = Key(
-                mode: normalized(departure.mode),
-                line: normalized(departure.line),
-                place: normalized(departure.place(showing: showing))
-            )
-            if buckets[key] == nil { order.append(key) }
-            buckets[key, default: []].append(departure)
+            if let index = groups.firstIndex(where: { sameService($0.primary, departure) }) {
+                groups[index].departures.append(departure)
+            } else {
+                groups.append(WatchDepartureGroup(
+                    id: Self.serviceId(departure, showing: showing),
+                    departures: [departure],
+                    showing: showing
+                ))
+            }
         }
-        return order.compactMap { key in
-            guard let grouped = buckets[key], !grouped.isEmpty else { return nil }
-            return WatchDepartureGroup(
-                id: "\(showing.rawValue)|\(key.mode)|\(key.line)|\(key.place)",
-                departures: grouped,
-                showing: showing
-            )
+        return groups
+    }
+
+    /// Line and terminus, not the first vehicle's id — that id changed on
+    /// every refresh and the board shuffled.
+    private static func serviceId(
+        _ departure: WatchStationDeparture, showing: WatchBoardShowing
+    ) -> String {
+        let mode = Mode(rawValue: departure.mode)
+        let line = Journey.publishedLine(departure.line, mode: mode)
+        let place = departure.place(showing: showing)
+        let local = StopNaming.localDestination(place)
+        func fold(_ value: String) -> String {
+            value.folding(
+                options: [.diacriticInsensitive, .caseInsensitive],
+                locale: Locale(identifier: "en_US")
+            ).filter { $0.isLetter || $0.isNumber }
         }
+        let full = fold(place)
+        let short = fold(local)
+        let dest = !short.isEmpty && short.count < full.count ? short : full
+        return "\(showing.rawValue)|\(departure.mode)|\(line)|\(dest)"
     }
 
     private func departureCard(for group: WatchDepartureGroup) -> some View {
@@ -222,9 +234,7 @@ struct WatchDepartureTimesView: View {
             WatchGlassCard {
                 VStack(alignment: .leading, spacing: 5) {
                     WatchDepartureLineBadge(
-                        line: group.primary.line.isEmpty
-                            ? group.primary.mode.capitalized
-                            : group.primary.line,
+                        line: group.primary.line.isEmpty ? "ext" : group.primary.line,
                         mode: group.primary.mode
                     )
                     Text(group.primary.place(showing: group.showing))
@@ -277,8 +287,10 @@ private struct WatchDepartureRow: View {
     var frequencyText: String? = nil
 
     private var displayLine: String {
-        let line = departure.line.trimmingCharacters(in: .whitespacesAndNewlines)
-        return line.isEmpty ? departure.mode.capitalized : line
+        let published = Journey.publishedLine(
+            departure.line, mode: Mode(rawValue: departure.mode)
+        )
+        return published.isEmpty ? "ext" : published
     }
 
     private var displayPlatform: String? {

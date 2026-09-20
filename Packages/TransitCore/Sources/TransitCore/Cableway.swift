@@ -547,26 +547,10 @@ public enum Cableway {
         /// opposite platforms several metres apart: every scheduled line
         /// remains, and the live or more detailed path wins where available.
         public func merging(_ other: Plan) -> Plan {
-            func sameEnds(_ lhs: Span, _ rhs: Span) -> Bool {
-                if let identity = lhs.identity, identity == rhs.identity { return true }
-                guard let la = lhs.points.first, let lb = lhs.points.last,
-                      let ra = rhs.points.first, let rb = rhs.points.last
-                else { return false }
-                let shorter = min(Geo.metres(la, lb), Geo.metres(ra, rb))
-                // Platform offsets are a larger fraction of a short lift than
-                // a long one. Twenty-five metres covers paired terminals; five
-                // percent grows naturally with the span, while the cap keeps
-                // neighbouring but genuinely distinct systems separate.
-                let tolerance = min(80.0, max(25.0, shorter * 0.05))
-                let forward = max(Geo.metres(la, ra), Geo.metres(lb, rb))
-                let reverse = max(Geo.metres(la, rb), Geo.metres(lb, ra))
-                return min(forward, reverse) <= tolerance
-            }
-
             var spans: [Span] = []
             for span in self.spans + other.spans {
                 guard span.points.count >= 2 else { continue }
-                if let i = spans.firstIndex(where: { sameEnds($0, span) }) {
+                if let i = spans.firstIndex(where: { Cableway.sameRope($0, span) }) {
                     // The latter source is live at the call site. On equal
                     // detail it wins as well as when it has the richer path.
                     if spans[i].points.count <= span.points.count { spans[i] = span }
@@ -695,11 +679,101 @@ public enum Cableway {
         }
 
         var plan = Plan()
-        plan.spans = spans.values.sorted { $0.points[0].lon < $1.points[0].lon }
+        plan.spans = collapse(Array(spans.values))
+            .sorted { $0.points[0].lon < $1.points[0].lon }
         plan.stations = legs.values
             .map { Station(at: $0.at, bearing: alignment(of: $0.bearings)) }
             .sorted { $0.at.lon < $1.at.lon }
         return plan
+    }
+
+    /// Drop the second drawing of the same physical rope.
+    ///
+    /// Two directions, an all-day chord plus a live alignment, and OSM's
+    /// paired aerialway ways all describe one lift. Identity and nearby
+    /// terminals catch most of them; a mean-distance test catches two
+    /// nearly-parallel copies whose platforms sit farther apart than
+    /// `sameEnds` allows.
+    static func collapse(_ spans: [Span]) -> [Span] {
+        var out: [Span] = []
+        for span in spans where span.points.count >= 2 {
+            if let i = out.firstIndex(where: { sameRope($0, span) }) {
+                if out[i].points.count < span.points.count { out[i] = span }
+            } else {
+                out.append(span)
+            }
+        }
+        return out
+    }
+
+    /// Whether two polylines are the same rope, not two neighbouring lifts.
+    static func sameRope(_ lhs: Span, _ rhs: Span) -> Bool {
+        if let identity = lhs.identity, identity == rhs.identity { return true }
+        if sameEnds(lhs, rhs) { return true }
+        return liesAlong(lhs, rhs)
+    }
+
+    /// Terminals close enough to be two names for one station pair.
+    static func sameEnds(_ lhs: Span, _ rhs: Span) -> Bool {
+        guard let la = lhs.points.first, let lb = lhs.points.last,
+              let ra = rhs.points.first, let rb = rhs.points.last
+        else { return false }
+        let shorter = min(Geo.metres(la, lb), Geo.metres(ra, rb))
+        // Platform offsets are a larger fraction of a short lift than a long
+        // one. Twenty-five metres covers paired terminals; five percent grows
+        // naturally with the span, while the cap keeps neighbouring but
+        // genuinely distinct systems separate.
+        let tolerance = min(80.0, max(25.0, shorter * 0.05))
+        let forward = max(Geo.metres(la, ra), Geo.metres(lb, rb))
+        let reverse = max(Geo.metres(la, rb), Geo.metres(lb, ra))
+        return min(forward, reverse) <= tolerance
+    }
+
+    /// One path lies along the other, even when the terminals disagree.
+    ///
+    /// OSM often maps a gondola as two aerialway ways a few metres apart.
+    /// Two independent lifts side by side are tens of metres apart and
+    /// fail this; a doubled drawing of one rope does not.
+    static func liesAlong(_ lhs: Span, _ rhs: Span) -> Bool {
+        let a = lhs.points, b = rhs.points
+        guard a.count >= 2, b.count >= 2 else { return false }
+        let la = Geo.length(of: a), lb = Geo.length(of: b)
+        let longer = max(la, lb)
+        guard longer >= shortestSpan, min(la, lb) / longer > 0.55 else { return false }
+        let (short, long) = la <= lb ? (a, b) : (b, a)
+        let steps = min(8, max(3, short.count))
+        var total = 0.0
+        for i in 0..<steps {
+            let f = steps == 1 ? 0.0 : Double(i) / Double(steps - 1)
+            let along = Geo.length(of: short) * f
+            let point = point(on: short, at: along)
+            total += distance(from: point, to: long)
+        }
+        return total / Double(steps) < 30
+    }
+
+    private static func point(on points: [Coord], at metres: Double) -> Coord {
+        var walked = 0.0
+        for i in 1..<points.count {
+            let step = Geo.metres(points[i - 1], points[i])
+            if walked + step >= metres || i == points.count - 1 {
+                let share = step > 0 ? min(1, max(0, (metres - walked) / step)) : 0
+                return Geo.interpolate(points[i - 1], points[i], share)
+            }
+            walked += step
+        }
+        return points[0]
+    }
+
+    private static func distance(from point: Coord, to line: [Coord]) -> Double {
+        var best = Double.greatestFiniteMagnitude
+        for i in 1..<line.count {
+            let d = Geo.distanceToSegment(
+                lon: point.lon, lat: point.lat, a: line[i - 1], b: line[i]
+            )
+            if d < best { best = d }
+        }
+        return best
     }
 
     /// Record which way the line leaves this station.

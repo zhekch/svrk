@@ -3,6 +3,22 @@ import Foundation
 /// A background URL session is essential for a watch-sized runtime: the system
 /// process continues the explicit 124 MB download after the display sleeps or
 /// the app is suspended, without keeping SwissTransit running.
+struct WatchTimetableDownloadProgress: Equatable, Sendable {
+    var receivedBytes: Int64
+    var expectedBytes: Int64
+
+    var fraction: Double {
+        guard expectedBytes > 0 else { return 0 }
+        return min(1, Double(receivedBytes) / Double(expectedBytes))
+    }
+
+    var remainingBytes: Int64 {
+        max(0, expectedBytes - receivedBytes)
+    }
+
+    var hasBytes: Bool { receivedBytes > 0 && expectedBytes > 0 }
+}
+
 final class WatchTimetableDownloadCoordinator: NSObject, @unchecked Sendable {
     static let shared = WatchTimetableDownloadCoordinator()
     static let sessionIdentifier = "com.kexts.swisstransit.watch.full-timetable"
@@ -11,6 +27,8 @@ final class WatchTimetableDownloadCoordinator: NSObject, @unchecked Sendable {
     private var waiters: [CheckedContinuation<Void, Error>] = []
     private var backgroundEventWaiters: [CheckedContinuation<Void, Never>] = []
     private var sessionStorage: URLSession?
+    private var receivedByTask: [Int: Int64] = [:]
+    private var expectedByTask: [Int: Int64] = [:]
 
     private override init() {
         super.init()
@@ -40,6 +58,7 @@ final class WatchTimetableDownloadCoordinator: NSObject, @unchecked Sendable {
         let session = session
         let existing = await session.allTasks
         if existing.isEmpty {
+            resetProgress()
             try WatchNationalArchiveFiles.prepareStaging()
             for asset in WatchNationalArchiveFiles.assets {
                 var request = URLRequest(url: asset.remoteURL, timeoutInterval: 20 * 60)
@@ -47,8 +66,11 @@ final class WatchTimetableDownloadCoordinator: NSObject, @unchecked Sendable {
                 let task = session.downloadTask(with: request)
                 task.taskDescription = asset.name
                 task.countOfBytesClientExpectsToReceive = asset.expectedBytes
+                rememberExpected(task.taskIdentifier, asset.expectedBytes)
                 task.resume()
             }
+        } else {
+            adoptProgress(from: existing)
         }
 
         try await withCheckedThrowingContinuation { continuation in
@@ -60,6 +82,62 @@ final class WatchTimetableDownloadCoordinator: NSObject, @unchecked Sendable {
 
     func isActive() async -> Bool {
         !(await session.allTasks).isEmpty
+    }
+
+    func progressSnapshot() async -> WatchTimetableDownloadProgress {
+        let tasks = await session.allTasks
+        if !tasks.isEmpty { adoptProgress(from: tasks) }
+        lock.lock()
+        let received = receivedByTask.values.reduce(0, +)
+        let reported = expectedByTask.values.reduce(0, +)
+        lock.unlock()
+        let baseline = WatchNationalArchiveFiles.assets.reduce(Int64(0)) {
+            $0 + $1.expectedBytes
+        }
+        return WatchTimetableDownloadProgress(
+            receivedBytes: received,
+            expectedBytes: max(reported, baseline)
+        )
+    }
+
+    private func resetProgress() {
+        lock.lock()
+        receivedByTask.removeAll()
+        expectedByTask.removeAll()
+        lock.unlock()
+    }
+
+    private func rememberExpected(_ taskID: Int, _ bytes: Int64) {
+        guard bytes > 0 else { return }
+        lock.lock()
+        expectedByTask[taskID] = max(expectedByTask[taskID] ?? 0, bytes)
+        lock.unlock()
+    }
+
+    private func adoptProgress(from tasks: [URLSessionTask]) {
+        lock.lock()
+        for task in tasks {
+            if task.countOfBytesReceived > 0 {
+                receivedByTask[task.taskIdentifier] = task.countOfBytesReceived
+            }
+            let expected = max(
+                task.countOfBytesExpectedToReceive,
+                task.countOfBytesClientExpectsToReceive
+            )
+            if expected > 0 {
+                expectedByTask[task.taskIdentifier] = max(
+                    expectedByTask[task.taskIdentifier] ?? 0,
+                    expected
+                )
+            } else if let name = task.taskDescription,
+                      let asset = WatchNationalArchiveFiles.asset(named: name) {
+                expectedByTask[task.taskIdentifier] = max(
+                    expectedByTask[task.taskIdentifier] ?? 0,
+                    asset.expectedBytes
+                )
+            }
+        }
+        lock.unlock()
     }
 
     /// Called by SwiftUI's matching `.urlSession` background task. Merely
@@ -95,6 +173,28 @@ extension WatchTimetableDownloadCoordinator: URLSessionDownloadDelegate {
     func urlSession(
         _ session: URLSession,
         downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        lock.lock()
+        receivedByTask[downloadTask.taskIdentifier] = totalBytesWritten
+        let expected = max(
+            totalBytesExpectedToWrite,
+            downloadTask.countOfBytesClientExpectsToReceive
+        )
+        if expected > 0 {
+            expectedByTask[downloadTask.taskIdentifier] = max(
+                expectedByTask[downloadTask.taskIdentifier] ?? 0,
+                expected
+            )
+        }
+        lock.unlock()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
         do {
@@ -107,6 +207,15 @@ extension WatchTimetableDownloadCoordinator: URLSessionDownloadDelegate {
             try? FileManager.default.removeItem(at: asset.stagedURL)
             try FileManager.default.moveItem(at: location, to: asset.stagedURL)
             try WatchNationalArchiveFiles.validate(asset.stagedURL, as: asset)
+            if let size = try? WatchNationalArchiveFiles.fileSize(asset.stagedURL) {
+                lock.lock()
+                receivedByTask[downloadTask.taskIdentifier] = size
+                expectedByTask[downloadTask.taskIdentifier] = max(
+                    expectedByTask[downloadTask.taskIdentifier] ?? 0,
+                    size
+                )
+                lock.unlock()
+            }
 
             if try WatchNationalArchiveFiles.installIfComplete() {
                 finishWaiters(with: .success(()))

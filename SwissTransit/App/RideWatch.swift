@@ -137,6 +137,11 @@ final class RideWatch {
     /// When the trail stopped looking like something running, or nil while it
     /// still does.
     private var stillSince: Date?
+    /// The map must drop its 25 m distance filter the moment the phone stops,
+    /// or a standing passenger produces no fixes and the station offer never
+    /// starts. Fired on the standing edge only.
+    var onNeedPlaceAccuracy: (() -> Void)?
+    private var askedPlaceAccuracy = false
     /// When the fixes stopped arriving, or nil while they are.
     private var holdingSince: Date?
     private var holdCheckedAt = Date.distantPast
@@ -236,7 +241,10 @@ final class RideWatch {
             fixes.removeAll { $0.at < cutoff }
         }
         moving = RideMatching.isRiding(fixes)
-        if moving { clearNearby() }
+        if moving {
+            askedPlaceAccuracy = false
+            clearNearby()
+        }
     }
 
     /// Ask, if it is time to and there is anything worth asking about.
@@ -297,14 +305,21 @@ final class RideWatch {
         asking = true
 
         if !moving {
+            if !askedPlaceAccuracy, ride == nil {
+                askedPlaceAccuracy = true
+                onNeedPlaceAccuracy?()
+            }
             // A settled ride remains the better answer while a train is at a
             // station: stillness alone cannot distinguish dwelling aboard from
             // having stepped onto the platform. Once the ride has genuinely
             // ended, a tight stationary cluster may name the place instead.
-            guard ride == nil, RideMatching.isStill(fixes), let fix = fixes.last
-            else {
+            guard ride == nil, let fix = fixes.last else {
                 asking = false
                 if ride == nil { clearNearby(resetDismissal: false) }
+                return
+            }
+            guard RideMatching.isStill(fixes) else {
+                asking = false
                 return
             }
             let now = clock.nowSeconds()
@@ -440,7 +455,12 @@ final class RideWatch {
         }
         guard moving else {
             if let nearbyBoard { return nearbyBoard.title }
-            return fixes.isEmpty ? "no fix" : "still"
+            guard let fix = fixes.last else { return "no fix" }
+            if let ride { return "\(ride.line) · stopped" }
+            guard RideMatching.isStill(fixes) else {
+                return "settling · \(Int(RideMatching.span(of: fixes).rounded()))s · ±\(Int(fix.accuracy.rounded()))m"
+            }
+            return "still · no nearby stop"
         }
         guard let ride else {
             return leader == nil

@@ -25,6 +25,17 @@ struct WatchRailOverlayLine: Identifiable, Sendable {
     var style: WatchRailStyle
     var coordinates: [WatchCoordinate]
     var isDetailed: Bool
+
+    /// Round caps hide the millimetre-scale gaps at welded junctions; round
+    /// joins are what makes a simplified polyline read as a curve instead of a
+    /// chain of chords. MapKit's own transit overlay uses the same two.
+    var strokeStyle: StrokeStyle {
+        StrokeStyle(
+            lineWidth: isDetailed ? 1.7 : 1.2,
+            lineCap: .round,
+            lineJoin: .round
+        )
+    }
 }
 
 /// A memory-mapped, watch-sized derivative of the app's OSM railway graph.
@@ -64,8 +75,8 @@ actor WatchRailOverlayStore {
 
         // SwiftUI Map creates a separate renderer for every custom polyline.
         // Keep the watch layer deliberately sparse; Apple's basemap still
-        // supplies geographic context underneath it. The 12 m corridor band
-        // is only worthwhile once the camera reaches city scale.
+        // supplies geographic context underneath it. The city band is only
+        // worthwhile once individual blocks are readable.
         let policy: (
             level: UInt8,
             lineLimit: Int,
@@ -74,17 +85,17 @@ actor WatchRailOverlayStore {
         )
         switch span {
         case 1.0...:
-            policy = (0, 32, 500, 150)
+            policy = (0, 40, 900, 80)
         case 0.35 ..< 1.0:
-            policy = (0, 48, 800, 150)
+            policy = (0, 56, 1_400, 40)
         case 0.14 ..< 0.35:
-            policy = (0, 72, 1_200, 150)
+            policy = (0, 80, 2_000, 25)
         case 0.05 ..< 0.14:
-            policy = (1, 96, 1_800, 55)
+            policy = (1, 100, 2_400, 12)
         case 0.015 ..< 0.05:
-            policy = (1, 120, 2_600, 25)
+            policy = (1, 130, 3_400, 6)
         default:
-            policy = (1, 140, 3_200, 10)
+            policy = (1, 160, 4_200, 4)
         }
         let detailed = policy.level == 1
         let level = policy.level
@@ -108,21 +119,27 @@ actor WatchRailOverlayStore {
             if lhsPriority != rhsPriority { return lhsPriority > rhsPriority }
             return $0.extent > $1.extent
         }
-        var selected: [Entry] = []
-        selected.reserveCapacity(min(visible.count, policy.lineLimit))
-        var selectedPoints = 0
-        for entry in visible {
-            guard selected.count < policy.lineLimit else { break }
-            guard selectedPoints + entry.pointCount <= policy.pointLimit else { continue }
-            selected.append(entry)
-            selectedPoints += entry.pointCount
-        }
 
-        return selected.compactMap { entry in
+        let pad = span * 0.12
+        let clipBox = BBox(
+            west: min(viewport.west, viewport.east) - pad,
+            south: min(viewport.south, viewport.north) - pad,
+            east: max(viewport.west, viewport.east) + pad,
+            north: max(viewport.north, viewport.south) + pad
+        )
+
+        var drawn: [WatchRailOverlayLine] = []
+        drawn.reserveCapacity(min(visible.count, policy.lineLimit))
+        var selectedPoints = 0
+
+        for entry in visible {
+            guard drawn.count < policy.lineLimit else { break }
+            guard selectedPoints < policy.pointLimit else { break }
             let pointBytes = entry.pointCount * 8
             guard entry.pointsOffset >= 0,
                   entry.pointsOffset + pointBytes <= archive.file.buffer.count
-            else { return nil }
+            else { continue }
+
             var raw: [Coord] = []
             raw.reserveCapacity(entry.pointCount)
             for index in 0 ..< entry.pointCount {
@@ -142,20 +159,33 @@ actor WatchRailOverlayStore {
                     )
                 )
             }
-            let simplified = detailed
-                ? Geo.simplify(raw, toleranceMetres: policy.simplifyMetres)
-                : raw
-            guard simplified.count >= 2 else { return nil }
-            let coordinates = simplified.map {
-                WatchCoordinate(latitude: $0.lat, longitude: $0.lon)
+
+            let parts = Geo.clipped(raw, to: clipBox)
+            for part in parts {
+                guard drawn.count < policy.lineLimit else { break }
+                var shape = Geo.simplify(part, toleranceMetres: policy.simplifyMetres)
+                guard shape.count >= 2 else { continue }
+                if detailed, shape.count >= 3 {
+                    let rounded = Geo.chaikin(shape, iterations: 1)
+                    if selectedPoints + rounded.count <= policy.pointLimit {
+                        shape = rounded
+                    }
+                }
+                guard selectedPoints + shape.count <= policy.pointLimit else { continue }
+                selectedPoints += shape.count
+                drawn.append(
+                    WatchRailOverlayLine(
+                        id: drawn.count,
+                        style: entry.style,
+                        coordinates: shape.map {
+                            WatchCoordinate(latitude: $0.lat, longitude: $0.lon)
+                        },
+                        isDetailed: detailed
+                    )
+                )
             }
-            return WatchRailOverlayLine(
-                id: entry.id,
-                style: entry.style,
-                coordinates: coordinates,
-                isDetailed: detailed
-            )
         }
+        return drawn
     }
 
     private func loadIfNeeded() -> Archive? {

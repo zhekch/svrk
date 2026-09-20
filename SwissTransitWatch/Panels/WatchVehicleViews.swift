@@ -247,9 +247,8 @@ private struct WatchStopTimelineRow: View {
 
 extension WatchTransitVehicle {
     var displayLine: String {
-        line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? mode.capitalized
-            : line
+        let published = Journey.publishedLine(line, mode: Mode(rawValue: mode))
+        return published.isEmpty ? "ext" : published
     }
 
     var displayDestination: String {

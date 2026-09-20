@@ -9,8 +9,9 @@ import UIKit
 /// and that choice is what made the launch expensive rather than the data
 /// being large. Expanding the timetable nationally builds 25,518 journeys and
 /// half a million calls; a phone opened on one canton draws about a thousand of
-/// them. So the opening camera is now decided *before* the fleet is drawn, and
-/// the fleet is drawn for it.
+/// them. So the opening camera is now decided *before* the fleet is drawn, the
+/// fleet is drawn for it, and a zoom-out or a pan onto new ground expands
+/// what the camera can actually see — not the rest of the country behind it.
 ///
 /// Three sources, in order, and the order is the point:
 ///
@@ -23,9 +24,11 @@ import UIKit
 ///   opens on last night's city has to be dragged back before it is any use.
 /// - **Where the map was left.** Instant, needs no permission, and the only
 ///   answer there is when the fix is missing, stale, refused, or abroad.
-/// - **The country.** No fix, no stored camera: the map opens the way it always
-///   did, and the timetable is expanded nationally because at zoom 7.4 there is
-///   nothing to clip away.
+/// - **Bern HB.** No fix, no stored camera: a city viewport on the network's
+///   hub, not the whole country. The national pass builds 25,000 journeys and
+///   is why a first launch with no location used to sit on the curtain for a
+///   minute. Bern is a place the timetable can clip, and a map somebody can
+///   actually read.
 struct OpeningCamera {
     var lat: Double
     var lon: Double
@@ -46,7 +49,9 @@ struct OpeningCamera {
         case remembered
         /// The fix the system already had, at `OpeningCamera.localZoom`.
         case located
-        /// The whole network, as it was before any of this.
+        /// Bern HB, when there is no fix and nothing remembered.
+        case bern
+        /// The whole network. Kept for a camera that was actually left there.
         case country
     }
 
@@ -66,12 +71,27 @@ struct OpeningCamera {
     /// of a core correcting itself.
     static let localZoom = 11.0
 
-    /// Switzerland, whole, which is where the app opened before there was
-    /// anything to remember.
+    /// Switzerland, whole. Not an opening default: a launch that expands this
+    /// builds the national fleet, which is the minute the curtain used to sit.
     static let country = OpeningCamera(
         lat: 46.8182, lon: 8.2275, zoom: 7.4, bearing: 0, pitch: 0,
         clip: nil, where_: .country
     )
+
+    /// Bern HB, at the local zoom. The fallback when the phone has no fix and
+    /// the last session left nothing to restore.
+    ///
+    /// The station, not the city centroid: somebody opening a transit map with
+    /// no location is looking for trains, and this is where they are.
+    static let bern: OpeningCamera = {
+        let centre = CLLocationCoordinate2D(latitude: 46.94882, longitude: 7.43913)
+        return OpeningCamera(
+            lat: centre.latitude, lon: centre.longitude, zoom: localZoom,
+            bearing: 0, pitch: 0,
+            clip: viewport(centre: centre, zoom: localZoom),
+            where_: .bern
+        )
+    }()
 
     static func resolve() -> OpeningCamera {
         if let fix = lastKnownFix() {
@@ -88,7 +108,7 @@ struct OpeningCamera {
             )
         }
         if let remembered = Settings.camera() { return remembered }
-        return country
+        return bern
     }
 
     /// The fix the system is already holding, if it is holding one.
@@ -112,7 +132,7 @@ struct OpeningCamera {
         guard CLLocationCoordinate2DIsValid(here) else { return nil }
         // Outside the country the network does not cover, the stored camera is
         // absent and the fix is useless: opening the Swiss transit map on Milan
-        // shows an empty rectangle. The country is the better answer.
+        // shows an empty rectangle. Bern is the better answer.
         guard Self.switzerland.contains(lon: here.longitude, lat: here.latitude) else { return nil }
         return here
     }

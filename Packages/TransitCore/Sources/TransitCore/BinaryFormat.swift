@@ -58,7 +58,11 @@ public final class MappedFile: @unchecked Sendable {
         }
         length = Int(info.st_size)
 
-        guard let base = mmap(nil, length, PROT_READ, MAP_PRIVATE, fd, 0), base != MAP_FAILED else {
+        // Shared rather than private: these files are never written through the
+        // mapping, and a private mapping of a 119 MB bundle file is a cold
+        // launch of page faults that do not survive a force-quit the way a
+        // shared mapping's pages do.
+        guard let base = mmap(nil, length, PROT_READ, MAP_SHARED, fd, 0), base != MAP_FAILED else {
             throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: url.path])
         }
         buffer = UnsafeRawBufferPointer(start: base, count: length)
@@ -68,6 +72,21 @@ public final class MappedFile: @unchecked Sendable {
         if let base = UnsafeMutableRawPointer(mutating: buffer.baseAddress) {
             munmap(base, length)
         }
+    }
+
+    /// Hint that the next walk is from the start of the file to the end.
+    ///
+    /// A clipped timetable query used to touch pattern records in trip order,
+    /// which is random in the file. The sequential fill that replaced it is
+    /// only as cheap as the kernel believing it.
+    public func adviseSequential() {
+        guard let base = UnsafeMutableRawPointer(mutating: buffer.baseAddress) else { return }
+        posix_madvise(base, length, POSIX_MADV_SEQUENTIAL)
+    }
+
+    public func adviseNormal() {
+        guard let base = UnsafeMutableRawPointer(mutating: buffer.baseAddress) else { return }
+        posix_madvise(base, length, POSIX_MADV_NORMAL)
     }
 }
 

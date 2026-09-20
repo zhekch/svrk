@@ -638,6 +638,32 @@ fifth of what was running — about −15 to +170 on this snapshot — and drew 
 whole curve as a strip of bars under the clock, so the thinning was something
 you could see coming.
 
+### Which workings are one train
+
+`timetable.bin` also carries the national through-service graph, which is what
+the map uses to know that an arriving RE1 and a departing one are the same
+vehicle rather than two trains sharing a platform.
+
+It is not inferred. GTFS publishes it as `transfers.txt` with
+`transfer_type=4` — an in-seat transfer, the passenger stays on board — and the
+feed carries 270,487 of them, every one naming both trips and a calendar.
+Scoped to one operating day that is 18,785 links, of which 99.1% are a plain
+continuation, 173 are splits and 306 are joins. `build-through-services.mjs`
+reads and reports it, `pack-timetable.mjs` writes it in as format 4 at twelve
+bytes a link — 3.2 MB for the year — and `Chains.build` prefers it over its own
+inference, which now runs only for workings the feed never mentions.
+
+The calendar is the part that matters. Unscoped, a trip appears to continue as
+up to 56 different workings, because those are its successors across a whole
+year of service days rather than a train that parts 56 ways.
+
+One thing the feed says that the app declines to draw: a bus turning round and
+running back is published as an in-seat transfer, and it is genuinely the same
+vehicle, but a joined journey concatenates stop lists — so drawing it as one
+run lists every stop twice and matches no route. Those halves stay two
+vehicles, held on the platform one after the other. See
+`Chains.carriesOn(_:_:)`.
+
 **The archive removed the question.** `timetable.bin` is a year of service days
 and answers for any minute in it straight off the file, so what the control may
 offer is a fact about the packed feed — 2025-12-14 to 2026-12-13 on the current

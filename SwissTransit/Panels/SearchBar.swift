@@ -6,29 +6,35 @@ import TransitCore
 /// A button rather than a permanent field. The map is the document here and a
 /// search field pinned across the top of it is a strip of chrome over the thing
 /// you came to look at — so it stays a 34-point circle until it is asked for,
-/// and then it becomes the whole header. Opening it puts the keyboard up
-/// immediately: nobody taps a magnifying glass to admire the field.
+/// and then it becomes the whole header. The keyboard follows the expansion
+/// so its first layout does not interrupt the glass animation.
 struct SearchBar: View {
     @Bindable var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var focused: Bool
+
+    static let expansionDuration = 0.22
+    static let expansionAnimation = Animation.smooth(duration: expansionDuration)
 
     var body: some View {
         VStack(spacing: 8) {
             field
             if model.isSearching, !model.searchResults.isEmpty {
                 results
+                    .menuAppearance()
             }
         }
-        // The keyboard is the point of the button, so it goes up on its own.
-        //
-        // After a beat rather than immediately: this view is created *by* the
-        // change that opens it, and a `focused = true` in the same pass asks
-        // UIKit to make first responder a field it has not laid out yet, which
-        // it declines silently. One runloop turn is enough, and is under the
-        // 220 ms the header takes to expand anyway.
+        .menuAnimation(value: model.searchResults.stations.map(\.id))
+        .menuAnimation(value: model.searchResults.vehicles.map(\.id))
+        // First-responder setup and keyboard layout can be expensive on the
+        // first opening. Keep them out of the header's expansion transaction.
         .task {
-            guard model.isSearching else { return }
-            try? await Task.sleep(for: .milliseconds(60))
+            do {
+                try await Task.sleep(for: .seconds(reduceMotion ? 0 : Self.expansionDuration))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, model.isSearching else { return }
             focused = true
         }
     }
@@ -64,14 +70,15 @@ struct SearchBar: View {
             }
 
             Button("Cancel") {
-                withAnimation(.snappy(duration: 0.22)) { model.isSearching = false }
+                focused = false
+                model.isSearching = false
             }
             .font(.callout)
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 12)
         .frame(height: 34)
-        .background(.ultraThinMaterial, in: Capsule())
+        .liquidGlass(in: Capsule())
     }
 
     /// What was found, stations first.
@@ -97,6 +104,7 @@ struct SearchBar: View {
                             stationRow(place)
                         }
                         .buttonStyle(.plain)
+                        .menuAppearance()
                         // No rule under the last row of the last group: a
                         // divider with nothing beneath it reads as a row that
                         // failed to draw.
@@ -115,6 +123,7 @@ struct SearchBar: View {
                             vehicleRow(hit)
                         }
                         .buttonStyle(.plain)
+                        .menuAppearance()
                         if index < vehicles.count - 1 {
                             Divider().padding(.leading, 46)
                         }
@@ -125,7 +134,7 @@ struct SearchBar: View {
         // Tall enough for about six rows. Any more and the list is covering the
         // map it is about to move.
         .frame(maxHeight: 320)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .liquidGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     private func groupHeading(_ text: String) -> some View {

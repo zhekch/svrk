@@ -4,6 +4,8 @@ import TransitCore
 
 /// Presentation helpers shared by every panel.
 enum Format {
+    static let delayColor = Color(red: 1, green: 149.0 / 255, blue: 0)
+
     static let clock: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
@@ -11,7 +13,7 @@ enum Format {
     }()
 
     static func time(_ stamp: Timestamp) -> String {
-        clock.string(from: Date(timeIntervalSince1970: TimeInterval(stamp)))
+        clock.string(from: Date(timeIntervalSince1970: TimeInterval(TransitCore.Clock.displayMinute(stamp))))
     }
 
     /// "Tue 3 Mar" — enough to tell one day from another without a year nobody
@@ -24,32 +26,30 @@ enum Format {
 
     static func day(_ date: Date) -> String { dayName.string(from: date) }
 
-    /// "in 4 min", "now", "2 min ago" — what a board actually needs.
+    /// "in 4 min", "in 6h", "now", "2 min ago".
     ///
     /// With the "in". A bare "23 min" beside a clock time reads as a duration —
     /// a journey of twenty-three minutes — and the one word settles it.
     ///
-    /// Past midnight it says which day instead of repeating the clock. A board
-    /// reads a day ahead now — the last boat of the evening, the first bus of
-    /// the morning — and `01:26` under `01:26` at eleven at night is the one
-    /// reading of it that is actually wrong.
+    /// Counted from the printed clocks, not rounded seconds: a 15:30 departure
+    /// at 15:07 is "in 23 min", the same figure the Live Activity shows.
+    ///
+    /// An hour out it is whole hours, and the nearest one rather than the one
+    /// the wait is in: 2h40 is nearly three hours away, not two. Nobody leaves
+    /// for a train on 5h 53min's notice, so the minutes past the hour were
+    /// precision spent on the one row that needed it least — and they were
+    /// spending it out of every other row's width, since the column holds the
+    /// longest thing in the section and "in 5h 53min" is nearly twice "in 4
+    /// min". That was the gap between the platform badges and the clocks on a
+    /// board reaching into tomorrow.
     static func relative(_ stamp: Timestamp, from now: Timestamp) -> String {
-        let minutes = Int(((Double(stamp - now)) / 60).rounded())
+        let minutes = Clock.remainingMinutes(until: stamp, from: now)
         if minutes == 0 { return "now" }
-        if minutes < 0 { return "\(-minutes) min ago" }
-        if minutes < 60 { return "in \(minutes) min" }
-        guard let days = calendarDays(from: now, to: stamp), days > 0 else { return time(stamp) }
-        return days == 1 ? "tomorrow" : weekday(stamp)
-    }
-
-    /// How many local midnights lie between two moments.
-    private static func calendarDays(from: Timestamp, to: Timestamp) -> Int? {
-        let calendar = Calendar.current
-        return calendar.dateComponents(
-            [.day],
-            from: calendar.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(from))),
-            to: calendar.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(to)))
-        ).day
+        let magnitude = abs(minutes)
+        let duration = magnitude < 60
+            ? "\(magnitude) min"
+            : "\((magnitude + 30) / 60)h"
+        return minutes < 0 ? "\(duration) ago" : "in \(duration)"
     }
 
     private static let weekdayName: DateFormatter = {
@@ -64,18 +64,17 @@ enum Format {
 
     /// A call note from the feed, in English, or nil where it says nothing.
     ///
-    /// SIRI's `CallNote` is German and almost entirely one fact: in a national
-    /// snapshot 20,013 of 20,019 notes are `Aussteigeseite: Links` or `Rechts`,
-    /// four are a partial cancellation, and the rest are bare reference numbers
-    /// that mean nothing to a passenger. So this is a lookup rather than a
-    /// translation layer — and the numbers are dropped, because a row reading
-    /// "99871" under a station name is worse than an empty one.
+    /// SIRI's `CallNote` is German. Almost all of a national snapshot is
+    /// `Aussteigeseite: Links` or `Rechts`, which this app does not show —
+    /// nothing currently live publishes an exit side, and the geometric guess
+    /// is gone with it. What remains worth saying is a partial cancellation.
+    /// Bare reference numbers are dropped: a row reading "99871" under a
+    /// station name is worse than an empty one.
     static func note(_ raw: String?) -> String? {
         guard let raw else { return nil }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         switch text {
-        case "Aussteigeseite: Links": return "Exit on the left"
-        case "Aussteigeseite: Rechts": return "Exit on the right"
+        case "Aussteigeseite: Links", "Aussteigeseite: Rechts": return nil
         case "Teilausfall Ankunft": return "Arrival cancelled"
         case "Teilausfall Abfahrt": return "Departure cancelled"
         default: break
@@ -85,12 +84,18 @@ enum Format {
         return text
     }
 
-    /// Below this a delay is not worth a badge.
+    /// The smallest delay worth a badge, in minutes.
     ///
     /// Real-time systems revise by the second, and the small end of that is
-    /// jitter rather than information — a board that says a bus is one minute
-    /// late is saying nothing and looking busy while it does so.
-    static let smallestWorthShowing = 3
+    /// jitter rather than information. A train three minutes down is already a
+    /// platform change; a bus or tram two minutes down is already a missed
+    /// connection. One minute is still noise on every mode.
+    static func smallestWorthShowing(_ mode: Mode?) -> Int {
+        switch mode {
+        case .bus, .tram: return 2
+        default: return 3
+        }
+    }
 
     /// A platform, as a board should print it: the number, without the sectors.
     ///
@@ -127,8 +132,8 @@ enum Format {
     /// its published time, so a negative figure is measurement noise rather than
     /// something a passenger can act on — "−1" beside a departure tells nobody
     /// anything.
-    static func delay(_ minutes: Int?) -> String? {
-        guard let minutes, minutes > smallestWorthShowing else { return nil }
+    static func delay(_ minutes: Int?, mode: Mode? = nil) -> String? {
+        guard let minutes, minutes >= smallestWorthShowing(mode) else { return nil }
         return "+\(minutes)"
     }
 

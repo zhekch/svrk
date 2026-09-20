@@ -24,5 +24,11 @@ let package = Package(
             dependencies: ["TransitCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .testTarget(
+            name: "TransitRegressionTests",
+            dependencies: ["TransitCore"],
+            path: "RegressionTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

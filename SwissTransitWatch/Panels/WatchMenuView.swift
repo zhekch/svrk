@@ -17,31 +17,36 @@ struct WatchMenuView: View {
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
 
-                        Text(model.fullTimetableStatus)
-                            .font(.caption.weight(.semibold))
-                        if let validity = model.fullTimetableValidity {
-                            Text("Valid until \(validity)")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text("~124 MB")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Button {
-                            model.downloadFullTimetable()
-                        } label: {
-                            WatchGlassActionLabel(
-                                title: model.nationalTimetableInfo == nil
-                                    ? "Download"
-                                    : "Update",
-                                systemName: "arrow.down.circle",
-                                tint: .blue
+                        if model.isDownloadingFullTimetable {
+                            WatchTimetableDownloadProgressView(
+                                progress: model.fullTimetableProgress,
+                                remainingText: model.fullTimetableRemainingText
                             )
+                        } else {
+                            Text(model.fullTimetableStatus)
+                                .font(.caption.weight(.semibold))
+                            if let validity = model.fullTimetableValidity {
+                                Text("Valid until \(validity)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text("~124 MB")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Button {
+                                model.downloadFullTimetable()
+                            } label: {
+                                WatchGlassActionLabel(
+                                    title: model.nationalTimetableInfo == nil
+                                        ? "Download"
+                                        : "Update",
+                                    systemName: "arrow.down.circle",
+                                    tint: .blue
+                                )
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
-                        .disabled(model.isDownloadingFullTimetable)
                     }
                 }
                 destination(.about, title: "About", symbol: "info.circle.fill", tint: .blue)
@@ -86,6 +91,57 @@ struct WatchMenuView: View {
     }
 }
 
+private struct WatchTimetableDownloadProgressView: View {
+    let progress: WatchTimetableDownloadProgress?
+    var remainingText: String?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            WatchDownloadRing(fraction: progress?.hasBytes == true ? progress?.fraction : nil)
+            Text(remainingText ?? "Starting…")
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Timetable download")
+        .accessibilityValue(remainingText ?? "Starting")
+    }
+}
+
+/// System `ProgressView` circular style paints a cyan highlight on the leading
+/// cap. A single-colour trimmed circle is the remaining amount without that.
+private struct WatchDownloadRing: View {
+    var fraction: Double?
+    @State private var spin = 0.0
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.blue.opacity(0.28), lineWidth: 3.5)
+            Circle()
+                .trim(from: 0, to: fraction.map { min(1, max(0, $0)) } ?? 0.22)
+                .stroke(
+                    Color.blue,
+                    style: StrokeStyle(lineWidth: 3.5, lineCap: .round)
+                )
+                .rotationEffect(.degrees((fraction == nil ? spin : 0) - 90))
+        }
+        .frame(width: 28, height: 28)
+        .onChange(of: fraction == nil, initial: true) { _, spinning in
+            if spinning {
+                withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) {
+                    spin = 360
+                }
+            } else {
+                spin = 0
+            }
+        }
+    }
+}
+
 private struct WatchMenuActionRow: View {
     let title: String
     let symbol: String
@@ -120,17 +176,17 @@ struct WatchStatusView: View {
             LazyVStack(spacing: 8) {
                 WatchGlassCard {
                     VStack(spacing: 7) {
-                        WatchStatusRow(
-                            title: "Snapshot",
-                            value: model.hasSnapshot
-                                ? (model.isSnapshotStale ? "Needs refresh" : "Ready")
-                                : "No cache"
-                        )
-
+                        WatchStatusRow(title: "Nearby", value: model.nearbyStatusText)
                         Divider().opacity(0.4)
                         WatchStatusRow(title: "Location", value: model.locationStatusText)
                         Divider().opacity(0.4)
                         WatchStatusRow(title: "Timetable", value: model.fullTimetableStatus)
+                        if model.isDownloadingFullTimetable {
+                            WatchTimetableDownloadProgressView(
+                                progress: model.fullTimetableProgress,
+                                remainingText: model.fullTimetableRemainingText
+                            )
+                        }
                     }
                 }
 
@@ -154,15 +210,18 @@ private struct WatchStatusRow: View {
     let value: String
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .center, spacing: 8) {
             Text(title)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            Spacer(minLength: 4)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 6)
             Text(value)
                 .font(.caption.weight(.semibold))
                 .multilineTextAlignment(.trailing)
-                .lineLimit(2)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
         }
     }
 }

@@ -70,7 +70,7 @@ public final class RailNet: @unchecked Sendable {
     /// rail itself is a metre from the platform.
     static let platformEdgeSearch = 250.0
 
-    struct Graph {
+    struct Graph: Sendable {
         var lons: [Int32]
         var lats: [Int32]
         var offsets: [Int32]
@@ -92,7 +92,7 @@ public final class RailNet: @unchecked Sendable {
 
     private var graph: Graph?
     private var grid: [GridKey: [Int32]] = [:]
-    struct GridKey: Hashable { var x: Int32; var y: Int32 }
+    struct GridKey: Hashable, Sendable { var x: Int32; var y: Int32 }
 
     /// Memoised legs. `nil` value means "asked, and there is no sensible route"
     /// — worth remembering, since the caller would otherwise re-run the search
@@ -160,6 +160,15 @@ public final class RailNet: @unchecked Sendable {
         )
         graph = loaded
         buildGrid(loaded)
+    }
+
+    /// Adopt a graph loaded off this instance, so the fleet actor can overlap
+    /// a 17 MB rail read with timetable work instead of waiting on it.
+    public func take(_ other: RailNet) {
+        graph = other.graph
+        grid = other.grid
+        other.graph = nil
+        other.grid = [:]
     }
 
     private func buildGrid(_ graph: Graph) {
@@ -521,18 +530,25 @@ public final class RailNet: @unchecked Sendable {
     /// Track geometry between two stops, or nil when no sensible route exists
     /// (the caller then falls back to a straight line). `key` identifies the
     /// stop pair so repeated legs are only routed once.
-    public func routeLeg(key: String, from: Coord, to: Coord, mode: Mode = .train) -> [Coord]? {
+    ///
+    /// `allowLong` is for a selected vehicle: the 120 km skip exists so the
+    /// draw loop does not Dijkstra a non-stop Frankfurt–Basel for every train
+    /// in view. Once both ends snap onto this graph, the search is cheap even
+    /// at 200 km — Basel–Interlaken is the case that skip turned into a chord
+    /// across the Oberland.
+    public func routeLeg(
+        key: String, from: Coord, to: Coord, mode: Mode = .train,
+        allowLong: Bool = false
+    ) -> [Coord]? {
         guard let graph else { return nil }
-        let cacheKey = "\(mode.rawValue)|\(key)"
+        let cacheKey = "\(mode.rawValue)|\(key)|L\(allowLong)"
         if let hit = cacheLock.withLock({ legCache[cacheKey] }) { return hit }
 
         let direct = Geo.metres(from, to)
         var result: [Coord]?
 
-        // Beyond ~120 km a leg is almost always a non-stop run whose search
-        // cost is not worth it, and below ~40 m the straight line is already
-        // correct.
-        if direct > 40 && direct < 120_000 {
+        // Below ~40 m the straight line is already the track.
+        if direct > 40 && (allowLong ? direct < 500_000 : direct < 120_000) {
             // Between adjacent stops the snap radius must stay well under the
             // gap itself. Otherwise the two candidate sets overlap and the
             // cheapest "route" the search can find is a single shared node — a
@@ -824,6 +840,34 @@ extension RailNet {
         public var kind: UInt8
     }
 
+    /// Read-only graph storage for drawing independently of the fleet actor.
+    /// Arrays and the spatial index share copy-on-write storage; routing caches
+    /// and subsequent graph loads cannot mutate this snapshot.
+    public struct TrackOverlay: Sendable {
+        private let graph: Graph?
+        private let grid: [GridKey: [Int32]]
+
+        fileprivate init(graph: Graph?, grid: [GridKey: [Int32]]) {
+            self.graph = graph
+            self.grid = grid
+        }
+
+        public var isReady: Bool { graph != nil }
+        public func kindBit(_ name: String) -> UInt8 { graph?.kindBits[name] ?? 0 }
+
+        public func lines(
+            in bbox: BBox, limit: Int = 20_000, kindMask: UInt8 = 0,
+            minLength: Double = 0, simplify: Double = 0
+        ) -> [TrackLine] {
+            RailNet.overlayLines(in: bbox, graph: graph, grid: grid, limit: limit,
+                                 kindMask: kindMask, minLength: minLength, simplify: simplify)
+        }
+    }
+
+    public func trackOverlay() -> TrackOverlay {
+        TrackOverlay(graph: graph, grid: grid)
+    }
+
     /// The railway network inside a viewport, as polylines.
     ///
     /// The web app gets this for free by loading OpenRailwayMap's vector tiles
@@ -857,6 +901,14 @@ extension RailNet {
     public func lines(
         in bbox: BBox, limit: Int = 20_000, kindMask: UInt8 = 0,
         minLength: Double = 0, simplify: Double = 0
+    ) -> [TrackLine] {
+        Self.overlayLines(in: bbox, graph: graph, grid: grid, limit: limit,
+                          kindMask: kindMask, minLength: minLength, simplify: simplify)
+    }
+
+    private static func overlayLines(
+        in bbox: BBox, graph: Graph?, grid: [GridKey: [Int32]], limit: Int,
+        kindMask: UInt8, minLength: Double, simplify: Double
     ) -> [TrackLine] {
         guard let graph else { return [] }
 
@@ -941,6 +993,7 @@ extension RailNet {
         // in half wherever the sweep happened to start.
         for pass in 0..<2 {
             for node32 in candidates {
+                if Task.isCancelled { return [] }
                 let node = Int(node32)
                 if pass == 0 && degree(node) == 2 { continue }
                 for edge in Int(graph.offsets[node])..<Int(graph.offsets[node + 1]) {

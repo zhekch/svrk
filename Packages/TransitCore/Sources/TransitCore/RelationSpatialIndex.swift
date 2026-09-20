@@ -24,7 +24,7 @@ extension RelationStore {
 
         for i in 0..<count {
             let relation = self.relation(at: i)
-            let path = self.path(of: relation)
+            let path = self.pathCoords(of: relation)
             guard path.count > 1 else { continue }
 
             var lastCell: TrackCell?
@@ -70,7 +70,7 @@ extension RelationStore {
         var scored: [(distance: Double, index: Int)] = []
         for i in candidates {
             let relation = self.relation(at: Int(i))
-            let path = self.path(of: relation)
+            let path = self.pathCoords(of: relation)
             guard path.count > 1 else { continue }
 
             var best = Double.infinity
@@ -152,7 +152,7 @@ extension RelationStore {
         var built: [TrackCell: [Int32]] = [:]
         for i in 0..<count {
             let relation = self.relation(at: i)
-            let stops = self.stops(of: relation)
+            let stops = self.stopCoords(of: relation)
             for s in 0..<stops.count {
                 let point = stops[s]
                 let cell = Self.trackCell(point.lon, point.lat)
@@ -197,7 +197,7 @@ extension RelationStore {
         var scored: [(distance: Double, index: Int)] = []
         for i in candidates {
             let relation = self.relation(at: Int(i))
-            let stops = self.stops(of: relation)
+            let stops = self.stopCoords(of: relation)
             var best = Double.infinity
             for s in 0..<stops.count {
                 let d = Geo.flatMetres(stops[s].lon, stops[s].lat, lon, lat)
@@ -219,7 +219,7 @@ extension RelationStore {
             if !seen.insert(key).inserted { continue }
             out.append(ServingLine(
                 id: r.id, ref: ref, mode: mode,
-                headline: r.name ?? "\(r.from ?? "?") → \(r.to ?? "?")",
+                headline: RouteNaming.headline(name: r.name, from: r.from, to: r.to) ?? "",
                 operatorName: r.operatorName
             ))
             if out.count >= limit { break }

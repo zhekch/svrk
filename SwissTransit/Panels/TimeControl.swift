@@ -84,7 +84,7 @@ struct TimeControl: View {
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 9)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .liquidGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         // The clock may already be offset before this view exists — restored
         // state, or a development launch argument. Read it rather than assume
         // zero, or the buttons would step from a number the clock disagrees with.
@@ -96,6 +96,7 @@ struct TimeControl: View {
                 onPick: applyPickedDate
             )
             .presentationDetents([.height(380)])
+            .keepBottomSheet()
         }
     }
 

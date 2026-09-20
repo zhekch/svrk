@@ -154,8 +154,8 @@ struct WatchVehicleRouteView: View {
             ForEach(railLines) { line in
                 MapPolyline(coordinates: line.coordinates.map(\.mapCoordinate))
                     .stroke(
-                        line.style.color.opacity(0.72),
-                        lineWidth: line.isDetailed ? 1.35 : 1
+                        line.style.color.opacity(0.86),
+                        style: line.strokeStyle
                     )
             }
 

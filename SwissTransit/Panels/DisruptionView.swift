@@ -62,7 +62,7 @@ struct DisruptionRow: View {
 
                 if hasMore {
                     Button(expanded ? "Less" : "More") {
-                        withAnimation(.snappy(duration: 0.2)) { expanded.toggle() }
+                        expanded.toggle()
                     }
                     .font(.caption.weight(.medium))
                     .buttonStyle(.plain)
@@ -93,6 +93,7 @@ struct DisruptionRow: View {
             }
         }
         .padding(.vertical, 2)
+        .menuAnimation(value: expanded)
     }
 
     private var icon: String {

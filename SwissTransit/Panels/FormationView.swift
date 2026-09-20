@@ -17,6 +17,7 @@ import TransitCore
 /// the sectors they stand in change at every stop, and the stop a reader wants
 /// is not always the one the panel opened on.
 struct FormationView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let formation: TrainFormation
     /// The stop the panel is already talking about, and where the picker opens.
     let stop: FormationAtStop
@@ -35,7 +36,8 @@ struct FormationView: View {
     /// in a card under the drawing rather than opening a sheet: what is in
     /// coach 9 is a footnote to the picture, not a place to navigate to.
     @State private var opened: Int?
-    /// The stop the reader picked, as an index into `formation.stops`. Nil
+    /// The stop the reader picked, by UIC so loading earlier legs cannot shift
+    /// the selection to a different station. Nil
     /// until they pick one, which is what makes `stop` the default without
     /// having to copy it into state and keep it in step.
     @State private var chosen: Int?
@@ -46,6 +48,13 @@ struct FormationView: View {
     /// loads and for every stop that has no strip — most bus stops, and any
     /// station OpenStreetMap has not drawn.
     @State private var strip: PlatformStrip?
+    @State private var coachLayout = CoachLayoutCache()
+    @State private var positionedTrain = false
+
+    private struct TrainScrollTarget: Equatable {
+        let stop: Int
+        let offset: CGFloat
+    }
 
     private static let wagonHeight: CGFloat = 50
     /// The inset a grouped list gives its own rows, put back by hand.
@@ -94,13 +103,22 @@ struct FormationView: View {
                 // Reached on every change that moves it: the platform arrives
                 // after the card is already on screen, and the train's place on
                 // it is not known until it does.
-                .onChange(of: trainOffset) { _, _ in showTrain(scroller) }
-                .onChange(of: shown.uic) { _, _ in showTrain(scroller) }
-                .onAppear { showTrain(scroller) }
+                .task(id: TrainScrollTarget(stop: shown.uic, offset: trainOffset)) {
+                    // Wait for the anchor's layout, and cancel superseded
+                    // requests instead of queuing several competing jumps.
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    withAnimation(reduceMotion || !positionedTrain ? nil : MenuMotion.animation) {
+                        scroller.scrollTo(Self.trainAnchor, anchor: .leading)
+                    }
+                    positionedTrain = true
+                }
             }
 
             if let opened, let coach = shown.coaches.first(where: { $0.position == opened }) {
                 detail(of: coach).padding(.horizontal, Self.margin)
+                    .contentTransition(.opacity)
+                    .menuAppearance()
             }
             notes.padding(.horizontal, Self.margin)
         }
@@ -111,8 +129,9 @@ struct FormationView: View {
                     .onChange(of: proxy.size.width) { _, width in panelWidth = width }
             }
         }
-        .animation(.snappy(duration: 0.22), value: opened)
-        .animation(.snappy(duration: 0.22), value: chosen)
+        .menuAnimation(value: opened)
+        .menuAnimation(value: chosen)
+        .menuAnimation(value: strip != nil)
         .sensoryFeedback(.selection, trigger: opened)
         .sensoryFeedback(.selection, trigger: chosen)
         // The panel can move on to the next stop underneath us — the train
@@ -120,19 +139,9 @@ struct FormationView: View {
         // made about the old stop should not survive that.
         .onChange(of: stop.uic) { chosen = nil; opened = nil }
         .task(id: "\(shown.uic)|\(shown.track ?? "")") {
-            strip = await stripFor?(shown.uic, shown.track)
-        }
-    }
-
-    /// Bring the train back into view.
-    ///
-    /// On the next turn of the run loop rather than now: during a layout pass
-    /// the scroll view has not yet placed the anchor, and scrolling to a view
-    /// it has not placed does nothing at all — which is how a card opened on
-    /// four hundred metres of empty platform with the train off the edge.
-    private func showTrain(_ scroller: ScrollViewProxy) {
-        DispatchQueue.main.async {
-            scroller.scrollTo(Self.trainAnchor, anchor: .leading)
+            let found = await stripFor?(shown.uic, shown.track)
+            guard !Task.isCancelled else { return }
+            strip = found
         }
     }
 
@@ -148,7 +157,9 @@ struct FormationView: View {
     }
 
     private var shownIndex: Int? {
-        if let chosen, formation.stops.indices.contains(chosen) { return chosen }
+        if let chosen, let index = formation.stops.firstIndex(where: { $0.uic == chosen }) {
+            return index
+        }
         return formation.stops.firstIndex { $0.uic == stop.uic && $0.track == stop.track }
             ?? formation.stops.firstIndex { $0.uic == stop.uic }
     }
@@ -160,7 +171,7 @@ struct FormationView: View {
     private var selection: Binding<Int> {
         Binding(
             get: { shownIndex ?? choices.first ?? 0 },
-            set: { chosen = $0; opened = nil }
+            set: { chosen = formation.stops[$0].uic; opened = nil }
         )
     }
 
@@ -263,10 +274,10 @@ struct FormationView: View {
         var parts: [String] = []
         let coaches = shown.coaches.count { $0.kind.carriesPassengers }
         if coaches > 0 { parts.append("\(coaches) \(coaches == 1 ? "coach" : "coaches")") }
-        if let length = formation.totalLength, length > 0 {
+        if let length = shown.measuredLength ?? formation.totalLength, length > 0 {
             parts.append("\(Int(length.rounded())) m")
         }
-        if let seats = formation.totalSeats, seats > 0 { parts.append("\(seats) seats") }
+        if let seats = shown.measuredSeats ?? formation.totalSeats, seats > 0 { parts.append("\(seats) seats") }
         // Said once in words, so the row of letters under the drawing reads as
         // the platform it is rather than as a caption nobody explained.
         if let first = shown.sectors.first, let last = shown.sectors.last {
@@ -278,11 +289,36 @@ struct FormationView: View {
 
     // MARK: - Direction
 
+    /// What to put on the one arrow over a train that is not drawn in halves.
+    ///
+    /// The coach goal first, where the service files one covering the whole
+    /// train. The name passed in is the *service's* destination and on a train
+    /// that parts it names both ends of it: RE1 4177 is advertised
+    /// "Domodossola (I) | Zweisimmen", and an arrow reading "toward Domodossola
+    /// (I) | Zweisimmen" over twelve coaches says every one of them is going to
+    /// both places. The goal says what is actually true of the coaches drawn
+    /// — all twelve to Domodossola, with the Zweisimmen half a working of its
+    /// own — and it is the coaches that are drawn.
+    ///
+    /// Only where the goal covers all of them. A goal that speaks for part of
+    /// the train is a portion, and a portion gets its own arrow over its own
+    /// coaches rather than a caption over everybody else's.
+    private var bannerDestination: String? {
+        guard shown.portions.count == 1, let portion = shown.portions.first,
+              let named = portion.destination,
+              !shown.coaches.isEmpty,
+              shown.coaches.allSatisfy({
+                  $0.position >= portion.fromPosition && $0.position <= portion.toPosition
+              })
+        else { return destination }
+        return named
+    }
+
     private var directionBar: some View {
         HStack(spacing: 5) {
             Image(systemName: "arrowtriangle.left.fill")
                 .font(.system(size: 8))
-            Text(destination.map { "toward \($0)" } ?? "direction of travel")
+            Text(bannerDestination.map { "toward \($0)" } ?? "direction of travel")
                 .font(.caption2.weight(.semibold))
             Capsule()
                 .frame(height: 1.5)
@@ -392,11 +428,20 @@ struct FormationView: View {
         let blocked: Bool
     }
 
+    /// Several drawing properties read this layout in one SwiftUI pass. Keep
+    /// the immutable result across resizing passes instead of rebuilding every
+    /// wagon specification for each width, offset and sector calculation.
+    private final class CoachLayoutCache {
+        var coaches: [Coach] = []
+        var placed: [Placed] = []
+    }
+
     /// The whole train worked out once — widths, cabs, markings, gaps — so the
     /// drawing and the sector bands underneath it are laid out from the same
     /// numbers and cannot drift apart.
     private var naturalLayout: [Placed] {
         let coaches = shown.coaches
+        if coachLayout.coaches == coaches { return coachLayout.placed }
         // A gangway that cannot be walked through is worth the room, because on
         // a train that splits it is the difference between the half that goes
         // where you are going and the half that does not. Read from either side
@@ -406,7 +451,7 @@ struct FormationView: View {
             index > 0
                 && (coaches[index].noAccessForward || coaches[index - 1].noAccessBackward)
         }
-        return coaches.indices.map { index in
+        let placed = coaches.indices.map { index in
             // A join with no way through is where two units are coupled, and
             // the ends of a unit are driving cabs. So the cab is not only drawn
             // at the two ends of the train: a six-car regional service made of
@@ -425,6 +470,9 @@ struct FormationView: View {
                 blocked: blocked[index]
             )
         }
+        coachLayout.coaches = coaches
+        coachLayout.placed = placed
+        return placed
     }
 
     /// Which end of a coach the yellow band runs along.
@@ -610,7 +658,7 @@ struct FormationView: View {
     /// natural layout is used and not `layout`, because `layout` stretches a
     /// short train to fill the card and a stretched train is not 180 m long.
     private var trainMetres: Double {
-        if let length = formation.totalLength, length > 0 { return length }
+        if let length = shown.measuredLength ?? formation.totalLength, length > 0 { return length }
         let real = naturalLayout.filter { $0.coach.kind != .fictitious }
         guard !real.isEmpty else { return 0 }
         let bodies = real.reduce(0.0) { $0 + Double($1.spec.width) / Double(Wagon.pointsPerMetre) }
@@ -689,7 +737,7 @@ struct FormationView: View {
         for coach in filed {
             let width: CGFloat
             let occupied: Bool
-            if coach.kind == .fictitious {
+            if !coach.isTrainVehicle {
                 width = nominalCoachWidth
                 occupied = false
             } else {
@@ -713,19 +761,19 @@ struct FormationView: View {
     private var paddingBeforeTrain: CGFloat {
         var width: CGFloat = 0
         for coach in shown.padded {
-            guard coach.kind == .fictitious else { break }
+            guard !coach.isTrainVehicle else { break }
             width += nominalCoachWidth
         }
         return width
     }
 
-    /// Where the train's nose sits, in points from the left end of the drawing.
+    /// Where the train's nose sits on the full, uncropped platform.
     ///
     /// From the platform where the train could be placed on one, so a train two
     /// thirds of the way along a platform is drawn two thirds of the way along
     /// it. Otherwise from the padding alone, which at least says how much
     /// platform is in front of it.
-    private var trainOffset: CGFloat {
+    private var platformTrainOffset: CGFloat {
         guard scale > 0 else { return 0 }
         if let strip, let span = stripSpan, strip.length > 0 {
             return max(0, CGFloat(span.lower * strip.length) * scale)
@@ -735,14 +783,46 @@ struct FormationView: View {
 
     /// Where the lettered stretch begins, which is not where the platform does:
     /// the sectors are anchored to the train and run outwards from it.
-    private var sectorOffset: CGFloat {
-        max(0, trainOffset - paddingBeforeTrain)
+    /// Keep this signed. The mapped stop position can be closer to the platform
+    /// start than the formation's nominal padding. Clamping only the sectors
+    /// to zero puts the train over those empty sectors instead of its own.
+    /// `displayBounds` translates all rows together into nonnegative view space.
+    private var platformSectorOffset: CGFloat {
+        platformTrainOffset - paddingBeforeTrain
     }
 
-    private var contentWidth: CGFloat {
-        let lettered = sectorOffset + platformSectors.reduce(0) { $0 + $1.width }
-        return max(max(platformWidth, lettered), trainOffset + drawnTrainWidth)
+    /// Unlabelled placeholders outside the first/last named sector are not
+    /// sectors. Keep unnamed gaps inside the range, since they carry spacing.
+    private var sectorExtent: (start: CGFloat, runs: [SectorRun]) {
+        let runs = platformSectors
+        func named(_ run: SectorRun) -> Bool {
+            !(run.sector?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        }
+        guard let first = runs.firstIndex(where: named),
+              let last = runs.lastIndex(where: named)
+        else { return (0, []) }
+        return (
+            platformSectorOffset + runs[..<first].reduce(0) { $0 + $1.width },
+            Array(runs[first...last])
+        )
     }
+
+    /// Crop only the unlabelled ends, retaining all filed sectors, including
+    /// those the train does not occupy. Translate every row by the same origin
+    /// so removing blank scrolling never shifts a coach relative to its sector.
+    private var displayBounds: FormationDisplayBounds {
+        let sectors = sectorExtent
+        return FormationDisplayBounds(
+            platformWidth: Double(platformWidth),
+            trainStart: Double(platformTrainOffset), trainWidth: Double(drawnTrainWidth),
+            sectorStart: Double(sectors.start),
+            sectorWidth: Double(sectors.runs.reduce(0) { $0 + $1.width })
+        )
+    }
+
+    private var trainOffset: CGFloat { platformTrainOffset - CGFloat(displayBounds.lower) }
+    private var sectorOffset: CGFloat { sectorExtent.start - CGFloat(displayBounds.lower) }
+    private var contentWidth: CGFloat { CGFloat(displayBounds.width) }
 
     @ViewBuilder private var platformBand: some View {
         if scale > 0, !platformSectors.isEmpty || platformWidth > 0 {
@@ -759,12 +839,6 @@ struct FormationView: View {
                     alignment: .topLeading
                 )
 
-                if let strip, strip.length > 0 {
-                    Text("\(Int(strip.length.rounded())) m platform")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.leading, sectorOffset)
-                }
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(spokenPlatform)
@@ -780,7 +854,8 @@ struct FormationView: View {
     private var spokenPlatform: String {
         var parts: [String] = []
         if let strip, strip.length > 0 {
-            parts.append("Platform \(Int(strip.length.rounded())) metres")
+            parts.append("Full platform \(Int(strip.length.rounded())) metres")
+            if !sectorExtent.runs.isEmpty { parts.append("Diagram cropped to the sectors") }
         }
         let standing = platformSectors.filter(\.occupied).compactMap(\.sector)
         if !standing.isEmpty {
@@ -789,7 +864,8 @@ struct FormationView: View {
         let empty = platformSectors.filter { !$0.occupied }.compactMap(\.sector)
         if !empty.isEmpty { parts.append("also \(empty.joined(separator: ", "))") }
         if let strip {
-            for point in strip.access.sorted(by: { $0.fraction < $1.fraction }) {
+            for point in strip.access.sorted(by: { $0.fraction < $1.fraction })
+            where displayBounds.position(of: point.fraction * Double(platformWidth)) != nil {
                 let at = Int((point.fraction * strip.length).rounded())
                 parts.append("\(PlatformStripView.name(point.kind)) at \(at) metres")
             }
@@ -801,29 +877,17 @@ struct FormationView: View {
         CGFloat(Self.markerRowCount) * Self.markerSize
     }
 
-    /// Platform ahead of the lettered stretch, and behind it.
-    ///
-    /// A platform is longer than the part anybody has lettered, and the rest is
-    /// still platform you can stand on — so it is drawn as the same line with
-    /// no letter on it.
-    private var leadingPlain: CGFloat { min(sectorOffset, max(platformWidth, 0)) }
-
-    private var trailingPlain: CGFloat {
-        let lettered = sectorOffset + platformSectors.reduce(0) { $0 + $1.width }
-        return max(0, platformWidth - lettered)
-    }
-
     /// The platform: one hairline, broken by the letter of each sector.
     ///
     /// A rule and a letter, which is what the drawing under the train always
-    /// was — now run the length of the real platform instead of the length of
-    /// the train, so the sectors the train does *not* reach are on it too.
+    /// was — including sectors the train does not reach, but no unlabelled
+    /// continuation beyond the first and last sector boundaries.
     private var sectorRow: some View {
         HStack(spacing: 0) {
-            if leadingPlain > 0 {
-                rule.frame(width: leadingPlain, height: Self.sectorHeight)
+            if sectorOffset > 0 {
+                Color.clear.frame(width: sectorOffset, height: Self.sectorHeight)
             }
-            ForEach(Array(platformSectors.enumerated()), id: \.offset) { _, run in
+            ForEach(Array(sectorExtent.runs.enumerated()), id: \.offset) { _, run in
                 HStack(spacing: 5) {
                     rule
                     Text(run.sector ?? "–")
@@ -841,8 +905,8 @@ struct FormationView: View {
                 .overlay(alignment: .leading) { tick }
                 .overlay(alignment: .trailing) { tick }
             }
-            if trailingPlain > 0 {
-                rule.frame(width: trailingPlain, height: Self.sectorHeight)
+            if sectorExtent.runs.isEmpty {
+                rule.frame(width: platformWidth, height: Self.sectorHeight)
             }
         }
     }
@@ -853,7 +917,9 @@ struct FormationView: View {
         var out: [(point: AccessPoint, x: CGFloat, row: Int)] = []
         var lastX = [CGFloat](repeating: -.infinity, count: Self.markerRowCount)
         for point in strip.access.sorted(by: { $0.fraction < $1.fraction }) {
-            let x = CGFloat(point.fraction) * platformWidth
+            guard let visible = displayBounds.position(of: point.fraction * Double(platformWidth))
+            else { continue }
+            let x = CGFloat(visible)
             var row = 0
             while row < Self.markerRowCount - 1, x - lastX[row] < Self.markerSize { row += 1 }
             lastX[row] = x
@@ -937,7 +1003,6 @@ struct FormationView: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
     }
 
     @ViewBuilder

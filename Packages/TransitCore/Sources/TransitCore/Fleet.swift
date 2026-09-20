@@ -70,8 +70,27 @@ public struct VehicleSnapshot: Sendable, Identifiable, Equatable {
     /// `VehicleFootprint.centreline` and `Fleet.keepContinuous`.
     public var drift: Coord?
 
-    /// A complete snapshot for clients that render a vehicle without querying
-    /// the fleet actor, including SwiftUI previews.
+    /// A stopped last call may be a turnback or a join into another working.
+    /// Resolve that working before using this snapshot as a panel's first
+    /// paint; the raw stop list alone cannot say that the train ends here.
+    public var isStandingAtLastStop: Bool {
+        !moving && !stops.isEmpty && index == stops.count - 1
+    }
+
+    /// The same physical vehicle changes its advertised service at arrival,
+    /// before the outgoing working gets its own map position at departure.
+    public var isTurningAround: Bool {
+        layover?.id != nil && isStandingAtLastStop
+    }
+
+    public var displayLine: String {
+        isTurningAround ? (layover?.line ?? line) : line
+    }
+
+    public var displayDestination: String? {
+        isTurningAround ? (layover?.to ?? to) : to
+    }
+
     public init(
         id: String, mode: Mode, category: String? = nil,
         cable: LayoutLibrary.CableKind? = nil, line: String,
@@ -132,12 +151,27 @@ public struct BoardEntry: Sendable, Identifiable, Equatable {
     public var terminates: Bool
     public var originates: Bool
     public var running: Bool
+    public var typicalIntervalMinutes: Int?
+    public var runIdentity: BoardRunIdentity?
+
+    /// A timetable row ID may recur later today or tomorrow. SwiftUI needs an
+    /// occurrence identity for expanded times, while selection still uses `id`.
+    public var eventID: String {
+        "\(id)|\(runIdentity?.station ?? stop ?? "")|\(runIdentity?.scheduledDeparture ?? departure)|\(terminates)"
+    }
+
+    /// Keep the current displayed minute, including delayed departures whose
+    /// booked time has passed. A running train may already have left this stop.
+    public func isUpcoming(at now: Timestamp) -> Bool {
+        departure >= Clock.displayMinute(now)
+    }
 
     public init(
         id: String, mode: Mode, line: String, to: String? = nil, from: String,
         departure: Timestamp, arrival: Timestamp, platform: String? = nil,
         delay: Int? = nil, observed: Bool = false, stop: String? = nil,
-        terminates: Bool = false, originates: Bool = false, running: Bool = true
+        terminates: Bool = false, originates: Bool = false, running: Bool = true,
+        typicalIntervalMinutes: Int? = nil, runIdentity: BoardRunIdentity? = nil
     ) {
         self.id = id
         self.mode = mode
@@ -153,6 +187,17 @@ public struct BoardEntry: Sendable, Identifiable, Equatable {
         self.terminates = terminates
         self.originates = originates
         self.running = running
+        self.typicalIntervalMinutes = typicalIntervalMinutes
+        self.runIdentity = runIdentity
+    }
+
+    /// Same advertised service on a board: one tram, not `3` and `T3`.
+    public func sameService(as other: BoardEntry) -> Bool {
+        mode == other.mode
+            && Journey.publishedLine(line, mode: mode)
+                == Journey.publishedLine(other.line, mode: other.mode)
+            && Fleet.sameBoardDestination(to ?? "", other.to ?? "")
+            && stop == other.stop
     }
 }
 
@@ -170,6 +215,14 @@ public struct StationBoard: Sendable, Equatable {
     /// arrive together and cannot disagree about which stop they describe, or
     /// list the same line twice between them.
     public var serving: [ServingLine] = []
+    public var isLoading = false
+    /// Preserve the OSM lookup for stations outside the Swiss stop-place index.
+    public var shape: String? = nil
+
+    public static func loading(id: String, name: String, at point: Coord, now: Timestamp) -> Self {
+        Self(id: id, name: name, lon: point.lon, lat: point.lat, now: now,
+             departures: [], isLoading: true)
+    }
 }
 
 public struct PlatformBoard: Sendable, Equatable {
@@ -200,6 +253,7 @@ public struct PlatformBoard: Sendable, Equatable {
     /// Carried on the board rather than held beside it, so the map can outline
     /// the shape that is selected and cannot end up outlining one that is not:
     /// the highlight is a function of the selection, not a second copy of it.
+    public var isLoading = false
     public var shape: String?
 }
 
@@ -318,11 +372,222 @@ public actor Fleet {
     /// to, which is what makes this safe to land before the file ships.
     private var timetable: TimetableStore?
     private var builder: GeometryBuilder!
+    private var supportingLoaded = false
+    private let osmRoutes = OSMRouteClient()
+    /// Overpass keys that returned nothing useful, so a panel refresh does not
+    /// ask again for a line OSM simply does not have.
+    private var remoteRouteMisses: Set<String> = []
 
     private var journeys: [String: Journey] = [:]
     private(set) var revision = 0
     private var chainedRevision = -1
     private var chained: [String: Journey] = [:]
+    /// Through-services the formation service has told us about.
+    ///
+    /// The packed timetable is the bulk of the graph and the better half of it
+    /// — national, offline, and complete for the year. This is the other half:
+    /// the workings put together this morning, which no printed timetable can
+    /// contain. Both go into the same `ThroughGraph`; there is no second
+    /// mechanism and no precedence to reason about, because a link is a link.
+    private var learnedLinks: [FormationKey: [ThroughLink]] = [:]
+    private var learnedDay: String?
+    /// The packed graph for one operating day, which is the same for every
+    /// rebuild within that day and costs a few tens of milliseconds to resolve.
+    private var packedGraph = ThroughGraph.empty
+    private var packedGraphDays: [String] = []
+    /// The moment the drawn fleet is a picture of, for choosing that day.
+    private var drawnMoment: Date?
+
+    /// Use published through-services for map handovers as well as the panel.
+    ///
+    /// `working` is the reference the fleet files this train under — the same
+    /// one the formation was asked for. It has to come from the caller because
+    /// the formation service answers by operator and train number and never
+    /// says its own journey id, so it cannot be reconstructed from the reply.
+    @discardableResult
+    public func learnConnections(
+        _ formation: TrainFormation, for key: FormationKey, of working: String
+    ) -> Bool {
+        let links = formation.throughLinks(ownedBy: [working])
+        if learnedDay != key.operationDate {
+            learnedDay = key.operationDate
+            learnedLinks.removeAll(keepingCapacity: true)
+        }
+        guard learnedLinks[key] != links else { return false }
+        if links.isEmpty, learnedLinks[key] == nil { return false }
+        learnedLinks[key] = links
+        revision += 1
+        return true
+    }
+
+    /// The published graph indexed by every name a working answers to.
+    ///
+    /// Values are indices into `graph.links` rather than copies of the names:
+    /// the map is around 75,000 entries nationally and holding four strings per
+    /// entry would cost several megabytes to say something the graph already
+    /// says. Rebuilt when the day changes or the formation service adds a
+    /// working, which between them is a handful of times a day.
+    private var publishedForward: [String: [Int]] = [:]
+    private var publishedBackward: [String: [Int]] = [:]
+    private var publishedIndexed = ThroughGraph.empty
+    private var publishedIndexKey: String?
+
+    private func publishedIndex() -> ThroughGraph {
+        let graph = publishedGraph()
+        let key = "\(packedGraphDays.joined(separator: ","))|\(learnedLinks.count)|\(graph.links.count)"
+        guard publishedIndexKey != key else { return publishedIndexed }
+        publishedIndexKey = key
+        publishedIndexed = graph
+        publishedForward.removeAll(keepingCapacity: true)
+        publishedBackward.removeAll(keepingCapacity: true)
+        // Names arrive folded; see `ThroughLink`.
+        for (i, link) in graph.links.enumerated() {
+            for name in link.from { publishedForward[name, default: []].append(i) }
+            for name in link.to { publishedBackward[name, default: []].append(i) }
+        }
+        return graph
+    }
+
+    /// Every name a working answers to, on the side being asked about.
+    ///
+    /// A chained vehicle is several numbered legs, and only the one at the edge
+    /// can have a neighbour: asking what the Bern–Spiez leg continues as, when
+    /// the object in hand already runs Bern–Domodossola, would find the leg it
+    /// is already made of.
+    private static func edgeNames(of journey: Journey, forward: Bool) -> [String] {
+        var out: [String] = []
+        if let parts = journey.parts, let edge = forward ? parts.last : parts.first {
+            out.append(edge.id)
+            if let ref = edge.journeyRef { out.append(ref) }
+        }
+        out.append(journey.id)
+        if let ref = journey.journeyRef { out.append(ref) }
+        return out.filter { !$0.isEmpty }
+    }
+
+    /// What the feed says this working becomes, or came from.
+    ///
+    /// Returns the declared names on the other side, which is not the same as
+    /// a journey: the map draws ninety minutes and the named working is often
+    /// outside it. An empty result means the feed said nothing, and only then
+    /// is there anything to infer.
+    private func publishedNeighbourNames(of journey: Journey, forward: Bool) -> Set<String> {
+        let graph = publishedIndex()
+        guard !graph.isEmpty else { return [] }
+        let index = forward ? publishedForward : publishedBackward
+        var out = Set<String>()
+        for name in Self.edgeNames(of: journey, forward: forward) {
+            for link in index[name.lowercased()] ?? [] {
+                out.formUnion(forward ? graph.links[link].to : graph.links[link].from)
+            }
+        }
+        return out
+    }
+
+    /// The workings the feed says this one parts into, named as the branch
+    /// lookup wants them.
+    ///
+    /// `Fleet.onward` will accept a half whose line differs from the trunk's
+    /// only where that half is *named* — otherwise an RE1 would adopt any R11
+    /// leaving the same station at about the right time. Until now the only
+    /// thing that named one was the formation service's `T` relationship,
+    /// which is optional and often null, so the half that changes line number
+    /// was routinely unfindable: at Spiez the RE1 keeps its number to
+    /// Domodossola and the Zweisimmen half becomes an R11, and it was the
+    /// Zweisimmen half that went missing from the direction picker.
+    ///
+    /// The packed graph names both halves by journey id for the whole country,
+    /// offline, whether or not anybody filed a formation relationship.
+    public func publishedBranches(of id: String, journeyRef: String?) -> [TrainFormation.Working] {
+        let graph = publishedIndex()
+        guard !graph.isEmpty else { return [] }
+        var names = [id]
+        if let journeyRef { names.append(journeyRef) }
+        var out: [TrainFormation.Working] = []
+        var seen = Set<String>()
+        for name in names {
+            for link in publishedForward[name.lowercased()] ?? [] {
+                for other in graph.links[link].to where seen.insert(other).inserted {
+                    // A journey id is what the branch lookup matches on; a trip
+                    // id names the same run but not in the spelling the feed
+                    // keys journeys by, so both are offered.
+                    out.append(TrainFormation.Working(trainNumber: nil, journeyID: other))
+                }
+            }
+        }
+        return out
+    }
+
+    /// The parting this working makes, as the packed timetable has it.
+    ///
+    /// The formation service is the better answer and is not the *first*
+    /// answer: it is a network request per train, it covers eleven companies
+    /// out of the country's several hundred, and until it comes back the card
+    /// had nothing to say about a train that comes apart — no picker, no
+    /// branch stops, no second line on the map. The through-services graph is
+    /// already on the device, is read offline, and names both halves for every
+    /// operator in the timetable. It cannot say which coaches go where; that is
+    /// the part worth waiting for, and it arrives later and fills in.
+    ///
+    /// A working that parts is filed as one that ends at the junction with two
+    /// beginning there, so the parting is this working's last call and the two
+    /// successors are the halves. Anything with one successor is a through
+    /// service, which is a different thing and not this.
+    public func publishedSplit(of id: String, journeyRef: String?, at parting: Call) -> TrainFormation.Split? {
+        let graph = publishedIndex()
+        guard !graph.isEmpty else { return nil }
+        var names = [id]
+        if let journeyRef { names.append(journeyRef) }
+        var branches: [TrainFormation.Working] = []
+        var seen = Set<String>()
+        for name in names {
+            for link in publishedForward[name.lowercased()] ?? [] {
+                // One link is one successor: its `to` holds that working's
+                // several spellings, not several trains. And one successor is
+                // several links — the graph is built for the drawn day and the
+                // one before it, so a service day that runs past midnight is
+                // held twice. Counted either way round, an ordinary through
+                // service would have looked like a train coming apart.
+                let spellings = graph.links[link].to
+                guard !spellings.isEmpty else { continue }
+                let reference = spellings.first { $0.contains(":sjyid:") }
+                    ?? spellings.sorted().joined(separator: "|")
+                guard seen.insert(reference).inserted else { continue }
+                branches.append(TrainFormation.Working(
+                    trainNumber: FormationKey(journeyID: reference, operationDate: "")?.trainNumber,
+                    journeyID: reference
+                ))
+            }
+        }
+        guard branches.count > 1 else { return nil }
+        return TrainFormation.Split(
+            stopName: parting.name,
+            stopUIC: parting.ref.flatMap { StopRegister.didok(forSloid: $0).flatMap(Int.init) } ?? 0,
+            moment: Date(timeIntervalSince1970: Double(parting.arr)),
+            portions: [],
+            branches: branches
+        )
+    }
+
+    /// Everything published about which workings are one vehicle, right now.
+    ///
+    /// Both the drawn day and the one before it, because a service day runs
+    /// past midnight: the 23:50 that continues at 00:10 is filed under the day
+    /// it left on, and a fleet drawn at five past midnight is holding both.
+    private func publishedGraph() -> ThroughGraph {
+        let moment = drawnMoment ?? Date()
+        let zone = TimeZone(identifier: "Europe/Zurich") ?? .current
+        let days = [moment.addingTimeInterval(-86_400), moment]
+        let keys = days.map { FormationKey.operationDate(of: Timestamp($0.timeIntervalSince1970)) }
+        if keys != packedGraphDays {
+            packedGraphDays = keys
+            packedGraph = ThroughGraph(links: timetable.map { store in
+                days.flatMap { store.throughServices(on: $0, zone: zone) }
+            } ?? [])
+        }
+        guard !learnedLinks.isEmpty else { return packedGraph }
+        return packedGraph.merging(ThroughGraph(links: Array(learnedLinks.values.joined())))
+    }
 
     /// Timetabled runs a departure board has actually offered to the reader.
     ///
@@ -339,9 +604,17 @@ public actor Fleet {
     private var boardJourneys: [BoardJourneyKey: Journey] = [:]
     private var boardJourneyOrder: [BoardJourneyKey] = []
     private static let boardJourneyLimit = 1_024
+    /// Through-workings assembled from packed numbered legs, keyed by every
+    /// constituent id so opening 4257 after stitching 4157+4257 is free.
+    private var throughWorkings: [String: Journey] = [:]
+    private var throughRevision = -1
+    /// Packed neighbours at a junction, so a Bern board does not re-expand
+    /// the same twenty-minute window for every terminating train.
+    private var neighbourCandidates: [String: [Journey]] = [:]
 
-    private func rememberBoardJourney(_ journey: Journey, departure: Timestamp) {
-        let key = BoardJourneyKey(id: journey.id, departure: departure)
+    private func rememberBoardJourney(_ journey: Journey, departure: Timestamp, as id: String? = nil) {
+        let key = BoardJourneyKey(id: id ?? journey.id, departure: departure)
+        if let held = boardJourneys[key], held.stops.count > journey.stops.count { return }
         if boardJourneys[key] == nil { boardJourneyOrder.append(key) }
         boardJourneys[key] = journey
 
@@ -362,6 +635,73 @@ public actor Fleet {
     private var timingRevision = 0
     private var activeMinuteJourneys: [Journey] = []
     private var activeMinuteIDs: Set<String> = []
+    /// Grid of `activeMinuteJourneys` by `drawnWithin`. Rebuilt with the
+    /// minute index, not every tick, so a city viewport walks overlapping
+    /// cells instead of every running journey in the country.
+    private var activeSpatial = SpatialGrid()
+    private var activeSpatialDirty = false
+
+    /// A coarse geographic index over the current active-minute fleet.
+    ///
+    /// Cell size is about 22 km at Swiss latitudes: a Genève viewport hits a
+    /// handful of cells, an intercity occupies a strip rather than hundreds.
+    private struct SpatialGrid {
+        static let cellDegrees = 0.2
+        var cells: [Int: [Journey]] = [:]
+        var unboxed: [Journey] = []
+
+        mutating func removeAll() {
+            cells.removeAll(keepingCapacity: true)
+            unboxed.removeAll(keepingCapacity: true)
+        }
+
+        mutating func rebuild(_ journeys: [Journey]) {
+            removeAll()
+            for journey in journeys { insert(journey) }
+        }
+
+        mutating func insert(_ journey: Journey) {
+            guard let box = journey.drawnWithin() else {
+                unboxed.append(journey)
+                return
+            }
+            let x0 = cell(box.west), x1 = cell(box.east)
+            let y0 = cell(box.south), y1 = cell(box.north)
+            for x in min(x0, x1)...max(x0, x1) {
+                for y in min(y0, y1)...max(y0, y1) {
+                    cells[key(x, y), default: []].append(journey)
+                }
+            }
+        }
+
+        func journeys(overlapping box: BBox) -> [Journey] {
+            var seen = Set<String>()
+            var out: [Journey] = []
+            out.reserveCapacity(64)
+            let x0 = cell(box.west), x1 = cell(box.east)
+            let y0 = cell(box.south), y1 = cell(box.north)
+            for x in min(x0, x1)...max(x0, x1) {
+                for y in min(y0, y1)...max(y0, y1) {
+                    guard let bucket = cells[key(x, y)] else { continue }
+                    for journey in bucket where seen.insert(journey.id).inserted {
+                        out.append(journey)
+                    }
+                }
+            }
+            for journey in unboxed where seen.insert(journey.id).inserted {
+                out.append(journey)
+            }
+            return out
+        }
+
+        private func cell(_ value: Double) -> Int {
+            Int(floor(value / Self.cellDegrees))
+        }
+
+        private func key(_ x: Int, _ y: Int) -> Int {
+            x &* 73_421 &+ y
+        }
+    }
 
     private struct ActiveLifetime: Equatable {
         var appears: Timestamp
@@ -484,14 +824,9 @@ public actor Fleet {
     private let mirror = MirrorClient()
     private let snapshotURL: URL
 
-    /// Journeys the national feed does not carry, fetched one stop at a time.
-    ///
-    /// Kept apart from `journeys` rather than merged into it, because they are a
-    /// different kind of thing: a handful of sightings around one stop, not a
-    /// view of the whole country. They are only ever consulted for a board the
-    /// feed answered with nothing, so a service cannot appear twice, and they
-    /// are dropped whenever a real refresh lands.
-    private var mirrored: [String: Journey] = [:]
+    /// One record per operating run; feed IDs are aliases into this store.
+    /// The map remains a bounded time-window projection of the timetable.
+    private let runs = RunStore()
     /// Stops already asked about, so a repeated tap on a quiet stop does not
     /// repeat the request.
     private var mirrorAsked: [String: Date] = [:]
@@ -519,12 +854,16 @@ public actor Fleet {
 
     /// Where the routed legs are written back to, once opened.
     private var legCacheURL: URL?
+    /// Derived timetable geography, kept between launches so a cold start
+    /// does not walk the stop register for every pattern in the window.
+    private var geographyCacheURL: URL?
     /// How many legs were in the cache when it was last written, so an idle
     /// session does not rewrite an unchanged file.
     private var legsAtLastSave = -1
 
     public init(snapshotURL: URL) {
         self.snapshotURL = snapshotURL
+        builder = GeometryBuilder(relations: relations, railnet: railnet)
     }
 
     // MARK: - Loading
@@ -540,41 +879,139 @@ public actor Fleet {
         public var problems: [String] = []
     }
 
-    public func load(from directory: URL) -> Loaded {
+    public func load(from directory: URL, supporting: Bool = true) -> Loaded {
         var result = Loaded()
 
         func attempt(_ name: String, _ body: () throws -> Void) {
             do { try body() } catch { result.problems.append("\(name): \(error)") }
         }
 
+        // What the first frame needs: placing calls, naming operators, drawing
+        // stop dots, and expanding the timetable for the opening camera.
+        // Routes, the railway graph and platform plates wait until the map is
+        // up — together they were the other half of a four-second read on a
+        // phone, and none of them is required to put a vehicle on the chord
+        // between its two stops.
         attempt("stops") {
             try register.load(
                 stopsFile: directory.appendingPathComponent("stops.bin"),
-                foreignFile: directory.appendingPathComponent("foreign.bin")
+                foreignFile: directory.appendingPathComponent("foreign.bin"),
+                spatial: supporting
             )
         }
         attempt("operators") { try operators.load(directory.appendingPathComponent("operators.bin")) }
-        attempt("platforms") { try platforms.load(directory.appendingPathComponent("platforms.bin")) }
-        attempt("platform access") { try platformAccess.load(directory.appendingPathComponent("access.bin")) }
         attempt("stop places") { try stopPlaces.load(directory.appendingPathComponent("stop-places.bin")) }
-        attempt("routes") { try relations.load(directory.appendingPathComponent("routes.bin")) }
-        attempt("railnet") { try railnet.load(directory.appendingPathComponent("railnet.bin")) }
         // Not through `attempt`: a missing timetable is not a problem to report,
         // it is a build without one. The feed still draws the map.
         timetable = try? TimetableStore(url: directory.appendingPathComponent("timetable.bin"))
+        if let geographyCacheURL {
+            timetable?.openGeographyCache(at: geographyCacheURL)
+        }
 
         builder = GeometryBuilder(relations: relations, railnet: railnet)
 
         result.stops = register.stats.stops
+        result.stopPlaces = stopPlaces.count
+        if supporting {
+            supportingLoaded = false
+            loadSupporting(from: directory, into: &result)
+        }
+        return result
+    }
+
+    /// Routes, rails, platforms — everything the first frame can do without.
+    ///
+    /// Called once the map is up. The builder already holds these stores, so
+    /// filling them in is enough for the next refine pass to put vehicles on
+    /// their tracks.
+    @discardableResult
+    public func loadSupporting(from directory: URL) -> Loaded {
+        var result = Loaded()
+        loadSupporting(from: directory, into: &result)
+        return result
+    }
+
+    private func loadSupporting(from directory: URL, into result: inout Loaded) {
+        if supportingLoaded {
+            result.relations = relations.count
+            result.railnetNodes = railnet.nodeCount
+            result.platformShapes = platforms.shapeCount
+            result.stops = register.stats.stops
+            result.stopPlaces = stopPlaces.count
+            return
+        }
+        supportingLoaded = true
+        func attempt(_ name: String, _ body: () throws -> Void) {
+            do { try body() } catch { result.problems.append("\(name): \(error)") }
+        }
+        register.buildSpatialIndex()
+        attempt("platforms") { try platforms.load(directory.appendingPathComponent("platforms.bin")) }
+        attempt("platform access") { try platformAccess.load(directory.appendingPathComponent("access.bin")) }
+        attempt("routes") { try relations.load(directory.appendingPathComponent("routes.bin")) }
+        if !railnet.isReady {
+            attempt("railnet") { try railnet.load(directory.appendingPathComponent("railnet.bin")) }
+        }
         result.relations = relations.count
         result.railnetNodes = railnet.nodeCount
-        result.stopPlaces = stopPlaces.count
         result.platformShapes = platforms.shapeCount
+        result.stops = register.stats.stops
+        result.stopPlaces = stopPlaces.count
+    }
+
+    /// Station-board indexes: slot→station, station→patterns, pattern→trips.
+    ///
+    /// Built off the tap path so the first station card does not pay the
+    /// 179,000-pattern walk while a spinner is on screen.
+    public func prepareBoardIndexes() {
+        timetable?.prepareBoardIndexes()
+    }
+
+    /// The overlay graph, without the 31 MB route store.
+    ///
+    /// Track drawing only needs this file. Loading it behind `routes.bin` is
+    /// why the rails used to arrive ten seconds after the vehicles: the map
+    /// was up, and still waiting on a string table it does not paint.
+    @discardableResult
+    public func loadRailnet(from directory: URL) async -> Loaded {
+        var result = Loaded()
+        result.stops = register.stats.stops
+        result.stopPlaces = stopPlaces.count
+        result.relations = relations.count
+        if railnet.isReady {
+            result.railnetNodes = railnet.nodeCount
+            return result
+        }
+        let url = directory.appendingPathComponent("railnet.bin")
+        let loaded = await Task.detached(priority: .userInitiated) {
+            let net = RailNet()
+            try? net.load(url)
+            return net
+        }.value
+        if loaded.isReady {
+            railnet.take(loaded)
+        }
+        result.railnetNodes = railnet.nodeCount
+        if !railnet.isReady {
+            result.problems.append("railnet: missing")
+        }
         return result
+    }
+
+    /// Install a graph loaded off the actor. No-op if rails are already in.
+    public func installRailnet(_ net: RailNet) {
+        guard net.isReady, !railnet.isReady else { return }
+        railnet.take(net)
     }
 
     public func configure(token: String?) {
         client = OTDClient(token: token, budget: "gtfs-rt")
+    }
+
+    /// Pattern boxes and slot coordinates, written once so the next launch
+    /// does not derive them from cold mapped pages.
+    public func openGeographyCache(at url: URL) {
+        geographyCacheURL = url
+        timetable?.openGeographyCache(at: url)
     }
 
     /// What the platform says is left of the live-feed budget.
@@ -687,6 +1124,54 @@ public actor Fleet {
 
     /// What the last live refresh made of the feed.
     public private(set) var lastRealtime: Reconcile.Report?
+    private var realtimeReplacements: [String: (id: String, departure: Timestamp)] = [:]
+
+    /// Some producers publish a cancellation plus a new trip for a changed
+    /// platform, or an added extra for a delayed working after an incident.
+    /// Preserve the scheduled identity for a unique complete-route match,
+    /// including when the extra is already running late.
+    private func reconcilePlatformReplacements(_ feed: RealtimeFeed, at now: Timestamp) -> Bool {
+        realtimeReplacements = realtimeReplacements.filter { _, held in
+            guard let run = journeys[held.id], let first = run.stops.first else { return false }
+            return abs((first.sched ?? first.dep) - held.departure) < 12 * 3600
+        }
+        let cancelled = Set(feed.updates.filter {
+            $0.relationship == .canceled || $0.relationship == .deleted
+        }.map(\.tripID))
+        // Cancelled originals first, then any still-running timetable twin.
+        // A delayed extra after an accident is often published without
+        // cancelling the printed trip, and matching only cancellations left
+        // both on the map: an on-time ghost and an "unscheduled" extra.
+        let candidates = journeys.values.filter { !$0.extra }.sorted { a, b in
+            let aCancelled = a.cancelled || cancelled.contains(a.id)
+            let bCancelled = b.cancelled || cancelled.contains(b.id)
+            if aCancelled != bCancelled { return aCancelled && !bCancelled }
+            return a.id < b.id
+        }
+        guard !candidates.isEmpty else { return false }
+        var proposals: [String: [String]] = [:]
+        for update in feed.updates where update.relationship == .added || update.relationship == .replacement {
+            guard realtimeReplacements[update.tripID] == nil,
+                  journeys[update.tripID]?.extra != false,
+                  let new = buildExtra(update, at: now) else { continue }
+            let matching = candidates.filter { Reconcile.isPlatformReplacement(new, of: $0) }
+            guard matching.count == 1, let original = matching.first else { continue }
+            proposals[original.id, default: []].append(update.tripID)
+        }
+        var removed = false
+        for (originalID, replacements) in proposals where replacements.count == 1 {
+            guard let newID = replacements.first, let original = journeys[originalID],
+                  let first = original.stops.first else { continue }
+            realtimeReplacements[newID] = (originalID, first.sched ?? first.dep)
+            if let update = feed.updates.first(where: { $0.tripID == newID }),
+               let replacement = buildExtra(update, at: now) {
+                runs.registerReplacement(replacement, of: original)
+            }
+            if journeys.removeValue(forKey: newID) != nil { removed = true }
+            retired.removeValue(forKey: newID)
+        }
+        return removed
+    }
 
     /// Fold a national GTFS-Realtime feed onto the timetable the map is drawing.
     ///
@@ -702,8 +1187,13 @@ public actor Fleet {
         let now = Timestamp(moment.timeIntervalSince1970)
         // Two different kinds of change, because they cost three orders of
         // magnitude apart. See the fold at the end.
-        var arrived = false
-        var moved: [Journey] = []
+        var arrived = reconcilePlatformReplacements(feed, at: now)
+        // The old entry may remain SCHEDULED with individual SKIPPED calls.
+        // Once linked, only the replacement describes this occurrence, even
+        // when a later snapshot omits it. Feed order must not reinstate the old
+        // platforms or cancelled calls.
+        let replaced = Set(realtimeReplacements.values.map(\.id))
+        var moved: [(journey: Journey, repathed: Bool)] = []
         // If the chained fleet is already current, remember only the visible
         // lifetime of vehicles actually touched. A cancellation, a platform
         // change or a middle-stop correction must not make the next frame
@@ -712,14 +1202,18 @@ public actor Fleet {
         var activeLifetimeBefore: [String: ActiveLifetime] = [:]
 
         for update in feed.updates {
-            guard let journey = journeys[update.tripID] else {
+            if replaced.contains(update.tripID) { continue }
+            let identity = realtimeReplacements[update.tripID]?.id ?? update.tripID
+            let alias = runs.journey(id: identity, at: now)
+            guard let active = journeys[identity] ?? alias.flatMap({ journeys[$0.id] }) else {
                 // No timetabled run under this id. Either the feed is talking
                 // about something outside the window the map has expanded — the
                 // ordinary case, since it covers three hours and the map draws
                 // ninety minutes — or it is a run that is in no timetable at
                 // all, which is the one case worth building from scratch.
                 if update.isExtra, let built = buildExtra(update, at: now) {
-                    journeys[built.id] = built
+                    let canonical = runs.ingest(built)
+                    journeys[canonical.id] = canonical
                     report.added += 1
                     arrived = true
                 } else if update.isExtra {
@@ -728,6 +1222,12 @@ public actor Fleet {
                     report.unmatched += 1
                 }
                 continue
+            }
+            let journey = runs.resolve(active)
+            if journey !== active {
+                journeys.removeValue(forKey: active.id)
+                journeys[journey.id] = journey
+                arrived = true
             }
             report.matchedByRef += 1
 
@@ -740,19 +1240,41 @@ public actor Fleet {
             }
 
             var changed = false
+            if realtimeReplacements[update.tripID] != nil,
+               let reference = update.journeyReference {
+                if journey.journeyRef != reference {
+                    journey.journeyRef = reference
+                    changed = true
+                    arrived = true // Joined parts copy the journey reference.
+                }
+                if let number = FormationKey(journeyID: reference, operationDate: "").map({ String($0.trainNumber) }),
+                   journey.number != number {
+                    journey.number = number
+                    changed = true
+                    arrived = true
+                }
+            }
+            let wasCancelled = journey.cancelled
             switch update.relationship {
             case .canceled, .deleted:
                 journey.cancelled = true
-                changed = true
+                changed = changed || !wasCancelled
             case .added, .duplicated, .replacement, .unscheduled:
-                journey.extra = true
+                let extra = journey.extra && realtimeReplacements[update.tripID] == nil
+                    && update.relationship != .replacement
+                changed = changed || journey.extra != extra || journey.cancelled
+                journey.extra = extra
+                journey.cancelled = false
             case .scheduled:
-                break
+                changed = changed || journey.cancelled
+                journey.cancelled = false
             }
+            if wasCancelled != journey.cancelled { arrived = true }
 
+            let refs = journey.stops.map(\.ref)
             if apply(update, to: journey, at: now) { changed = true }
             if changed {
-                moved.append(journey)
+                moved.append((journey, refs != journey.stops.map(\.ref)))
                 if let lifetimeBefore, activeLifetimeBefore[lifetimeBefore.id] == nil {
                     activeLifetimeBefore[lifetimeBefore.id] = lifetimeBefore.lifetime
                 }
@@ -788,7 +1310,7 @@ public actor Fleet {
         if arrived {
             revision += 1
         } else {
-            for journey in moved { refold(journey, repathed: false) }
+            for change in moved { refold(change.journey, repathed: change.repathed) }
             let lifetimeMoved = activeLifetimeBefore.contains { id, before in
                 guard let vehicle = chained[id] ?? journeys[id] else { return true }
                 return Self.activeLifetime(of: vehicle) != before
@@ -808,22 +1330,23 @@ public actor Fleet {
     ///
     /// What it does not reliably carry is a name. The run is labelled only by a
     /// `route_id`, and about two in five of those resolve against the static
-    /// feed — the rest use a form no timetable contains. Those are drawn with
-    /// no line rather than left off the map, because an unlabelled train that is
-    /// running is closer to the truth than no train at all, and `extra` says
-    /// exactly what it is.
+    /// feed — the rest use a form no timetable contains. Those are drawn as
+    /// `ext` rather than left off the map: an empty plate reads as a missing
+    /// chip, and `extra` is what they are.
     private func buildExtra(_ update: TripUpdate, at now: Timestamp) -> Journey? {
         var calls: [Call] = []
         calls.reserveCapacity(update.stops.count)
         var visits: [String: Int] = [:]
 
         for stop in update.stops.sorted(by: { ($0.sequence ?? 0) < ($1.sequence ?? 0) }) {
-            guard let ref = stop.stopID, let place = register.lookup(ref) else { continue }
+            guard let ref = stop.assignedStopID ?? stop.stopID, let place = register.lookup(ref) else { continue }
             // A call with neither time is a call the vehicle cannot be
             // positioned against, and the interpolator needs both ends filled.
             guard let time = stop.departure ?? stop.arrival else { continue }
             let visit = (visits[ref] ?? 0) + 1
             visits[ref] = visit
+            let live = stop.departure ?? time
+            let delaySeconds = stop.departureDelay ?? stop.arrivalDelay ?? update.delay
             calls.append(Call(
                 key: "\(ref)|\(visit)",
                 ref: ref,
@@ -833,13 +1356,17 @@ public actor Fleet {
                 platform: place.platform,
                 precise: place.precise,
                 arr: stop.arrival ?? time,
-                dep: stop.departure ?? time,
-                delay: nil,
+                dep: live,
+                delay: SiriParser.reportableDelay(delaySeconds),
                 // Every time here is the operator's own statement about a run
                 // it has just filed, so a call already behind us is what
                 // happened rather than what was predicted.
                 observed: time < now,
-                assigned: place.assigned
+                sched: live - (delaySeconds ?? 0),
+                assigned: place.assigned,
+                cancelled: stop.skipped,
+                extra: stop.extra,
+                scheduledArrival: stop.arrival.map { $0 - (stop.arrivalDelay ?? update.delay ?? 0) }
             ))
         }
         guard calls.count >= 2 else { return nil }
@@ -852,14 +1379,20 @@ public actor Fleet {
             // railway stations is a train, and everything else is drawn as road.
             mode: known?.mode ?? inferredMode(of: calls),
             category: nil,
-            line: known?.line ?? "",
-            number: nil,
+            // About two in five extras have a route_id no timetable contains.
+            // Those used to be drawn with an empty plate; `ext` is the word
+            // that says what they are, and a published number still wins.
+            line: Journey.badgeLine(known?.line, extra: true, mode: known?.mode),
+            number: update.journeyReference.flatMap { FormationKey(journeyID: $0, operationDate: "") }.map { String($0.trainNumber) },
             operatorName: nil,
             operatorFull: nil,
             to: calls.last?.name,
             from: calls[0].name,
             // Minutes, as everywhere `delay` is read; the feed states seconds.
-            delay: SiriParser.reportableDelay(update.delay),
+            // Trip-level delay is often omitted on added runs even when every
+            // call is eight minutes down, so fall back to the calls.
+            delay: SiriParser.reportableDelay(update.delay)
+                ?? calls.compactMap(\.delay).max { abs($0) < abs($1) },
             start: calls[0].dep,
             end: calls[calls.count - 1].arr,
             complete: true,
@@ -867,7 +1400,8 @@ public actor Fleet {
             cancelled: update.relationship == .canceled || update.relationship == .deleted,
             source: Journey.timetableSource,
             stops: calls,
-            extra: true
+            extra: true,
+            journeyRef: update.journeyReference
         )
     }
 
@@ -891,17 +1425,16 @@ public actor Fleet {
     /// than by a test.
     func apply(_ update: TripUpdate, to journey: Journey, at now: Timestamp) -> Bool {
         guard !update.stops.isEmpty else {
-            // Minutes. Everything GTFS-RT states about lateness is in seconds —
-            // `TripUpdate.delay` and both `StopTimeEvent.delay`s — and every
-            // field it is being written into here is read as minutes, because
-            // `Format.delay` prints the number unconverted. Handed straight
-            // across, a train ninety seconds down reported `+90`.
-            if let delay = SiriParser.reportableDelay(update.delay), delay != journey.delay {
-                journey.delay = delay
-                journey.monitored = true
-                return true
+            guard let seconds = update.delay, let minutes = SiriParser.reportableDelay(seconds) else { return false }
+            let calls = journey.stops.indices.filter { !journey.stops[$0].observed }.map {
+                StopTimeUpdate(sequence: $0 + 1, arrivalDelay: seconds, departureDelay: seconds)
             }
-            return false
+            guard !calls.isEmpty else {
+                let changed = journey.delay != minutes
+                journey.delay = minutes
+                return changed
+            }
+            return apply(TripUpdate(tripID: update.tripID, delay: seconds, stops: calls), to: journey, at: now)
         }
 
         // Where this vehicle is before the fold, so a correction that moves it
@@ -911,24 +1444,42 @@ public actor Fleet {
         let anchor = Positioning.retimeAnchor(journey, at: now)
 
         // The feed keys calls by `stop_id`, which is the SLOID the timetable's
-        // calls already carry — so this is a lookup rather than a match. Where
-        // it also gives a sequence number that is used in preference, because a
-        // looping route calls at one stop twice.
+        // calls already carry — so this is a lookup rather than a match.
+        // Sequence is the fallback for a looping route that calls twice, not
+        // the first key: an exceptional halt inserted as sequence 2 would
+        // otherwise overwrite the printed second stop.
         var bySequence: [Int: StopTimeUpdate] = [:]
         var byStop: [String: StopTimeUpdate] = [:]
         for stop in update.stops {
             if let n = stop.sequence { bySequence[n] = stop }
             if let ref = stop.stopID { byStop[ref] = stop }
+            if let ref = stop.assignedStopID { byStop[ref] = stop }
         }
 
         var moved = false
+        var platformChanged = false
         for index in journey.stops.indices {
-            // GTFS stop_sequence is 1-based in this feed.
-            let found = bySequence[index + 1] ?? journey.stops[index].ref.flatMap { byStop[$0] }
+            let found = matchingUpdate(
+                for: journey.stops[index], at: index,
+                byStop: byStop, bySequence: bySequence
+            )
             guard let found else { continue }
 
-            if found.skipped, !journey.stops[index].cancelled {
-                journey.stops[index].cancelled = true
+            if found.skipped != journey.stops[index].cancelled {
+                journey.stops[index].cancelled = found.skipped
+                moved = true
+            }
+            if let ref = found.assignedStopID ?? found.stopID,
+               ref != journey.stops[index].ref,
+               StopRegister.stationOf(ref) == StopRegister.stationOf(journey.stops[index].ref),
+               let place = register.lookup(ref) {
+                journey.stops[index].ref = ref
+                journey.stops[index].platform = place.platform
+                journey.stops[index].assigned = place.assigned
+                journey.stops[index].lat = place.lat
+                journey.stops[index].lon = place.lon
+                journey.stops[index].precise = place.precise
+                platformChanged = true
                 moved = true
             }
             // Absolute times where they are given, delays where they are not.
@@ -942,34 +1493,52 @@ public actor Fleet {
             // fallback — but it is a fallback precisely because a producer is
             // allowed not to, and the failure it would cause is silent.
             //
-            // Only the departure is anchored here, because only the departure
-            // has a printed time to anchor against: `Call.sched` is the booked
-            // departure and there is no booked arrival beside it. Closing the
-            // arrival half means carrying one, which is a change to what
-            // `timetable.bin` and the fleet cache hold rather than a change to
-            // this arithmetic — worth doing before anything relies on the
-            // fallback, and not worth doing on the way past.
-            let booked = journey.stops[index].sched
-            if let arrival = found.arrival ?? found.arrivalDelay.map({ journey.stops[index].arr + $0 }),
-               arrival != journey.stops[index].arr {
+            let booked = journey.stops[index].sched ?? journey.stops[index].dep
+            journey.stops[index].sched = booked
+            let bookedArrival = journey.stops[index].scheduledArrival
+                ?? journey.stops[index].arr - (journey.stops[index].dep - booked)
+            journey.stops[index].scheduledArrival = bookedArrival
+            let departure = found.departure ?? found.departureDelay.map { booked + $0 }
+            let arrival = found.arrival ?? found.arrivalDelay.map { bookedArrival + $0 }
+                ?? departure.map { bookedArrival + ($0 - booked) }
+            let resolvedDeparture = departure ?? arrival.map { booked + ($0 - bookedArrival) }
+            if let arrival, arrival != journey.stops[index].arr {
                 journey.stops[index].arr = arrival
                 moved = true
             }
-            if let departure = found.departure ?? found.departureDelay.map({ (booked ?? journey.stops[index].dep) + $0 }),
-               departure != journey.stops[index].dep {
-                journey.stops[index].dep = departure
-                moved = true
+            if let resolvedDeparture {
+                let time = max(journey.stops[index].arr, resolvedDeparture)
+                if time != journey.stops[index].dep {
+                    journey.stops[index].dep = time
+                    moved = true
+                }
             }
             // Minutes, as above — and note the two lines before this one are
             // deliberately *not* converted: those add a delay to a `Timestamp`,
             // which is unix seconds, so seconds is exactly what they want.
-            journey.stops[index].delay = SiriParser.reportableDelay(
-                found.departureDelay ?? found.arrivalDelay
-            )
+            // Absolute times without a delay field still have a delay: the
+            // printed slot is `sched`, and the live clock minus that slot is
+            // the number the board should print.
+            if let stated = found.departureDelay ?? found.arrivalDelay {
+                journey.stops[index].delay = SiriParser.reportableDelay(stated)
+            } else {
+                journey.stops[index].delay = SiriParser.reportableDelay(
+                    journey.stops[index].dep - booked
+                )
+            }
             journey.stops[index].observed = journey.stops[index].dep < now
         }
 
+        if insertExtraStops(update.stops, onto: journey, at: now) {
+            moved = true
+            platformChanged = true
+        }
+
         if moved {
+            if platformChanged {
+                journey.invalidateGeometry()
+                builtGeometry[journey.id] = nil
+            }
             journey.monitored = true
             journey.delay = SiriParser.reportableDelay(update.delay)
                 ?? journey.stops.last(where: { $0.dep < now })?.delay
@@ -985,10 +1554,82 @@ public actor Fleet {
         return moved
     }
 
+    /// Prefer the update that names this call, so an extra halt at sequence 2
+    /// does not steal the printed second stop's times.
+    private func matchingUpdate(
+        for call: Call, at index: Int,
+        byStop: [String: StopTimeUpdate], bySequence: [Int: StopTimeUpdate]
+    ) -> StopTimeUpdate? {
+        if let ref = call.ref {
+            if let hit = byStop[ref] { return hit }
+            let station = StopRegister.stationOf(ref)
+            let hits = byStop.filter { StopRegister.stationOf($0.key) == station }
+            if hits.count == 1 { return hits.first?.value }
+        }
+        return bySequence[index + 1]
+    }
+
+    /// Halt the printed trip does not contain. GTFS-RT files those as a
+    /// `UNSCHEDULED` stop-time update. An unmatched `SCHEDULED` or `NO_DATA`
+    /// `stop_id` is a packing difference — passing time, operating point —
+    /// not SBB's exceptional stop.
+    private func insertExtraStops(
+        _ updates: [StopTimeUpdate], onto journey: Journey, at now: Timestamp
+    ) -> Bool {
+        var inserted = false
+        let ordered = updates.sorted { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
+        for stop in ordered where stop.extra && !stop.skipped {
+            let ref = stop.assignedStopID ?? stop.stopID
+            guard let ref else { continue }
+            let station = StopRegister.stationOf(ref)
+            if journey.stops.contains(where: {
+                $0.ref.map { StopRegister.stationOf($0) == station } == true
+            }) { continue }
+            guard let time = stop.departure ?? stop.arrival,
+                  let place = register.lookup(ref) else { continue }
+            if StopNaming.isTechnical(place.name) { continue }
+            let delaySeconds = stop.departureDelay ?? stop.arrivalDelay
+            let call = Call(
+                key: "\(ref)|extra",
+                ref: ref,
+                name: place.name,
+                lat: place.lat,
+                lon: place.lon,
+                platform: place.platform,
+                precise: place.precise,
+                arr: stop.arrival ?? time,
+                dep: stop.departure ?? time,
+                delay: SiriParser.reportableDelay(delaySeconds),
+                observed: time < now,
+                sched: (stop.departure ?? time) - (delaySeconds ?? 0),
+                assigned: place.assigned,
+                extra: true
+            )
+            let index = journey.stops.firstIndex(where: { $0.dep > call.dep })
+                ?? journey.stops.count
+            journey.stops.insert(call, at: index)
+            inserted = true
+        }
+        return inserted
+    }
+
     // MARK: - Drawing from the timetable
 
     /// Whether there is a timetable to draw from at all.
     public var hasTimetable: Bool { timetable?.isReady ?? false }
+
+    /// Slot coordinates and pattern boxes, once, before a window query.
+    private func prepareTimetableQuery() {
+        guard let timetable, register.isReady else { return }
+        timetable.prepareQuery(place: { [register] ref in register.lookup(ref) })
+    }
+
+    /// Finish and persist pattern boxes after the first frame, so the next
+    /// launch does not re-derive them.
+    public func completeTimetableGeography() {
+        guard let timetable, register.isReady else { return }
+        timetable.completeGeography(place: { [register] ref in register.lookup(ref) })
+    }
 
     public var timetableTrips: Int { timetable?.tripCount ?? 0 }
 
@@ -1020,6 +1661,7 @@ public actor Fleet {
         in region: BBox? = nil
     ) -> Bool {
         guard let timetable, timetable.isReady, register.isReady else { return false }
+        prepareTimetableQuery()
 
         let started = Date()
         let now = Timestamp(moment.timeIntervalSince1970)
@@ -1047,7 +1689,7 @@ public actor Fleet {
             found, summary: summary, started: started, bytes: 0, source: "timetable",
             drawnAt: moment
         )
-        timetableRegion = region
+        rememberCoverage(region)
         timetableDrawnAt = moment
         return true
     }
@@ -1057,52 +1699,106 @@ public actor Fleet {
 
     /// The region the drawn fleet was clipped to, if it was clipped at all.
     ///
-    /// `nil` is the ordinary state: the whole country, which is what everything
-    /// but the first frame of a launch wants. A launch draws its viewport first
-    /// and fills the rest in behind the map — see `completeTimetable` — and
-    /// until that lands this says the fleet is a view rather than the country.
+    /// `nil` means the last pass was national — either a country-wide opening
+    /// or an explicit `completeTimetable`. A launch that opened on one place
+    /// keeps this set and grows `timetableCoverage` as the camera asks for
+    /// more, rather than filling the country behind the map.
     public private(set) var timetableRegion: BBox?
     private var timetableDrawnAt: Date?
 
+    /// Regions already expanded, each padded the way `expandTimetable` queries.
+    ///
+    /// A list rather than their union: Geneva and Zürich together must not
+    /// claim Lausanne is covered. Empty means the fleet is the country.
+    private var timetableCoverage: [BBox] = []
+
     public var isTimetablePartial: Bool { timetableRegion != nil }
 
-    /// Expand the rest of the country onto a fleet that was drawn for a
-    /// viewport.
+    /// How much larger than the asked viewport a coverage box is stored.
     ///
-    /// Deliberately additive rather than a second `drawTimetable`. A full draw
-    /// *replaces* the store, and by the time this runs the map is already up:
-    /// a train the reader tapped in the first second may have had OJP's timings
-    /// folded onto it, and rebuilding would throw those away for a journey the
-    /// clipped pass had already built correctly. So what is already drawn is
-    /// kept exactly as it stands and only the missing ids are added.
+    /// Big enough that a short pan does not rebuild, small enough that a
+    /// pinch-out still asks for the newly visible ground. The store pads again
+    /// internally (a quarter of the query) against whole *routes*, so this is
+    /// only the margin the camera can move before we spend another expand.
+    static let timetableCoveragePad = 0.4
+
+    /// Rough extent of the packed network, used only to recognise a camera
+    /// that is already looking at the country.
+    static let networkBounds = BBox(west: 5.5, south: 45.6, east: 10.9, north: 48.0)
+
+    /// Whether `region` is already inside a box the timetable has expanded.
     ///
-    /// For the same reason `mirrored` and `mirrorAsked` survive: this is not a
-    /// new national view superseding the last one, it is the same view being
-    /// finished.
+    /// The draw query pads its viewport by 0.15, so this asks about a slightly
+    /// larger box than the screen: expanding after the edge has gone empty is
+    /// a frame of missing trains.
+    public func covers(_ region: BBox) -> Bool {
+        guard timetableWindow != nil else { return false }
+        if timetableCoverage.isEmpty {
+            return !isTimetablePartial && !journeys.isEmpty
+        }
+        let needed = region.padded(by: 0.2)
+        return timetableCoverage.contains { $0.contains(needed) }
+    }
+
+    private func rememberCoverage(_ region: BBox?) {
+        guard let region else {
+            timetableCoverage = []
+            timetableRegion = nil
+            return
+        }
+        let padded = region.padded(by: Self.timetableCoveragePad)
+        if padded.contains(Self.networkBounds) {
+            timetableCoverage = []
+            timetableRegion = nil
+            return
+        }
+        if !timetableCoverage.contains(where: { $0.contains(padded) }) {
+            timetableCoverage.append(padded)
+        }
+        timetableRegion = padded
+    }
+
+    /// Add the services that run through `region` onto a fleet that was drawn
+    /// for a smaller view.
+    ///
+    /// Additive, like `completeTimetable`: a train the reader has already
+    /// opened may have OJP timings folded onto it, and replacing the store
+    /// would throw those away. Ids already in hand stay as they are; only the
+    /// missing ones are built.
+    ///
+    /// This is what a zoom-out and a pan onto new ground both call. The
+    /// country is not filled in behind the map — it is filled in when the
+    /// camera actually asks to see it.
     @discardableResult
-    public func completeTimetable() -> Bool {
-        guard timetableRegion != nil, let timetable, timetable.isReady, register.isReady,
+    public func expandTimetable(to region: BBox) -> Bool {
+        guard let timetable, timetable.isReady, register.isReady,
               let moment = timetableDrawnAt, let window = timetableWindow
         else { return false }
+        if covers(region) { return false }
+        prepareTimetableQuery()
 
         let started = Date()
+        let padded = region.padded(by: Self.timetableCoveragePad)
         let built = timetable.journeys(
             from: window.lowerBound,
             to: window.upperBound,
+            in: padded,
             place: { [register] ref in register.lookup(ref) },
             operatorName: { [operators] agency in operators.name(for: agency) }
         )
-        // Cleared whatever happens. A window the archive has no service for is
-        // as complete as it is ever going to be, and leaving the flag set would
-        // have every later tick try again.
-        timetableRegion = nil
+        // Recorded even when nothing was added, or a quiet valley would be
+        // asked about on every later pan across the same empty ground.
+        rememberCoverage(region)
         guard !built.isEmpty else { return false }
 
         var found = journeys
         var added = 0
         for journey in built where found[journey.id] == nil {
-            found[journey.id] = journey
-            added += 1
+            let canonical = runs.ingest(journey)
+            if found[canonical.id] == nil {
+                found[canonical.id] = canonical
+                added += 1
+            }
         }
         guard added > 0 else { return false }
 
@@ -1114,6 +1810,81 @@ public actor Fleet {
         let clock = Timestamp(moment.timeIntervalSince1970)
         status.vehicles = fleetByID().values.count { Positioning.standsUntil($0) >= clock }
         return true
+    }
+
+    /// Expand the rest of the country onto a fleet that was drawn for a
+    /// viewport.
+    ///
+    /// Deliberately additive rather than a second `drawTimetable`. A full draw
+    /// *replaces* the store, and by the time this runs the map is already up:
+    /// a train the reader tapped in the first second may have had OJP's timings
+    /// folded onto it, and rebuilding would throw those away for a journey the
+    /// clipped pass had already built correctly. So what is already drawn is
+    /// kept exactly as it stands and only the missing ids are added.
+    ///
+    /// The launch path no longer calls this. Zooming out to the country still
+    /// can, and tests that want the whole window in one go still do.
+    @discardableResult
+    public func completeTimetable() -> Bool {
+        guard isTimetablePartial, let timetable, timetable.isReady, register.isReady,
+              let moment = timetableDrawnAt, let window = timetableWindow
+        else { return false }
+        prepareTimetableQuery()
+
+        let started = Date()
+        let built = timetable.journeys(
+            from: window.lowerBound,
+            to: window.upperBound,
+            place: { [register] ref in register.lookup(ref) },
+            operatorName: { [operators] agency in operators.name(for: agency) }
+        )
+        // Cleared whatever happens. A window the archive has no service for is
+        // as complete as it is ever going to be, and leaving the flag set would
+        // have every later tick try again.
+        rememberCoverage(nil)
+        guard !built.isEmpty else { return false }
+
+        var found = journeys
+        var added = 0
+        for journey in built where found[journey.id] == nil {
+            let canonical = runs.ingest(journey)
+            if found[canonical.id] == nil {
+                found[canonical.id] = canonical
+                added += 1
+            }
+        }
+        guard added > 0 else { return false }
+
+        journeys = found
+        revision += 1
+        status.journeys = found.count
+        status.seen = found.count
+        status.parseSeconds = Date().timeIntervalSince(started)
+        let clock = Timestamp(moment.timeIntervalSince1970)
+        status.vehicles = fleetByID().values.count { Positioning.standsUntil($0) >= clock }
+        return true
+    }
+
+    /// Resolve pattern boxes for the rest of the current window, a budget at a
+    /// time, without building the journeys.
+    ///
+    /// The first clipped draw only works out the boxes it needed to reject
+    /// against. This walks the remainder so a later expand — a zoom-out, a pan
+    /// two valleys over — is a compare and a build, not a stop-register walk
+    /// on the actor the frame is waiting on. Returns whether more unknown
+    /// boxes remain, so the caller can yield between chunks.
+    public func prefetchTimetableGeography(budget: Int = 512) -> Bool {
+        guard let timetable, let window = timetableWindow, register.isReady else {
+            return false
+        }
+        if timetable.geographyReady { return false }
+        prepareTimetableQuery()
+        return timetable.prefetchGeography(
+            from: window.lowerBound,
+            to: window.upperBound,
+            budget: budget,
+            place: { [register] ref in register.lookup(ref) }
+        )
     }
 
     /// How close to the edge of the drawn window the clock may come before the
@@ -1134,16 +1905,30 @@ public actor Fleet {
     /// Rebuilding discards any OJP timings already folded in, which is why it
     /// is guarded rather than done on every tick: those cost a request each and
     /// are re-fetched when the vehicle is next opened.
+    ///
+    /// A partial fleet is rebuilt as the same regions, not as the country: the
+    /// whole point of staying clipped is not to spend a time-scrub on 25,000
+    /// journeys the camera is not looking at.
     @discardableResult
     public func redrawTimetableIfNeeded(at moment: Date) -> Bool {
         guard hasTimetable else { return false }
         let now = Timestamp(moment.timeIntervalSince1970)
-        guard let window = timetableWindow else { return drawTimetable(at: moment) }
+        guard let window = timetableWindow else {
+            return drawTimetable(at: moment, in: timetableRegion)
+        }
         let margin = Timestamp(Self.timetableMargin)
         guard now < window.lowerBound + margin || now > window.upperBound - margin else {
             return false
         }
-        return drawTimetable(at: moment)
+        let saved = timetableCoverage
+        let region = saved.first ?? timetableRegion
+        let ok = drawTimetable(at: moment, in: saved.isEmpty ? nil : region)
+        if saved.count > 1 {
+            for extra in saved.dropFirst() {
+                _ = expandTimetable(to: extra)
+            }
+        }
+        return ok
     }
 
     /// Fold OJP's answer about one journey onto the copy the store holds.
@@ -1171,10 +1956,27 @@ public actor Fleet {
     /// of minutes and re-chaining the country to catch the rare one was never
     /// worth a stall on every fold.
     @discardableResult
-    public func applyTiming(_ timing: JourneyTiming, to id: String, at moment: Date = Date()) -> Int {
-        guard let journey = journeys[id] else { return 0 }
+    public func applyTiming(
+        _ timing: JourneyTiming, to id: String, at moment: Date = Date(),
+        boardDeparture: Timestamp? = nil
+    ) -> Int {
+        if let boardDeparture {
+            // Scheduled panels can name tomorrow's instance of a reused trip
+            // ID. Never apply that response (especially cancellation or extra
+            // calls) to today's map vehicle under the same ID.
+            guard let listed = boardJourneys[BoardJourneyKey(id: id, departure: boardDeparture)] else { return 0 }
+            let resolve: (String, String?) -> Place? = { [register] ref, quay in
+                register.lookup(ref, statedPlatform: quay, name: nil)
+            }
+            let wasCancelled = listed.cancelled
+            let touched = listed.apply(timing, at: Timestamp(moment.timeIntervalSince1970), resolve: resolve)
+            let grew = listed.absorb(extras: timing.calls, resolve: resolve)
+            return touched + (grew || wasCancelled != listed.cancelled ? 1 : 0)
+        }
+        guard let journey = journeys[id] ?? chained[id] ?? runs.journey(id: id, at: Timestamp(moment.timeIntervalSince1970)) else { return 0 }
+        let boardOnly = journeys[id] == nil && chained[id] == nil
         let lifetimeBefore: (id: String, lifetime: ActiveLifetime)?
-        if chainedRevision == revision {
+        if !boardOnly, chainedRevision == revision {
             let vehicle = currentVehicle(containing: journey)
             lifetimeBefore = (vehicle.id, Self.activeLifetime(of: vehicle))
         } else {
@@ -1182,12 +1984,27 @@ public actor Fleet {
         }
         let hadPath = journey.geometry != nil
         let quays = journey.stops.map(\.platform)
-        let touched = journey.apply(timing, at: Timestamp(moment.timeIntervalSince1970))
-        guard touched > 0 else { return 0 }
+        let refs = journey.stops.map(\.ref)
+        let resolve: (String, String?) -> Place? = { [register] ref, quay in
+            if let quay, let platform = register.platformPoint(station: StopRegister.stationOf(ref), code: quay) {
+                return register.lookup(platform.id)
+            }
+            return register.lookup(ref, statedPlatform: quay, name: nil)
+        }
+        let touched = journey.apply(timing, at: Timestamp(moment.timeIntervalSince1970), resolve: resolve)
+        let grew = journey.absorb(extras: timing.calls, resolve: resolve)
+        guard touched > 0 || grew else { return 0 }
+        if boardOnly {
+            if journey.source == "ojp" { applyBoardTimingToMap(journey) }
+            return touched + (grew ? 1 : 0)
+        }
         // The path only moved if the platform did — `Journey.apply` drops it
-        // then.
-        let repathed = (hadPath && journey.geometry == nil)
-            || quays != journey.stops.map(\.platform)
+        // then — or if the stop list grew past the border.
+        let repathed = grew || (hadPath && journey.geometry == nil)
+            || zip(quays, journey.stops).contains {
+                $0 != $1.platform && !StopRegister.sameTrack($0, $1.platform)
+            }
+            || refs != journey.stops.map(\.ref)
         if repathed { builtGeometry[id] = nil }
         refold(journey, repathed: repathed)
         if let lifetimeBefore {
@@ -1196,7 +2013,40 @@ public actor Fleet {
                 timingRevision &+= 1
             }
         }
-        return touched
+        return touched + (grew ? 1 : 0)
+    }
+
+    /// Fold formation stops the packed timetable omitted onto either end of
+    /// a journey. Middle extras have to come from a feed that marked them as
+    /// such; formation lists passing stations too.
+    @discardableResult
+    public func absorbFormationStops(_ formation: TrainFormation, onto id: String) -> Bool {
+        guard let journey = journeys[id] ?? chained[id] else { return false }
+        let extras: [Call] = formation.stops.compactMap { stop in
+            let ref = StopRegister.sloid(forDidok: String(format: "%07d", stop.uic))
+                ?? String(stop.uic)
+            let arr = stop.arrival.map { Timestamp($0.timeIntervalSince1970) }
+            let dep = stop.departure.map { Timestamp($0.timeIntervalSince1970) }
+            guard let when = arr ?? dep else { return nil }
+            return Call(
+                key: "\(ref)|formation",
+                ref: ref,
+                name: stop.stopName,
+                lat: 0, lon: 0,
+                platform: stop.track,
+                precise: false,
+                arr: arr ?? when,
+                dep: dep ?? when,
+                sched: dep ?? arr ?? when
+            )
+        }
+        let grew = journey.absorb(extras: extras) { [register] ref, quay in
+            register.lookup(ref, statedPlatform: quay, name: nil)
+        }
+        guard grew else { return false }
+        builtGeometry[id] = nil
+        refold(journey, repathed: true)
+        return true
     }
 
     /// Bring the joined vehicle carrying `leg` up to date with a fold onto it.
@@ -1325,8 +2175,8 @@ public actor Fleet {
 
         retire(replacing: merged)
         journeys = merged
-        builtGeometry = builtGeometry.filter { merged[$0.key] != nil }
-        mirrored = [:]
+        keepGeometry(for: merged.keys)
+        runs.removeAll()
         mirrorAsked = [:]
         revision += 1
         lastReconcile = report
@@ -1452,18 +2302,26 @@ public actor Fleet {
         started: Date, bytes: Int, source: String, current: Date = Date(),
         drawnAt: Date? = nil
     ) {
-        retire(replacing: found)
-        journeys = found
+        drawnMoment = drawnAt ?? current
+        runs.prune(around: Timestamp((drawnAt ?? current).timeIntervalSince1970))
+        for input in found.values.sorted(by: { $0.id < $1.id }) {
+            runs.ingest(input)
+        }
+        var canonical: [String: Journey] = [:]
+        for input in found.values {
+            let run = runs.resolve(input)
+            canonical[run.id] = run
+        }
+        retire(replacing: canonical)
+        journeys = canonical
         // The memo answers for what the feed still carries. Anything else has
         // finished, and a finished journey's path is not asked for again —
-        // `retire` drops it for the same reason.
-        builtGeometry = builtGeometry.filter { found[$0.key] != nil }
-        // A new national view supersedes every stop-level sighting taken to
-        // paper over the last one.
-        mirrored = [:]
+        // `retire` drops it for the same reason. Re-key by alias so an OJP id
+        // does not drop the path built under the timetable id.
+        keepGeometry(for: canonical.keys)
         mirrorAsked = [:]
         revision += 1
-        status.journeys = found.count
+        status.journeys = canonical.count
         status.seen = summary.seen
         status.unresolved = summary.unresolved
         status.refreshedAt = current
@@ -1487,7 +2345,7 @@ public actor Fleet {
     /// actually changed — the map reads this many times per refresh.
     private func fleetByID() -> [String: Journey] {
         if chainedRevision != revision {
-            let vehicles = Chains.build(standing())
+            let vehicles = Chains.build(standing(), published: publishedGraph())
             chained = Dictionary(vehicles.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             chainedRevision = revision
             indexChainParts()
@@ -1498,6 +2356,7 @@ public actor Fleet {
             // chord until `alignToTrack` remembered — which it does not, for
             // a bus in a crowded viewport.
             restoreMemoisedGeometry()
+            noteGeometryChanged()
         }
         return chained
     }
@@ -1524,10 +2383,15 @@ public actor Fleet {
         in fleet: [String: Journey], at moment: Double
     ) -> [Journey] {
         let minute = Int64(floor(moment / 60))
-        guard minute != activeMinute
-                || activeMinuteFleetRevision != chainedRevision
-                || activeMinuteTimingRevision != timingRevision
-        else { return activeMinuteJourneys }
+        if minute == activeMinute
+            && activeMinuteFleetRevision == chainedRevision
+            && activeMinuteTimingRevision == timingRevision {
+            if activeSpatialDirty {
+                activeSpatial.rebuild(activeMinuteJourneys)
+                activeSpatialDirty = false
+            }
+            return activeMinuteJourneys
+        }
 
         let lower = Double(minute) * 60
         let upper = lower + 60
@@ -1546,7 +2410,38 @@ public actor Fleet {
         activeMinute = minute
         activeMinuteFleetRevision = chainedRevision
         activeMinuteTimingRevision = timingRevision
+        activeSpatial.rebuild(activeMinuteJourneys)
+        activeSpatialDirty = false
         return activeMinuteJourneys
+    }
+
+    /// Geometry attach enlarges `drawnWithin`. Rebuild the grid on the next
+    /// query rather than walking the country until the minute rolls over.
+    private func noteGeometryChanged() {
+        activeSpatialDirty = true
+    }
+
+    /// Active-minute journeys whose route box overlaps `padded`.
+    ///
+    /// `including` is still an explicit exception: a selected vehicle that
+    /// just jumped out of the box has to come back.
+    private func spatialCandidates(
+        in padded: BBox, at moment: Double, including extraId: String? = nil
+    ) -> [Journey] {
+        let fleet = fleetByID()
+        _ = activeJourneys(in: fleet, at: moment)
+        var candidates = activeSpatial.journeys(overlapping: padded)
+        if let extraId, let extra = fleet[extraId],
+           !candidates.contains(where: { $0.id == extraId }) {
+            candidates.append(extra)
+        }
+        return candidates
+    }
+
+    /// Test seam: the spatial index's candidate set before positioning.
+    func spatialCandidateIDs(in bbox: BBox, at now: Timestamp) -> Set<String> {
+        let padded = bbox.padded(by: 0.15)
+        return Set(spatialCandidates(in: padded, at: Double(now)).map(\.id))
     }
 
     /// Which chained vehicle each raw journey was flattened into.
@@ -1571,12 +2466,44 @@ public actor Fleet {
     /// than from the fleet: a few hundred kept paths, not the whole country.
     private func restoreMemoisedGeometry() {
         for (id, held) in builtGeometry {
-            guard let journey = chained[id], journey.geometry == nil else { continue }
+            guard let journey = chainedVehicle(forID: id), journey.geometry == nil else { continue }
             guard held.fingerprint == Self.callFingerprint(journey.stops) else { continue }
             journey.geometry = held.geometry
             journey.legsFromRoute = held.fromRoute
             journey.legsFromGraph = held.fromGraph
+            noteGeometryChanged()
         }
+    }
+
+    /// Keep memoised paths for the journeys that are still in the store, even
+    /// when a live alias changed the public id the path was first stored under.
+    private func keepGeometry(for ids: some Collection<String>) {
+        var remapped: [String: BuiltGeometry] = [:]
+        remapped.reserveCapacity(ids.underestimatedCount)
+        for id in ids {
+            if let held = builtGeometry[id] {
+                remapped[id] = held
+                continue
+            }
+            for alias in runs.allAliases(of: id) where alias != id {
+                if let held = builtGeometry[alias] {
+                    remapped[id] = held
+                    break
+                }
+            }
+        }
+        builtGeometry = remapped
+    }
+
+    /// The chained vehicle this public id currently names.
+    private func chainedVehicle(forID id: String) -> Journey? {
+        if let direct = chained[id] { return direct }
+        if let chain = chainOf[id], let joined = chained[chain] { return joined }
+        for alias in runs.allAliases(of: id) where alias != id {
+            if let direct = chained[alias] { return direct }
+            if let chain = chainOf[alias], let joined = chained[chain] { return joined }
+        }
+        return nil
     }
 
     /// The chained fleet as a plain array, for the queries that live in another
@@ -1880,7 +2807,7 @@ public actor Fleet {
     /// name, which is the last-resort join for a stop the two sources spell
     /// differently. A station key and a stop name cannot collide, so one table
     /// holds both.
-    private func callers(matchingAnyOf keys: some Sequence<String>) -> [Journey] {
+    func callers(matchingAnyOf keys: some Sequence<String>) -> [Journey] {
         buildCallIndexIfNeeded()
         var slots = Set<Int32>()
         for key in keys {
@@ -1931,7 +2858,8 @@ public actor Fleet {
     /// than by the caller because it was the caller's *last* filter and it
     /// belongs first: a bus nobody wants drawn should not be asked where it is,
     /// and it must not be allowed to take a place from a train that is — see
-    /// `thinTheHidden`.
+    /// `thinTheHidden`. `including` outranks it: the one vehicle the reader has
+    /// opened is drawn whatever its mode.
     ///
     /// `spacing` is how close together two vehicles have to be on the ground
     /// before the second one is only ever painted underneath the first. Zero,
@@ -1952,15 +2880,11 @@ public actor Fleet {
         // frame rather than the next.
         var drawn: [(journey: Journey, position: VehiclePosition)] = []
         let hidden = !hiding.isEmpty
-        let fleet = fleetByID()
-        var candidates = activeJourneys(in: fleet, at: moment)
-        // Selection is an explicit exception to both the viewport and lifetime
-        // indexes: a live-time correction may have just moved the open vehicle
-        // beyond either one, and the camera still needs a final anchor for it.
-        if let extraId, !activeMinuteIDs.contains(extraId), let extra = fleet[extraId] {
-            candidates.append(extra)
-        }
+        let candidates = spatialCandidates(
+            in: padded, at: moment, including: extraId
+        )
         for journey in candidates {
+            guard !journey.cancelled else { continue }
             // Rejected on what the journey *is* before it is asked where it
             // is, because asking is the expensive half and the answer is
             // thrown away for all but a screenful of them.
@@ -1982,13 +2906,20 @@ public actor Fleet {
             // `Journey.drawnWithin`.
             //
             // A mode the reader has switched off, before anything is spent on
-            // it, and ahead of `extraId` because a hidden mode is hidden: the
-            // caller used to drop these from the answer and this is the same
-            // rule moved to where it costs one comparison against a value
-            // already in hand instead of a position, a place in the thinning
-            // and a snapshot. On a map showing trains only it clears four
-            // fifths of the country before the clock test has to look at it.
-            if hidden, hiding.contains(journey.mode) { continue }
+            // it: the caller used to drop these from the answer and this is
+            // the same rule moved to where it costs one comparison against a
+            // value already in hand instead of a position, a place in the
+            // thinning and a snapshot. On a map showing trains only it clears
+            // four fifths of the country before the clock test has to look at
+            // it.
+            //
+            // `extraId` is the one exception, and it has to be. The filter
+            // answers *which of the fleet do I want to see*, and it cannot
+            // also answer the vehicle the reader has opened and is following:
+            // a bus opened from a board while buses are switched off left the
+            // panel tracking it, the camera chasing it and nothing under
+            // either. One vehicle is not the mode.
+            if hidden, journey.id != extraId, hiding.contains(journey.mode) { continue }
             var gated = false
             if journey.id != extraId {
                 // Exactly the bound `position` checks first, and checked here
@@ -2030,8 +2961,10 @@ public actor Fleet {
             out.append(VehicleSnapshot(
                 id: journey.id, mode: journey.mode, category: journey.category,
                 cable: cableKind(of: journey),
-                line: journey.line, operatorName: journey.operatorName,
-                operatorFull: journey.operatorFull, to: journey.to, from: journey.from,
+                line: Journey.badgeLine(journey.line, extra: journey.extra, mode: journey.mode),
+                operatorName: journey.operatorName,
+                operatorFull: journey.operatorFull,
+                to: Journey.reachedDestination(journey), from: journey.from,
                 delay: journey.delay,
                 lon: position.lon + (shift?.lon ?? 0), lat: position.lat + (shift?.lat ?? 0),
                 bearing: position.bearing, moving: position.moving, speed: position.speed,
@@ -2678,8 +3611,7 @@ public actor Fleet {
         let midLat = (bbox.south + bbox.north) / 2
 
         var pending: [(journey: Journey, from: Double)] = []
-        let fleet = fleetByID()
-        for journey in activeJourneys(in: fleet, at: moment) {
+        for journey in spatialCandidates(in: padded, at: moment) {
             if let geometry = journey.geometry, geometry.refined { continue }
             // The clock and the box before the position, in that order, for
             // exactly the reasons `vehicles(in:at:)` gives: asking a journey
@@ -2754,8 +3686,8 @@ public actor Fleet {
         public var day: String
     }
 
-    /// Which vehicles on screen are still being drawn where the *timetable*
-    /// puts them, nearest the middle first.
+    /// Visible vehicles eligible for a live timing refresh, nearest the middle
+    /// first, excluding references the caller has checked recently.
     ///
     /// This is the other half of the fix for a vehicle that jumps when it is
     /// tapped, and the half that stops the jump existing rather than hiding it.
@@ -2768,9 +3700,9 @@ public actor Fleet {
     /// had the same shape and the same answer: refining ahead of the finger
     /// fixed the tap by fixing the drawing, and so does this.
     ///
-    /// `monitored` is the whole test. It is set by every path that folds a live
-    /// time on — the national tick, a sighting, an OJP answer — so what is left
-    /// is exactly the set nobody has said anything about.
+    /// A monitored run can still have stale predictions. Only the caller's
+    /// expiring hold excludes a run, and it is applied before the result limit
+    /// so fresh answers cannot crowd out trains still waiting for a check.
     ///
     /// Skipped when the map is further out than the error can be seen from, and
     /// this gate is much tighter than the one `refineDrawn` uses. A refinement
@@ -2778,7 +3710,8 @@ public actor Fleet {
     /// minute shared with every panel the reader opens, so it is spent only
     /// where the reader is close enough to be picking a vehicle out.
     public func awaitingLiveTiming(
-        in bbox: BBox, at now: Timestamp, limit: Int = 8
+        in bbox: BBox, at now: Timestamp, limit: Int = 8,
+        excludingJourneyRefs recentlyAsked: Set<String> = []
     ) -> [LiveTimingCandidate] {
         guard bbox.east - bbox.west <= Self.liveTimingWidestSpan else { return [] }
         let moment = Double(now)
@@ -2787,9 +3720,10 @@ public actor Fleet {
         let midLat = (bbox.south + bbox.north) / 2
 
         var pending: [(candidate: LiveTimingCandidate, from: Double)] = []
-        let fleet = fleetByID()
-        for journey in activeJourneys(in: fleet, at: moment) {
-            if journey.monitored { continue }
+        for journey in spatialCandidates(in: padded, at: moment) {
+            // `monitored` records provenance, not freshness. A train remains
+            // monitored after its last prediction expires; the caller's timed
+            // hold decides when it is worth asking again.
             // Gated before the position is asked for, for the reason
             // `vehicles(in:at:)` gives. This sweep idles on a settled map by
             // design — one check a second — and an idle check was walking the
@@ -2802,7 +3736,8 @@ public actor Fleet {
             guard let position = Positioning.position(
                 of: journey, at: moment, settling: true, spanChecked: true
             ), padded.contains(lon: position.lon, lat: position.lat),
-                  let handle = journeyRef(for: journey.id)
+                  let handle = journeyRef(for: journey.id),
+                  !recentlyAsked.contains(handle.ref)
             else { continue }
             let dLon = position.lon - midLon, dLat = position.lat - midLat
             pending.append((
@@ -2858,6 +3793,7 @@ public actor Fleet {
         if refined { journey.geometry = nil }
 
         builder.attach(to: journey, refined: refined)
+        if journey.geometry != nil { noteGeometryChanged() }
         guard let built = journey.geometry else { return true }
         builtGeometry[journey.id] = BuiltGeometry(
             fingerprint: fingerprint, geometry: built,
@@ -2890,8 +3826,7 @@ public actor Fleet {
 
         geometryUse += 1
         let fingerprint = Self.callFingerprint(journey.stops)
-        guard var held = builtGeometry[journey.id], held.fingerprint == fingerprint,
-              held.geometry.refined || !refined
+        guard var held = memoisedGeometry(for: journey, fingerprint: fingerprint, refined: refined)
         else { return false }
 
         journey.geometry = held.geometry
@@ -2899,7 +3834,28 @@ public actor Fleet {
         journey.legsFromGraph = held.fromGraph
         held.usedAt = geometryUse
         builtGeometry[journey.id] = held
+        noteGeometryChanged()
         return true
+    }
+
+    /// A path stored under this occurrence's current id or any live alias.
+    private func memoisedGeometry(
+        for journey: Journey, fingerprint: Int, refined: Bool
+    ) -> BuiltGeometry? {
+        var keys = runs.allAliases(of: journey.id)
+        keys.insert(journey.id)
+        if let ref = journey.journeyRef { keys.insert(ref) }
+        for part in journey.parts ?? [] {
+            keys.insert(part.id)
+            if let ref = part.journeyRef { keys.insert(ref) }
+        }
+        for key in keys {
+            guard let held = builtGeometry[key], held.fingerprint == fingerprint,
+                  held.geometry.refined || !refined
+            else { continue }
+            return held
+        }
+        return nil
     }
 
     /// Queue one cold build without letting it run on the Fleet actor.
@@ -3055,10 +4011,15 @@ public actor Fleet {
             journey.geometry = built
             journey.legsFromRoute = request.draft.legsFromRoute
             journey.legsFromGraph = request.draft.legsFromGraph
+            noteGeometryChanged()
         }
 
-        if let live = fleetByID()[request.key.id] { install(into: live) }
-        for (key, listed) in boardJourneys where key.id == request.key.id {
+        _ = fleetByID()
+        if let live = chainedVehicle(forID: request.key.id) {
+            install(into: live)
+        }
+        let aliases = runs.allAliases(of: request.key.id)
+        for (key, listed) in boardJourneys where aliases.contains(key.id) {
             install(into: listed)
         }
     }
@@ -3224,16 +4185,104 @@ public actor Fleet {
     /// service left today should not wait on the network to say so.
     @discardableResult
     public func fillFromMirror(placeId: String, at now: Timestamp) async -> Bool {
-        guard let place = stopPlaces.place(id: placeId) else { return false }
-        if let asked = mirrorAsked[placeId], Date().timeIntervalSince(asked) < Self.mirrorTTL {
+        let didok = StopRegister.didok(forSloid: placeId) ?? placeId
+        if let asked = mirrorAsked[didok], Date().timeIntervalSince(asked) < Self.mirrorTTL {
             return false
         }
-        mirrorAsked[placeId] = Date()
+        mirrorAsked[didok] = Date()
 
-        let found = await mirror.board(didok: place.id, at: now)
+        let found = await mirror.board(didok: didok, at: now)
         guard !found.isEmpty else { return false }
-        for journey in found { mirrored[journey.id] = journey }
+        ingestBoardFill(found)
         return true
+    }
+
+    public func overlayRoutes(_ routes: [OSMFetchedRoute]) {
+        relations.overlay(routes)
+    }
+
+    func boardFillJourneys() -> [Journey] { runs.boardValues }
+
+    /// Merge OJP stop-event workings into the board fill, locating each call.
+    ///
+    /// These win over a packed trip with the same journey reference because
+    /// they still have the Italian or German tail the Swiss file dropped.
+    public func ingestBoardFill(_ journeys: [Journey]) {
+        for journey in journeys {
+            let filled = journey
+            let located = journey.stops.map(locateBoardCall)
+            filled.stops = located
+            if let name = operators.name(for: filled.operatorName) {
+                filled.operatorFull = operators.fullName(for: filled.operatorName)
+                filled.operatorName = name
+            }
+            filled.from = located.first?.name ?? filled.from
+            filled.to = filled.to.map(StopNaming.display)
+            // Resolve against the printed occurrence before admitting a new
+            // record. This also works for tomorrow's board, outside the map's
+            // small active window, and when the live answer arrives first.
+            if let first = filled.stops.first, let ref = first.ref, let timetable {
+                let booked = first.sched ?? first.dep
+                let candidates = timetable.journeys(
+                    callingAt: [StopRegister.stationOf(ref)],
+                    from: booked - 30, to: booked + 30, limit: 500,
+                    place: { [register] ref in register.lookup(ref) },
+                    operatorName: { [operators] agency in operators.name(for: agency) }
+                ).filter { RunStore.matches($0, filled) }
+                if candidates.count == 1, let planned = candidates.first {
+                    // Retain an already-observed map object when it is this
+                    // occurrence; otherwise use the freshly expanded plan.
+                    let active = self.journeys[planned.id]
+                    runs.ingest(active.map { RunStore.matches($0, planned) ? $0 : planned } ?? planned)
+                }
+            }
+            let canonical = runs.ingest(filled, supplemental: true)
+            if filled.source == "ojp" { applyBoardTimingToMap(canonical) }
+        }
+    }
+
+    /// OJP may name a bus with a UUID while the timetable names the same
+    /// working SKI-1054. Match its operator, course and booked calls before
+    /// updating the map copy; opening that vehicle must not show old times.
+    private func applyBoardTimingToMap(_ live: Journey) {
+        let timing = JourneyTiming(liveBoardJourney: live)
+        guard !timing.isEmpty else { return }
+        var matches = Set<String>()
+        for (index, call) in live.stops.enumerated() {
+            guard let ref = call.ref else { continue }
+            let identity = BoardRunIdentity(journey: live, at: index)
+            for candidate in callers(matchingAnyOf: [StopRegister.stationOf(ref)]) {
+                guard candidate.mode == live.mode else { continue }
+                for i in candidate.stops.indices {
+                    let booked = candidate.stops[i]
+                    guard StopRegister.stationOf(booked.ref) == identity.station,
+                          abs((booked.sched ?? booked.dep) - identity.scheduledDeparture) <= 30 else { continue }
+                    guard identity.matches(BoardRunIdentity(journey: candidate, at: i)) else { continue }
+                    let part = candidate.parts?.last { $0.start <= i && i <= $0.end }
+                    matches.insert(part?.id ?? candidate.id)
+                }
+            }
+            if !matches.isEmpty { break }
+        }
+        guard matches.count == 1, let id = matches.first else { return }
+        _ = applyTiming(timing, to: id)
+    }
+
+    private func locateBoardCall(_ call: Call) -> Call {
+        var call = call
+        call.name = StopNaming.display(call.name)
+        guard let ref = call.ref, let place = register.lookup(ref, name: call.name) else {
+            return call
+        }
+        if call.lat == 0, call.lon == 0 {
+            call.lat = place.lat
+            call.lon = place.lon
+            call.precise = place.precise
+        }
+        if call.name.isEmpty || call.name == ref {
+            call.name = StopNaming.display(place.name)
+        }
+        return call
     }
 
     /// The fleet as the feed filed it, before chaining or geometry.
@@ -3241,6 +4290,26 @@ public actor Fleet {
     /// This is what the cache holds, so writing one is the same call the app
     /// makes after a refresh.
     public func everyRawJourney() -> [Journey] { Array(journeys.values) }
+
+    /// Query only on opening a cable card. The nearby six-hour timetable
+    /// window includes sparse shuttles without using the map's thinned dots
+    /// as a count of departures or adding network requests.
+    public func cableService(for vehicle: VehicleSnapshot, at moment: Timestamp) -> CableService.Summary {
+        guard vehicle.mode == .cable else {
+            return CableService.summarize(vehicle, journeys: [])
+        }
+        let stations = Set(vehicle.stops.compactMap(\.ref).map { StopRegister.stationOf($0) })
+        let scheduled = timetable?.journeys(
+            callingAt: stations, from: moment - 3 * 3600, to: moment + 3 * 3600,
+            limit: 10_000,
+            place: { [register] ref in register.lookup(ref) },
+            operatorName: { [operators] agency in operators.name(for: agency) }
+        ) ?? []
+        let source = scheduled.isEmpty ? journeys.values.filter {
+            $0.mode == .cable && abs(($0.stops.first?.dep ?? 0) - moment) <= 3 * 3600
+        } : scheduled
+        return CableService.summarize(vehicle, journeys: source)
+    }
 
     /// Cableway infrastructure scheduled anywhere in a view on this service
     /// day, whether or not a cabin is running at the selected moment.
@@ -3274,9 +4343,10 @@ public actor Fleet {
             guard let first = journey.stops.first else { return nil }
             return VehicleSnapshot(
                 id: journey.id, mode: journey.mode, category: journey.category,
-                cable: cableKind(of: journey), line: journey.line,
+                cable: cableKind(of: journey),
+                line: Journey.badgeLine(journey.line, extra: journey.extra, mode: journey.mode),
                 operatorName: journey.operatorName, operatorFull: journey.operatorFull,
-                to: journey.to, from: journey.from,
+                to: Journey.reachedDestination(journey), from: journey.from,
                 lon: first.lon, lat: first.lat, stops: journey.stops,
                 geometry: journey.geometry, journeyRef: journey.journeyRef
             )
@@ -3295,8 +4365,9 @@ public actor Fleet {
             return VehicleSnapshot(
                 id: journey.id, mode: journey.mode, category: journey.category,
                 cable: cableKind(of: journey),
-                line: journey.line, operatorName: journey.operatorName,
-                operatorFull: journey.operatorFull, to: journey.to, from: journey.from,
+                line: Journey.badgeLine(journey.line, extra: journey.extra, mode: journey.mode),
+                operatorName: journey.operatorName,
+                operatorFull: journey.operatorFull, to: Journey.reachedDestination(journey), from: journey.from,
                 delay: journey.delay, lon: journey.stops[0].lon, lat: journey.stops[0].lat,
                 bearing: 0, moving: false, speed: 0, index: 0,
                 complete: journey.complete, cancelled: journey.cancelled,
@@ -3327,21 +4398,76 @@ public actor Fleet {
     /// later leg handed back an id the fleet could not resolve; the panel asked
     /// for it, got nil, and sat on the spinner it shows while a vehicle is
     /// being fetched — for ever, because nothing was ever going to arrive.
-    private func drawnJourney(_ id: String) -> Journey? {
+    private func drawnJourney(_ id: String, at moment: Timestamp? = nil) -> Journey? {
         // `fleetByID()` first and not merely for its answer: it is what builds
         // `chainOf`, so the fallback below has nothing to read until it has run.
-        if let direct = fleetByID()[id] { return direct }
-        if let chain = chainOf[id], let joined = chained[chain] { return joined }
-        return mirrored[id]
+        _ = fleetByID()
+        if let vehicle = chainedVehicle(forID: id) { return vehicle }
+        guard let run = runs.journey(id: id, at: moment) else { return nil }
+        return fleetVehicle(matching: run) ?? run
+    }
+
+    /// The map vehicle for this operating run, if the fleet is already drawing it.
+    ///
+    /// A live alias is a different public id of the same occurrence. Resolving
+    /// the map object through `RunStore` used to *replace* it with that alias,
+    /// which dropped chained parts and the path already drawn for the tap.
+    private func fleetVehicle(matching run: Journey) -> Journey? {
+        let fleet = fleetByID()
+        var keys = runs.allAliases(of: run.id)
+        keys.insert(run.id)
+        if let ref = run.journeyRef { keys.insert(ref) }
+        for part in run.parts ?? [] {
+            keys.insert(part.id)
+            if let ref = part.journeyRef { keys.insert(ref) }
+        }
+        for key in keys {
+            if let direct = fleet[key] { return direct }
+            if let chain = chainOf[key], let joined = fleet[chain] { return joined }
+        }
+        return nil
+    }
+
+    /// The journey a panel, tap or route request is naming, preferring the
+    /// object the map is already drawing.
+    private func occurrence(
+        id: String, at moment: Timestamp? = nil, boardDeparture: Timestamp? = nil
+    ) -> Journey? {
+        if let boardDeparture, let listed = boardJourneys[BoardJourneyKey(id: id, departure: boardDeparture)] {
+            // `RunStore` ingested the packed numbered leg. Resolving the
+            // through-working against it used to replace Bern→Brig with the
+            // five-stop Spiez shuttle the file actually contains.
+            if let live = fleetVehicle(matching: listed) {
+                return listed.stops.count >= live.stops.count ? listed : live
+            }
+            let resolved = runs.resolve(listed)
+            return listed.stops.count >= resolved.stops.count ? listed : resolved
+        }
+        return drawnJourney(id, at: moment)
+    }
+
+    public func splitContinuation(of id: String, preferredID: String?, at now: Timestamp) -> VehicleSnapshot? {
+        guard let source = drawnJourney(id), !source.splitContinuations.isEmpty else { return nil }
+        let children = source.splitContinuations.compactMap { drawnJourney($0) }
+        guard let next = Chains.continuation(of: source, among: children, preferredID: preferredID, at: now),
+              now <= Positioning.standsUntil(next) else { return nil }
+        return journey(id: next.id, at: now)
     }
 
     public func journey(
-        id: String, at now: Timestamp, boardDeparture: Timestamp? = nil
+        id: String, at now: Timestamp, boardDeparture: Timestamp? = nil,
+        through: Bool = true
     ) -> VehicleSnapshot? {
         let listed = boardDeparture.flatMap {
             boardJourneys[BoardJourneyKey(id: id, departure: $0)]
         }
-        guard let journey = listed ?? drawnJourney(id) else { return nil }
+        guard let found = occurrence(id: id, at: now, boardDeparture: boardDeparture) else { return nil }
+        // Board rows already stitch packed legs; a map tap on the outgoing
+        // numbered working must too, or the panel says "from Spiez" for a
+        // train that ran from Bern. Offline: packed timetable only.
+        // `through: false` is the packed/map object for the first paint of
+        // the card; the caller then asks again with the default to join legs.
+        let journey = through ? boardWorking(found) : found
         if listed != nil {
             // A future departure is outside the map fleet, but its route is no
             // less real. Restore a cached path immediately or queue the normal
@@ -3383,30 +4509,31 @@ public actor Fleet {
         // Whatever geometry it has is what the map drew it with; whatever it
         // lacks, the draw loop and `refineDrawn` supply within a frame or two,
         // and the vehicle moves then — ambiently, not under the reader's finger.
-        let position = Positioning.position(of: journey, at: now)
+        return snapshot(of: journey, identity: found, at: now)
+    }
 
+    /// Panel card for `identity`, with `journey`'s through-working route.
+    private func snapshot(of journey: Journey, identity: Journey, at now: Timestamp) -> VehicleSnapshot {
+        let position = Positioning.panelPosition(of: identity, at: now)
+            ?? Positioning.panelPosition(of: journey, at: now)
+        let throughIndex = Positioning.panelPosition(of: journey, at: now)?.index
         return VehicleSnapshot(
-            id: journey.id, mode: journey.mode, category: journey.category,
-            cable: cableKind(of: journey),
-            line: journey.line, operatorName: journey.operatorName,
-            operatorFull: journey.operatorFull, to: journey.to, from: journey.from,
+            id: identity.id, mode: identity.mode, category: identity.category,
+            cable: cableKind(of: identity),
+            line: Journey.badgeLine(identity.line, extra: identity.extra, mode: identity.mode),
+            operatorName: identity.operatorName,
+            operatorFull: identity.operatorFull, to: Journey.reachedDestination(journey), from: journey.from,
             delay: journey.delay,
-            lon: position?.lon ?? journey.stops[0].lon,
-            lat: position?.lat ?? journey.stops[0].lat,
+            lon: position?.lon ?? identity.stops[0].lon,
+            lat: position?.lat ?? identity.stops[0].lat,
             bearing: position?.bearing ?? 0, moving: position?.moving ?? false,
-            speed: position?.speed ?? 0, index: position?.index ?? 0,
-            // Carried, and not defaulted away. `progress` is how anything that
-            // draws the vehicle as a *vehicle* finds the point on the path its
-            // body hangs off — see `VehicleFootprint.centreline`. Left at zero
-            // it says "at the last stop", so a train mid-leg had its coaches
-            // laid out along the track it had already run over: a body that
-            // traces the right rails in the wrong place, which is what a tap
-            // used to draw.
+            speed: position?.speed ?? 0, index: throughIndex ?? position?.index ?? 0,
             progress: position?.progress ?? 0,
             complete: journey.complete, cancelled: journey.cancelled,
-            stops: journey.stops, parts: journey.parts, geometry: journey.geometry,
-            layover: journey.layover, onTrack: position?.onTrack ?? false,
-            extra: journey.extra, journeyRef: journey.journeyRef
+            stops: journey.stops, parts: journey.parts,
+            geometry: identity.geometry ?? journey.geometry,
+            layover: identity.layover ?? journey.layover, onTrack: position?.onTrack ?? false,
+            extra: identity.extra, journeyRef: identity.journeyRef ?? journey.journeyRef
         )
     }
 
@@ -3420,12 +4547,31 @@ public actor Fleet {
     public func boardJourneyGeometry(
         id: String, departure: Timestamp
     ) async -> JourneyGeometry? {
-        guard let journey = boardJourneys[
-            BoardJourneyKey(id: id, departure: departure)
-        ] else { return nil }
+        await journeyGeometry(id: id, boardDeparture: departure)
+    }
+
+    /// A selected train gets its route even while waiting at its origin or
+    /// outside the viewport. Queue the existing worker rather than routing
+    /// synchronously during hit detection or waiting for the train to move.
+    public func journeyGeometry(
+        id: String, boardDeparture: Timestamp? = nil
+    ) async -> JourneyGeometry? {
+        guard let journey = occurrence(
+            id: id, at: boardDeparture, boardDeparture: boardDeparture
+        ) else { return nil }
 
         while !Task.isCancelled, !geometryBackgroundSuspended {
             if restoreGeometry(to: journey, refined: true) {
+                // A cached all-chord path is from an earlier matcher that
+                // needed three stops on one relation. Rebuild locally so the
+                // Swiss half of an ICE can land on IC 61 before Overpass
+                // is asked — and return that without waiting for the network.
+                if journey.geometry?.hasUnmappedLeg == true,
+                   journey.geometry?.relation == nil {
+                    builtGeometry.removeValue(forKey: journey.id)
+                    journey.geometry = nil
+                    _ = attachGeometry(to: journey, refined: true)
+                }
                 return journey.geometry
             }
             let result = enqueueGeometryBuild(for: journey, refined: true, urgent: true)
@@ -3444,6 +4590,57 @@ public actor Fleet {
             }
         }
         return nil
+    }
+
+    /// Overpass for the hops the packed extract still draws as a chord.
+    ///
+    /// Separate from `journeyGeometry` so the map can draw the Swiss rails
+    /// immediately and splice in the foreign ones when this returns.
+    public func refineRemoteRoute(
+        id: String, boardDeparture: Timestamp? = nil
+    ) async -> JourneyGeometry? {
+        guard let journey = occurrence(
+            id: id, at: boardDeparture, boardDeparture: boardDeparture
+        ) else { return nil }
+        _ = restoreGeometry(to: journey, refined: true)
+        await fetchRemoteRoute(for: journey)
+        return journey.geometry
+    }
+
+    /// Ask Overpass for the OSM relation of a run the packed Swiss extract
+    /// could not describe. Selecting the vehicle is what makes the download
+    /// worth it; the chord stays on the map until a relation actually matches.
+    private func fetchRemoteRoute(for journey: Journey) async {
+        let ref = RelationStore.normaliseRef(journey.line)
+        guard !ref.isEmpty, journey.stops.count >= 2 else { return }
+        let key = remoteRouteKey(journey)
+        guard !remoteRouteMisses.contains(key) else { return }
+
+        var extra: [String] = []
+        if let id = journey.geometry?.relation, let rel = relations.relation(id: id) {
+            extra.append(contentsOf: [rel.from, rel.to, rel.name].compactMap { $0 })
+        }
+        let fetched = await osmRoutes.fetch(
+            line: journey.line, mode: journey.mode, stops: journey.stops, extraTokens: extra
+        )
+        guard !fetched.isEmpty else {
+            remoteRouteMisses.insert(key)
+            return
+        }
+        relations.ingest(fetched)
+        builtGeometry.removeValue(forKey: journey.id)
+        journey.geometry = nil
+        _ = attachGeometry(to: journey, refined: true)
+        if journey.geometry?.hasUnmappedLeg != false {
+            remoteRouteMisses.insert(key)
+        }
+    }
+
+    private func remoteRouteKey(_ journey: Journey) -> String {
+        let ref = RelationStore.normaliseRef(journey.line)
+        let bbox = OSMRouteClient.bbox(of: journey.stops)
+        let cell = bbox.map { OSMRouteClient.cacheCell($0) } ?? ""
+        return "\(journey.mode.rawValue)|\(ref)|\(cell)"
     }
 
     /// Where a vehicle ends up once a correction in flight has been walked off,
@@ -3511,36 +4708,104 @@ public actor Fleet {
     /// for that place.
     ///
     /// Deliberately narrow. The destination must match, the departure must be
-    /// inside the hour after the trunk gets there, and the call must be the
+    /// within twenty minutes after the trunk gets there, and the call must be the
     /// working's own origin — which is what a portion that has just been
     /// detached is. Nothing that fails all three is guessed at.
     public func onward(
-        from stopName: String, notBefore moment: Timestamp, to destination: String,
-        mode: Mode, at now: Timestamp
+        from stopName: String, stopUIC: Int? = nil,
+        notBefore moment: Timestamp, to destination: String?, destinationUIC: Int? = nil,
+        mode: Mode, operatorName: String? = nil, line: String? = nil,
+        workings: [TrainFormation.Working] = [], at now: Timestamp
     ) -> VehicleSnapshot? {
-        var best: (journey: Journey, dep: Timestamp)?
-        for journey in fleetByID().values {
-            guard journey.mode == mode, journey.stops.count >= 2,
-                  let last = journey.stops.last,
-                  Self.sameStop(last.name, destination)
-            else { continue }
-            // The parting has to be where this working *begins* — a detached
-            // portion starts its own life there. A leg the feed renumbered and
-            // this app chained into a longer vehicle counts too, which is why
-            // the parts are checked as well as index zero: the Solothurn half
-            // is often the second half of some other chained run.
-            var origins = [0]
-            origins.append(contentsOf: (journey.parts ?? []).map(\.start))
-            for index in origins where journey.stops.indices.contains(index) {
+        let station = stopUIC.flatMap { StopRegister.sloid(forDidok: String($0)) }
+        let target = destinationUIC.flatMap { StopRegister.sloid(forDidok: String($0)) }
+        // A half the service named as a working and gave no coach goal for.
+        // Then the name is the whole of the evidence and nothing else may
+        // stand in for it — see the `explicit` requirement below.
+        let named = destination == nil && destinationUIC == nil
+        func reachesDestination(_ call: Call) -> Bool {
+            if let target { return StopRegister.stationOf(call.ref) == target }
+            if let destinationUIC, let ref = call.ref {
+                // Foreign UICs have no Swiss SLOID. Compare their actual
+                // identity, independent of country suffixes in display names.
+                let code = StopRegister.scheduledStopPointCode(ref) ?? ref
+                return Int(code) == destinationUIC
+            }
+            guard let destination else { return false }
+            return Self.sameStop(call.name, destination)
+        }
+        var candidates = Array(fleetByID().values)
+        // A branch can start beyond the map's time window or outside its
+        // viewport. Ask the packed timetable at the split, independently of
+        // which vehicles have been expanded for drawing.
+        if let station, let timetable, register.isReady {
+            candidates += timetable.journeys(
+                callingAt: [station], from: moment - 120, to: moment + 20 * 60,
+                limit: 240, place: { [register] in register.lookup($0) },
+                operatorName: { [operators] in operators.name(for: $0) }
+            )
+        }
+        // Folded, because a published name is: see `ThroughLink`. A half named
+        // by the graph and the same half named by the formation service differ
+        // only in the case of the namespace, and an exact compare finds one.
+        let ids = Set(workings.compactMap { $0.journeyID?.lowercased() })
+        let numbers = Set(workings.compactMap(\.trainNumber))
+        var matches: [(journey: Journey, departure: Timestamp, explicit: Bool)] = []
+        var seen = Set<String>()
+        for journey in candidates {
+            guard journey.mode == mode, !journey.cancelled, journey.stops.count >= 2,
+                  let last = journey.stops.last else { continue }
+            let reachesTarget = reachesDestination(last)
+            if let operatorName, journey.operatorName != operatorName { continue }
+            let origins = Set([0] + (journey.parts ?? []).map(\.start))
+            for index in origins.sorted() where journey.stops.indices.contains(index) {
                 let call = journey.stops[index]
-                guard Self.sameStop(call.name, stopName),
-                      call.dep >= moment - 120, call.dep <= moment + 3600
-                else { continue }
-                if best == nil || call.dep < best!.dep { best = (journey, call.dep) }
+                let atSplit = station.map { StopRegister.stationOf(call.ref) == $0 }
+                    ?? Self.sameStop(call.name, stopName)
+                guard atSplit, !call.cancelled,
+                      call.dep >= moment - 120, call.dep <= moment + 20 * 60 else { continue }
+                let part = journey.parts?.last { $0.start == index }
+                let ref = part?.journeyRef ?? part?.id ?? journey.journeyRef ?? journey.id
+                let number = FormationKey(journeyID: ref, operationDate: "")?.trainNumber
+                let explicit = ids.contains(ref.lowercased())
+                    || ids.contains((part?.id ?? journey.id).lowercased())
+                    || (number.map { numbers.contains($0) } ?? false)
+                // Coach goals may end before the passenger working does:
+                // Bern's RE1 names Brig, while its published child 4277
+                // continues through Brig to Domodossola. Use that explicit
+                // relationship, but still distinguish it from the other half
+                // by requiring the goal on this child's onward route.
+                if named {
+                    guard explicit else { continue }
+                } else {
+                    guard reachesTarget || (explicit && journey.stops.dropFirst(index + 1).contains(where: reachesDestination))
+                    else { continue }
+                }
+                // Without a published link, require the same advertised line
+                // as well as operator, place, destination, and a short dwell.
+                if !explicit, let line, (part?.line ?? journey.line) != line { continue }
+                let identity = "\(ref)|\(call.sched ?? call.dep)"
+                guard seen.insert(identity).inserted else { continue }
+                matches.append((journey, call.dep, explicit))
             }
         }
-        guard let found = best?.journey else { return nil }
-        return journey(id: found.id, at: now)
+        matches.sort {
+            if $0.explicit != $1.explicit { return $0.explicit }
+            return abs($0.departure - moment) < abs($1.departure - moment)
+        }
+        guard let best = matches.first else { return nil }
+        // Equally plausible departures are not evidence for a connection.
+        if matches.count > 1, matches[1].explicit == best.explicit,
+           abs(abs(matches[1].departure - moment) - abs(best.departure - moment)) < 120 {
+            return nil
+        }
+        // Retain this scheduled working for the panel and its asynchronous
+        // route builder, without inserting future trains into the map fleet.
+        rememberBoardJourney(best.journey, departure: best.departure)
+        // The detached portion, not the through-working: a Burgdorf S44
+        // branch is nine stops to Solothurn, even though the trunk ran from
+        // Thun. `journey()` would stitch that trunk back on.
+        return snapshot(of: best.journey, identity: best.journey, at: now)
     }
 
     /// Whether two names are one place written two ways.
@@ -3553,7 +4818,21 @@ public actor Fleet {
         Self.squash(a) == Self.squash(b)
     }
 
-    private static func squash(_ name: String) -> String {
+    /// `Domodossola (I)` and `Domodossola` are one station.
+    public static func sameListedStop(_ a: String, _ b: String) -> Bool {
+        StopNaming.sameListedStop(a, b)
+    }
+
+    /// Destinations as two feeds write them. See `StopNaming.sameBoardDestination`.
+    public static func sameBoardDestination(_ a: String, _ b: String) -> Bool {
+        StopNaming.sameBoardDestination(a, b)
+    }
+
+    public static func localDestination(_ name: String) -> String {
+        StopNaming.localDestination(name)
+    }
+
+    static func squash(_ name: String) -> String {
         name.folding(options: [.diacriticInsensitive, .caseInsensitive],
                      locale: Locale(identifier: "en_US"))
             .filter { $0.isLetter || $0.isNumber }
@@ -3583,6 +4862,7 @@ public actor Fleet {
     /// modes without weakening the prefix rule for genuinely different stops.
     static func partOfStation(_ name: String, _ stationName: String) -> Bool {
         sameStop(name, stationName) || name.hasPrefix("\(stationName), ")
+            || isGenericStationStop(name, stationName: stationName)
     }
 
     /// Whether a stop name is merely the generic forecourt name of a station.
@@ -3597,14 +4877,21 @@ public actor Fleet {
             value.folding(
                 options: [.diacriticInsensitive, .caseInsensitive],
                 locale: Locale(identifier: "de_CH")
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            ).split { !$0.isLetter && !$0.isNumber }.joined(separator: " ")
         }
-        let child = folded(name), parent = folded(stationName)
+        let child = folded(name)
+        var parent = folded(stationName)
         if child == parent { return true }
-        guard child.hasPrefix("\(parent),") else { return false }
-        let suffix = child.dropFirst(parent.count + 1)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return ["bahnhof", "gare", "station", "stazione", "staziun"].contains(suffix)
+        // Main stations can carry the generic suffix on either side of the
+        // join: Zürich HB / Zürich, Bahnhof; Bern / Bern, Hauptbahnhof.
+        for suffix in [" hauptbahnhof", " hb"] where parent.hasSuffix(suffix) {
+            parent.removeLast(suffix.count)
+            break
+        }
+        guard !parent.isEmpty, child.hasPrefix("\(parent) ") else { return false }
+        let suffix = String(child.dropFirst(parent.count + 1))
+        return ["bahnhof", "hauptbahnhof", "hb", "gare", "station", "stazione", "staziun",
+                "gare centrale", "stazione centrale"].contains(suffix)
     }
 
     /// Whether `candidate` is the whole interchange that contains `place`.
@@ -3612,6 +4899,7 @@ public actor Fleet {
     /// without loading the national stop register.
     static func isStationParent(_ candidate: StopPlace, of place: StopPlace) -> Bool {
         guard candidate.id != place.id,
+              !place.rail || candidate.rail,
               Geo.flatMetres(
                   place.lon, place.lat, candidate.lon, candidate.lat
               ) <= Self.stationSpread
@@ -3671,12 +4959,53 @@ public actor Fleet {
         return out
     }
 
-    public func stationBoard(placeId: String, at now: Timestamp, limit: Int = 60) -> StationBoard? {
-        guard let place = stopPlaces.place(id: placeId) else { return nil }
-        let station = canonicalStationPlace(place)
+    public func cityStation(named name: String, near centre: Coord) -> StopPlace? {
+        guard centre.lon.isFinite, centre.lat.isFinite,
+              abs(centre.lon) <= 180, abs(centre.lat) <= 85 else { return nil }
+        let candidates = stopPlaces.nearby(
+            lon: centre.lon, lat: centre.lat, within: CityStation.searchRadius, limit: .max
+        )
+        return CityStation.resolve(named: name, near: centre, among: candidates) { place in
+            place.rail || timetable?.isRailwayStation(place.id) == true
+        }
+    }
+
+    /// `loadingOnly` resolves the canonical place without scanning departures,
+    /// expanding timetable journeys or looking up serving routes. Map hit
+    /// testing needs only that identity before it can present a card.
+    ///
+    /// `preview` is the packed timetable for the next couple of hours, without
+    /// chaining through-workings or looking up serving routes. The card can
+    /// paint that immediately; the full board replaces it when the rest is
+    /// ready. Live OJP/mirror rows arrive later still.
+    public func stationBoard(
+        placeId: String, at now: Timestamp, limit: Int = 60,
+        loadingOnly: Bool = false, preview: Bool = false
+    ) -> StationBoard? {
+        if let place = stopPlaces.place(id: placeId) {
+            let station = canonicalStationPlace(place)
+            if loadingOnly {
+                return .loading(id: station.id, name: station.name,
+                                at: Coord(lon: station.lon, lat: station.lat), now: now)
+            }
+            return board(
+                name: station.name, id: station.id, lon: station.lon, lat: station.lat,
+                at: now, limit: limit, preview: preview
+            )
+        }
+        // Milano Centrale is a UIC and not a drawn Swiss stop place. The
+        // register still names it, and a board is all this needs.
+        let didok = StopRegister.didok(forSloid: placeId) ?? placeId
+        guard didok.allSatisfy(\.isNumber),
+              let place = register.lookup(didok) ?? register.lookup(placeId)
+        else { return nil }
+        if loadingOnly {
+            return .loading(id: didok, name: place.name,
+                            at: Coord(lon: place.lon, lat: place.lat), now: now)
+        }
         return board(
-            name: station.name, id: station.id, lon: station.lon, lat: station.lat,
-            at: now, limit: limit
+            name: place.name, id: didok, lon: place.lon, lat: place.lat,
+            at: now, limit: limit, preview: preview
         )
     }
 
@@ -3706,7 +5035,8 @@ public actor Fleet {
     public func nearbyBoard(
         lon: Double, lat: Double, accuracy: Double, at now: Timestamp
     ) -> NearbyBoard? {
-        guard accuracy.isFinite, accuracy >= 0, accuracy <= 35,
+        guard accuracy.isFinite, accuracy >= 0,
+              accuracy <= RideMatching.stationaryAccuracy,
               stopPlaces.count > 0
         else { return nil }
 
@@ -3750,11 +5080,13 @@ public actor Fleet {
         let ranked = groupDistance.sorted { a, b in
             a.value == b.value ? a.key < b.key : a.value < b.value
         }
-        guard let nearest = ranked.first,
-              // The uncertainty circle may reach the stop, with a modest
-              // allowance for the register point sitting beside the shelter.
-              nearest.value <= max(25, accuracy + 25),
-              let station = groupPlace[nearest.key]
+        guard let nearest = ranked.first, let station = groupPlace[nearest.key],
+              // Railway platforms extend well beyond their register points.
+              // A precise fix 80 m along Spiez's platform still identifies the
+              // station; it does not identify a particular track. Kerbside
+              // stops retain their smaller reach and platform selection below
+              // still requires clear separation from the adjacent platform.
+              nearest.value <= max(station.rail ? 100 : 25, accuracy + 25)
         else { return nil }
 
         // Two unrelated stops equally plausible under the accuracy circle are
@@ -3814,8 +5146,40 @@ public actor Fleet {
         return first.stop
     }
 
+    /// Use the same cached, direction-specific daytime cadence as the Watch
+    /// board, rather than estimating a frequency from a few visible rows.
+    private func typicalInterval(of journey: Journey, at index: Int, now: Timestamp) -> Int? {
+        guard let ref = journey.stops.indices.contains(index) ? journey.stops[index].ref : nil else {
+            return nil
+        }
+        let station = StopRegister.stationOf(ref)
+        return intervalMinutes(
+            of: journey, at: index,
+            cadences: timetable?.departureCadences(
+                callingAt: [station], on: Date(timeIntervalSince1970: Double(now))
+            ) ?? []
+        )
+    }
+
+    private func intervalMinutes(
+        of journey: Journey, at index: Int, cadences: [TimetableCadence]
+    ) -> Int? {
+        guard journey.stops.indices.contains(index),
+              let ref = journey.stops[index].ref else { return nil }
+        let station = StopRegister.stationOf(ref)
+        guard let direction = journey.stops.dropFirst(index + 1).compactMap({ call -> String? in
+            guard let ref = call.ref else { return nil }
+            let next = StopRegister.stationOf(ref)
+            return next == station ? nil : next
+        }).first else { return nil }
+        return cadences.first {
+            $0.mode == journey.mode && $0.line == journey.line && $0.direction == direction
+        }?.minutes
+    }
+
     private func board(
-        name: String, id: String, lon: Double, lat: Double, at now: Timestamp, limit: Int
+        name: String, id: String, lon: Double, lat: Double, at now: Timestamp, limit: Int,
+        preview: Bool = false
     ) -> StationBoard {
         // Which SLOIDs count as "here".
         //
@@ -3835,10 +5199,23 @@ public actor Fleet {
         var hereStations = Set<String>()
         // The kerbs this station is made of, so the mapped routes can be asked
         // about each of them rather than about the point between them.
-        var kerbs: [Coord] = [Coord(lon: lon, lat: lat)]
+        //
+        // Each carries whether it may use the widened rail radius, and only its
+        // numbered platforms do. A whole-station board still names the S-Bahn,
+        // because the platforms it is made of ask for it; what it no longer does
+        // is let the road-side kerbs ask, which at Bern is how a pole on the
+        // Bollwerk came to list the RBS lines running under the forecourt.
+        var kerbs: [ServingPoint] = []
+        // The centre is a point nothing stops at, so it asks as the station: at
+        // a railway station the tracks are genuinely what is here, and at a bus
+        // terminal beside a railway they are not.
+        var stationIsRail = stopPlaces.place(id: id)?.rail ?? false
 
         // Exact, and free: a DIDOK number is `85` plus the SLOID number.
         if let own = StopRegister.sloid(forDidok: id) { hereStations.insert(own) }
+        // Italian / French / German stations are a UIC, not a Swiss SLOID.
+        if id.allSatisfy(\.isNumber) { hereStations.insert(id) }
+        if let code = StopRegister.scheduledStopPointCode(id) { hereStations.insert(code) }
 
         // Sibling stop places first. Most stations are joined below through
         // their registered platforms, but a boat landing has no platform row.
@@ -3852,7 +5229,8 @@ public actor Fleet {
             if let station = StopRegister.sloid(forDidok: place.id) {
                 hereStations.insert(station)
             }
-            kerbs.append(Coord(lon: place.lon, lat: place.lat))
+            if place.rail { stationIsRail = true }
+            kerbs.append(ServingPoint(Coord(lon: place.lon, lat: place.lat), rail: place.rail))
         }
 
         if register.isReady {
@@ -3860,9 +5238,15 @@ public actor Fleet {
             where Self.partOfStation(stop.name, name) {
                 herePlatforms.insert(stop.id)
                 hereStations.insert(StopRegister.stationOf(stop.id))
-                kerbs.append(Coord(lon: stop.lon, lat: stop.lat))
+                kerbs.append(ServingPoint(
+                    Coord(lon: stop.lon, lat: stop.lat), rail: railPlatform(track: stop.platform, at: StopRegister.stationOf(stop.id))
+                ))
             }
         }
+        // First, as it was before the kerbs were added around it: where two
+        // relations carry the same line the nearest one to the tap should be
+        // the one whose direction the row names.
+        kerbs.insert(ServingPoint(Coord(lon: lon, lat: lat), rail: stationIsRail), at: 0)
 
         func callsHere(_ stop: Call) -> Bool {
             if let ref = stop.ref {
@@ -3874,68 +5258,384 @@ public actor Fleet {
             return stop.name == name
         }
 
+        /// Which of a run's calls inside this station the board should name.
+        ///
+        /// A station is a place, not a point, so a run can call at several of
+        /// its stops one after another: tram 3 reaches Bern, Hirschengraben a
+        /// minute before Bern, Bahnhof. Naming the first of those answered
+        /// "what leaves Bern" with a tram *to* Bern — a departure whose whole
+        /// remaining journey never left the station it was listed on. Walk the
+        /// adjacent calls that are all here, and name the one a passenger
+        /// means:
+        ///
+        /// - where they run to the end of the journey, the last of them. It
+        ///   terminates inside this station, so it is an arrival here and not
+        ///   a departure, and the board files it as one.
+        /// - otherwise the station's own stop, if it is among them. Somebody
+        ///   standing at Bern boards at Bern, Bahnhof; the kerb one street
+        ///   earlier is a place the same vehicle happens to pass first.
+        /// - otherwise the first, as before.
+        ///
+        /// Adjacency is the whole of it: a bus that leaves Bern, Bollwerk,
+        /// loops the city for forty minutes and comes back to the station at
+        /// the end of its run still leaves from Bollwerk.
+        func boardCall(_ journey: Journey, from first: Int) -> Int {
+            var last = first
+            while last + 1 < journey.stops.count, callsHere(journey.stops[last + 1]) {
+                last += 1
+            }
+            if last == journey.stops.count - 1 { return last }
+            guard last > first else { return first }
+            return (first...last).first {
+                Self.sameStop(journey.stops[$0].name, name)
+                    || Self.isGenericStationStop(journey.stops[$0].name, stationName: name)
+            } ?? first
+        }
+
         var found: [BoardEntry] = []
-        var listed = Set<String>()
         /// One row for one run, wherever the run was read from.
-        func list(_ journey: Journey) {
-            guard let index = journey.stops.firstIndex(where: callsHere) else { return }
+        var listedRuns = Set<String>()
+        func list(_ input: Journey) {
+            // Packed legs first. Chaining every candidate at Bern used to look
+            // up fifty destination stations (~250 ms each) before a single row
+            // appeared. Through-workings run only on the trimmed list below.
+            let journey = listedJourney(input)
+            guard let first = journey.stops.firstIndex(where: {
+                callsHere($0) && $0.dep >= Clock.displayMinute(now)
+            }) else { return }
+            let index = boardCall(journey, from: first)
+            let occurrence = "\(journey.id)|\(journey.stops[index].sched ?? journey.stops[index].dep)"
+            guard listedRuns.insert(occurrence).inserted else { return }
             let stop = journey.stops[index]
-            // A departure board is about what is leaving, not what left. A
-            // minute of grace covers a vehicle still standing there.
-            if stop.dep < now - 60 { return }
-
-            // Keyed twice, because the same run has two names here. A chained
-            // journey carries its *first* leg's id — an S1 renumbered at
-            // Gümligen is one row on the map and two trips in the file — so the
-            // timetable's own row for the later leg is a different id for a
-            // departure already on the board. The legs are claimed below; the
-            // second key catches whatever chaining did not join.
-            //
-            // That key has to name the whole departure and not just its line
-            // and minute: two directions of a city bus leave the same station
-            // in the same minute all day, and they are two departures.
-            guard listed.insert(journey.id).inserted else { return }
-            guard listed.insert(
-                "\(journey.mode.rawValue)|\(journey.line)|\(stop.dep)|\(stop.ref ?? stop.name)|\(journey.to ?? "")"
-            ).inserted else { return }
-            for part in journey.parts ?? [] { listed.insert(part.id) }
-
-            found.append(BoardEntry(
-                id: journey.id, mode: journey.mode, line: journey.line, to: journey.to,
-                from: journey.stops[0].name, departure: stop.dep, arrival: stop.arr,
-                platform: stop.platform ?? stop.assigned, delay: stop.delay ?? journey.delay,
-                observed: stop.observed,
-                stop: stop.name == name ? nil : stop.name,
-                terminates: index == journey.stops.count - 1,
-                originates: index == 0,
-                running: Positioning.position(of: journey, at: now) != nil
-            ))
-            rememberBoardJourney(journey, departure: stop.dep)
+            found.append(
+                boardEntry(input, journey: journey, at: index, now: now, stationName: name)
+            )
+            rememberBoardJourney(journey, departure: stop.dep, as: input.id)
         }
 
-        // The national feed first, and the mirror's own sightings only if it
-        // had nothing — so a service can never be listed twice.
-        //
-        // Narrowed by identity before anything is measured; see `callers`.
-        // `herePlatforms` needs no key of its own, because every register row
-        // that goes into it puts its own station into `hereStations` beside it.
-        // The mirror is a handful of sightings around one stop and is walked as
-        // it always was.
-        var source = callers(matchingAnyOf: hereStations.union([name]))
-        if !mirrored.isEmpty, !source.contains(where: { $0.stops.contains(where: callsHere) }) {
-            source.append(contentsOf: mirrored.values)
-        }
+        // OJP / mirror first: those still have the foreign tail the packed
+        // Swiss trip dropped, and `list` then skips the truncated duplicate.
+        var source = runs.boardValues
+        source.append(contentsOf: callers(matchingAnyOf: hereStations.union([name])))
         for journey in source { list(journey) }
-        for journey in scheduled(at: hereStations, from: now, filling: found.count, of: limit) {
+        for journey in scheduled(
+            at: hereStations, from: now, filling: found.count, of: limit, preview: preview
+        ) {
             list(journey)
         }
         found.sort { $0.departure < $1.departure }
-
+        found = Self.trim(Self.collapseDuplicateRuns(found).filter { $0.isUpcoming(at: now) }, to: limit)
+        if preview {
+            return StationBoard(
+                id: id, name: StopNaming.display(name), lon: lon, lat: lat, now: now,
+                departures: found
+            )
+        }
+        found = enrichBoardRows(found, now: now, stationName: name, stations: hereStations, callsHere: callsHere)
+        found = Self.trim(Self.collapseDuplicateRuns(found).filter { $0.isUpcoming(at: now) }, to: limit)
         return StationBoard(
-            id: id, name: name, lon: lon, lat: lat, now: now,
-            departures: Self.trim(found, to: limit),
+            id: id, name: StopNaming.display(name), lon: lon, lat: lat, now: now,
+            departures: found,
             serving: servingLines(at: kerbs, besides: found)
         )
+    }
+
+    /// Prefer the RunStore record when live and packed have already merged,
+    /// without walking neighbours. `boardWorking` is the later, slower join.
+    private func listedJourney(_ input: Journey) -> Journey {
+        let resolved = runs.resolve(input)
+        return input.stops.count > resolved.stops.count ? input : resolved
+    }
+
+    private func boardEntry(
+        _ input: Journey, journey: Journey, at index: Int, now: Timestamp, stationName: String,
+        interval: Int? = nil, showStop: Bool = true
+    ) -> BoardEntry {
+        let stop = journey.stops[index]
+        return BoardEntry(
+            id: input.id, mode: journey.mode,
+            line: Journey.badgeLine(input.line, extra: input.extra, mode: input.mode),
+            to: Journey.reachedDestination(journey, from: index),
+            from: StopNaming.display(journey.stops[0].name),
+            departure: stop.dep, arrival: stop.arr,
+            platform: stop.platform ?? stop.assigned, delay: stop.delay ?? journey.delay,
+            observed: stop.observed,
+            // The second line answers "which stop of this station", so it is
+            // worth a line only where the answer is somewhere else. `Bern,
+            // Bahnhof` is the forecourt of Bern: naming it under every tram on
+            // Bern's board repeats the title once per row and buries the one
+            // line that means something — `Bern, Hirschengraben`, which is a
+            // walk away.
+            stop: showStop && !Self.sameListedStop(stop.name, stationName)
+                && !Self.isGenericStationStop(stop.name, stationName: stationName)
+                ? StopNaming.display(stop.name) : nil,
+            terminates: index == journey.stops.count - 1,
+            originates: index == 0,
+            running: Positioning.position(of: journey, at: now) != nil,
+            typicalIntervalMinutes: interval,
+            runIdentity: BoardRunIdentity(journey: journey, at: index)
+        )
+    }
+
+    /// Through-workings and daytime cadence, only for the rows the panel will
+    /// actually draw. The packed list is already on screen.
+    private func enrichBoardRows(
+        _ entries: [BoardEntry], now: Timestamp, stationName: String, stations: Set<String>,
+        callsHere: (Call) -> Bool, showStop: Bool = true
+    ) -> [BoardEntry] {
+        let cadences = timetable?.departureCadences(
+            callingAt: stations, on: Date(timeIntervalSince1970: Double(now))
+        ) ?? []
+        return entries.map { entry in
+            let stored = boardJourneys[BoardJourneyKey(id: entry.id, departure: entry.departure)]
+            guard let stored else {
+                return withInterval(entry, of: nil, cadences: cadences, now: now)
+            }
+            let working = boardWorking(stored, predecessors: true)
+            let booked = entry.runIdentity?.scheduledDeparture ?? entry.departure
+            guard let index = working.stops.firstIndex(where: {
+                callsHere($0) && abs(($0.sched ?? $0.dep) - booked) <= 30
+            }) else {
+                return withInterval(entry, of: stored, cadences: cadences, now: now)
+            }
+            rememberBoardJourney(working, departure: working.stops[index].dep, as: entry.id)
+            var out = boardEntry(
+                stored, journey: working, at: index, now: now, stationName: stationName,
+                interval: intervalMinutes(of: working, at: index, cadences: cadences),
+                showStop: showStop
+            )
+            if entry.delay != nil {
+                out.delay = entry.delay
+                out.departure = entry.departure
+                out.arrival = entry.arrival
+                out.observed = entry.observed
+                out.platform = entry.platform ?? out.platform
+            }
+            return out
+        }
+    }
+
+    private func withInterval(
+        _ entry: BoardEntry, of journey: Journey?, cadences: [TimetableCadence], now _: Timestamp
+    ) -> BoardEntry {
+        var out = entry
+        if let journey, let index = journey.stops.firstIndex(where: {
+            ($0.sched ?? $0.dep) == (entry.runIdentity?.scheduledDeparture ?? entry.departure)
+        }) {
+            out.typicalIntervalMinutes = intervalMinutes(of: journey, at: index, cadences: cadences)
+        } else if let journey, let index = journey.stops.firstIndex(where: { $0.dep == entry.departure }) {
+            out.typicalIntervalMinutes = intervalMinutes(of: journey, at: index, cadences: cadences)
+        }
+        return out
+    }
+
+    /// The through-working a board should name.
+    ///
+    /// Packed GTFS splits a physical train at a junction — RE1 Frutigen→Spiez
+    /// continues Spiez→Bern under a new trip id — so a row built from the
+    /// printed leg says Spiez while the panel, which opens the chained vehicle,
+    /// says Bern. Prefer the chained vehicle, then unique same-line neighbours
+    /// from the packed timetable. Look backwards as well as forwards: opening
+    /// the Spiez→Brig numbered working still started in Bern.
+    func boardWorking(_ input: Journey, predecessors: Bool = true) -> Journey {
+        _ = fleetByID()
+        if throughRevision != revision {
+            throughWorkings.removeAll(keepingCapacity: true)
+            neighbourCandidates.removeAll(keepingCapacity: true)
+            throughRevision = revision
+        }
+        let resolved = runs.resolve(input)
+        let base = input.stops.count > resolved.stops.count ? input : resolved
+        let live = fleetVehicle(matching: base) ?? currentVehicle(containing: base)
+        var seed = live
+        if base.stops.count > seed.stops.count { seed = base }
+        if input.stops.count > seed.stops.count { seed = input }
+        if predecessors,
+           let cached = throughWorkings[Self.throughKey(seed)] ?? throughWorkings[Self.throughKey(input)],
+           cached.stops.count >= seed.stops.count {
+            return cached
+        }
+        var legs = [seed]
+        // Predecessors are for the opened panel ("from Bern" on the Spiez
+        // numbered working). A station board that asked this for every row
+        // spent half a minute at Bern querying the origin of each departure.
+        if predecessors {
+            while legs.count < Chains.maxChainLength,
+                  let prev = boardNeighbour(of: legs[0], forward: false) {
+                if legs.contains(where: { $0.id == prev.id }) { break }
+                legs.insert(prev, at: 0)
+            }
+        }
+        while legs.count < Chains.maxChainLength,
+              (predecessors || Self.needsForwardContinuation(legs[legs.count - 1])),
+              let next = boardNeighbour(of: legs[legs.count - 1], forward: true) {
+            if legs.contains(where: { $0.id == next.id }) { break }
+            legs.append(next)
+        }
+        let working = legs.count == 1 ? seed : Chains.join(legs)
+        if predecessors { rememberThrough(working, keys: [seed, input, working]) }
+        return working
+    }
+
+    private static func throughKey(_ journey: Journey) -> String {
+        "\(journey.id)|\(journey.start)"
+    }
+
+    private func packedCallers(
+        _ timetable: TimetableStore, station: String, from: Timestamp, until: Timestamp
+    ) -> [Journey] {
+        let quantum: Timestamp = 5 * 60
+        let qFrom = from / quantum * quantum
+        let qUntil = ((until + quantum - 1) / quantum) * quantum
+        let key = "\(station)|\(qFrom)|\(qUntil)"
+        if let cached = neighbourCandidates[key] { return cached }
+        let found = timetable.journeys(
+            callingAt: [station],
+            from: qFrom,
+            to: qUntil,
+            limit: 80,
+            place: { [register] stop in register.lookup(stop) },
+            operatorName: { [operators] agency in operators.name(for: agency) }
+        )
+        neighbourCandidates[key] = found
+        return found
+    }
+
+    /// Packed split headsigns already name the passenger destination. Trams
+    /// and buses that end where they advertise do not need a neighbour search;
+    /// trains still might (RE1 4157 advertises Spiez and continues as 4257).
+    private static func needsForwardContinuation(_ journey: Journey) -> Bool {
+        if journey.to?.contains("|") == true { return false }
+        switch journey.mode {
+        case .train, .metro: return true
+        default: return false
+        }
+    }
+
+    private func rememberThrough(_ working: Journey, keys: [Journey]) {
+        for journey in keys { throughWorkings[Self.throughKey(journey)] = working }
+        for part in working.parts ?? [] {
+            let start = working.stops.indices.contains(part.start)
+                ? working.stops[part.start].dep : working.start
+            throughWorkings["\(part.id)|\(start)"] = working
+        }
+    }
+
+    /// Unique packed neighbour of this numbered leg, or nil when the working
+    /// begins or ends here.
+    private func boardNeighbour(of journey: Journey, forward: Bool) -> Journey? {
+        guard let edge = forward ? journey.stops.last : journey.stops.first else { return nil }
+        let junction = Chains.stationKey(edge)
+        // What the feed says, if it says anything. Where it does, the scoring
+        // below is not consulted at all — not as a tie-break and not as a
+        // fallback. Two RE1s leave Spiez within the ambiguity margin and the
+        // score cannot tell them apart, which is exactly the case where the
+        // feed names the right one outright.
+        let declared = publishedNeighbourNames(of: journey, forward: forward)
+        var stated: [Journey] = []
+        var best: (journey: Journey, score: Int)?
+        var runnerUp = Int.max
+        var considered: [Journey] = []
+        func consider(_ input: Journey) {
+            let inputEdge = forward ? input.stops.first : input.stops.last
+            guard let inputEdge, Chains.stationKey(inputEdge) == junction else { return }
+            // The map and packed lookup can return the same occurrence, and
+            // OJP can give it another ID. Rank operating runs, not copies:
+            // otherwise the duplicate becomes its own ambiguous runner-up.
+            // Resolve first so a stale packed copy cannot override live data.
+            let candidate = runs.resolve(input)
+            guard candidate.id != journey.id else { return }
+            let otherEdge = forward ? candidate.stops.first : candidate.stops.last
+            guard let otherEdge, Chains.stationKey(otherEdge) == junction else { return }
+            guard !considered.contains(where: { RunStore.matches($0, candidate) }) else { return }
+            considered.append(candidate)
+            if !declared.isEmpty {
+                let names = Self.edgeNames(of: candidate, forward: !forward)
+                // The same turnaround caveat as the map's: the feed publishes a
+                // bus continuing as its own return working, and joining those
+                // halves gives the panel a run that goes out and back.
+                if names.contains(where: { declared.contains($0.lowercased()) }),
+                   Chains.carriesOn(forward ? journey : candidate, forward ? candidate : journey) {
+                    stated.append(candidate)
+                }
+                return
+            }
+            let earlier = forward ? journey : candidate
+            let later = forward ? candidate : journey
+            guard var score = Chains.candidateScore(earlier, later)
+                    ?? Chains.passengerContinuationScore(earlier, later)
+            else { return }
+            // The incoming headsign "Brig | Zweisimmen" names the portions.
+            // Prefer the continuation that actually goes to one of them when
+            // two RE1s leave Spiez in the same window.
+            let advertised = earlier.to
+            if let advertised, advertised.contains("|") {
+                let wanted = advertised.split(separator: "|").map {
+                    $0.trimmingCharacters(in: .whitespaces)
+                }
+                if let dest = later.to ?? later.stops.last?.name,
+                   wanted.contains(where: { StopNaming.sameBoardDestination(dest, $0) }) {
+                    score -= 60
+                }
+            }
+            if let held = best {
+                if score < held.score {
+                    runnerUp = held.score
+                    best = (candidate, score)
+                } else if score < runnerUp {
+                    runnerUp = score
+                }
+            } else {
+                best = (candidate, score)
+            }
+        }
+
+        let keys = [edge.ref.map { StopRegister.stationOf($0) }, edge.name]
+            .compactMap { $0 }.filter { !$0.isEmpty }
+        for candidate in callers(matchingAnyOf: keys) { consider(candidate) }
+
+        // Always ask the packed file, not only when the map fleet is empty.
+        // Callers at a junction like Spiez are often two RE1s a few minutes
+        // apart; that used to look like ambiguity and skip the timetable,
+        // leaving the board on the numbered leg's last stop.
+        if let timetable, register.isReady, let ref = edge.ref {
+            let station = StopRegister.stationOf(ref)
+            let from = forward ? edge.arr : edge.dep - Chains.maxGapSameLine
+            let until = forward ? edge.arr + Chains.maxGapSameLine : edge.dep
+            if !station.isEmpty, until > from {
+                for candidate in packedCallers(
+                    timetable, station: station, from: from, until: until
+                ) { consider(candidate) }
+            }
+        }
+
+        if !declared.isEmpty {
+            if stated.count == 1 { return stated[0] }
+            // **Forward, a working that parts keeps nothing.** RE1 4177 leaves
+            // Bern advertising "Domodossola (I) | Zweisimmen" and comes apart at
+            // Spiez into RE1 4277 and R11 6829. Folding in the half that keeps
+            // the line number reads as a train that runs through to Domodossola,
+            // and that is a worse answer than a short one: the Zweisimmen half
+            // is then a destination the card names in its title and cannot
+            // show, the direction picker has one direction in it, and the map
+            // draws one line down the Lötschberg for a train that is two.
+            // The trunk therefore ends where the train does, and both halves
+            // are offered beside it — see `AppModel.loadBranches`, which is what
+            // the stop list, the picker and the extra map lines are built from.
+            //
+            // **Backward, a join still answers.** Two trains coupling are one
+            // train leaving, and the reader's own coaches came from one of
+            // them: the half that keeps the line is the working this one
+            // continues, the same rule the map uses in
+            // `Chains.continuation(of:among:preferredID:at:)`.
+            guard !forward else { return nil }
+            let sameLine = stated.filter { $0.line == journey.line && !journey.line.isEmpty }
+            return sameLine.count == 1 ? sameLine[0] : nil
+        }
+
+        guard let best, runnerUp == Int.max || runnerUp - best.score >= Chains.ambiguityMargin
+        else { return nil }
+        return best.journey
     }
 
     /// How far ahead a board reads when the drawn fleet runs out.
@@ -3954,6 +5654,10 @@ public actor Fleet {
     /// the last boat of the evening from an afternoon. It costs an integer
     /// rejection per trip of the day and stops as soon as the board is full.
     public static let boardHorizon: TimeInterval = 24 * 3600
+    /// First paint of a station card: the next couple of hours, packed only.
+    /// Night buses and through-destinations arrive on the full read that
+    /// replaces this.
+    public static let boardPreviewHorizon: TimeInterval = 2 * 3600
 
     /// How deep into the schedule a board reads before it is trimmed.
     ///
@@ -3963,33 +5667,131 @@ public actor Fleet {
     /// at 23:15, the 17 and the 19 fill forty rows before the Moonliner's 01:45
     /// is reached.
     static let boardDepth = 240
+    static let boardPreviewDepth = 80
 
     /// The board, trimmed so a frequent line cannot crowd out a rare one.
     ///
-    /// A count alone is the wrong cap for this panel, because the panel groups:
-    /// forty rows of a bus every seven minutes draw as two rows with a
-    /// disclosure on them, and the Moonliner that leaves stop M at 01:45 —
-    /// which is the whole reason to look at that kerb at midnight — falls off
-    /// the end of a list it was never really competing for. So the count is
-    /// kept, and after it every service still unrepresented gets its next
-    /// departure, up to a ceiling on how many a board is.
+    /// A count alone is the wrong cap, because the panel groups: forty rows of
+    /// a bus every seven minutes draw as two rows with a disclosure on them.
+    /// The next departure of *every* service that calls here is kept, even when
+    /// that is more rows than `limit`. Remaining slots are later runs of the
+    /// busy lines, so the disclosure still fills.
     ///
-    /// Keyed as the panel groups — see `DepartureGroup.group`, which draws one
-    /// row per line, destination and kerb.
-    static func trim(_ entries: [BoardEntry], to limit: Int, services: Int = 24) -> [BoardEntry] {
-        guard entries.count > limit else { return entries }
-        var seen = Set<String>()
+    /// Keyed as the panel groups — see `DepartureGroup.group`.
+    /// Shared by station, platform and platform-shape boards. Match the
+    /// operating run and booked call before normalising the display label.
+    /// Presentation still has to collapse: `RunStore` keeps ambiguous
+    /// lookalikes distinct, and a board lists every source until this runs.
+    static func collapseDuplicateRuns(_ entries: [BoardEntry]) -> [BoardEntry] {
         var out: [BoardEntry] = []
-        out.reserveCapacity(limit)
-        for entry in entries {
-            let key = "\(entry.mode.rawValue)|\(entry.line)|\(entry.to ?? "")|\(entry.stop ?? "")"
-            let known = !seen.insert(key).inserted
-            // Inside the count, everything; past it, only a service the board
-            // has not named yet, and only while it is still a board rather than
-            // a timetable.
-            if out.count >= limit, known || seen.count > services { continue }
-            out.append(entry)
+        out.reserveCapacity(entries.count)
+        // Compare only neighbouring booked minutes at the same station. A day
+        // of departures otherwise reparses/compares every run with every other.
+        var buckets: [String: Set<Int>] = [:]
+        func bucket(_ entry: BoardEntry, minute: Int) -> String {
+            let station = entry.runIdentity?.station ?? "id:" + entry.id
+            return "\(entry.mode.rawValue)|\(station)|\(entry.terminates)|\(minute)"
         }
+        for var entry in entries {
+            entry.line = Journey.publishedLine(entry.line, mode: entry.mode)
+            let minute = (entry.runIdentity?.scheduledDeparture ?? entry.departure) / 60
+            var candidates = Set<Int>()
+            for nearby in (minute - 1)...(minute + 1) {
+                candidates.formUnion(buckets[bucket(entry, minute: nearby)] ?? [])
+            }
+            let index: Int
+            if let i = candidates.sorted().first(where: { isSameWorking(out[$0], entry) }) {
+                out[i] = preferredWorking(out[i], entry)
+                index = i
+            } else {
+                index = out.count
+                out.append(entry)
+            }
+            buckets[bucket(entry, minute: minute), default: []].insert(index)
+        }
+        return out.sorted { ($0.departure, $0.id) < ($1.departure, $1.id) }
+    }
+
+    static func isSameWorking(_ a: BoardEntry, _ b: BoardEntry) -> Bool {
+        guard a.mode == b.mode, a.terminates == b.terminates else { return false }
+        if let first = a.runIdentity, let second = b.runIdentity {
+            return first.matches(second)
+        }
+        // Older callers without journey metadata can only prove exact identity.
+        return a.id == b.id && a.departure == b.departure && a.stop == b.stop
+    }
+
+    static func preferredWorking(_ a: BoardEntry, _ b: BoardEntry) -> BoardEntry {
+        let keep: BoardEntry
+        let drop: BoardEntry
+        let aLive = a.runIdentity?.source == "ojp" && a.delay != nil
+        let bLive = b.runIdentity?.source == "ojp" && b.delay != nil
+        if aLive != bLive {
+            keep = aLive ? a : b
+            drop = aLive ? b : a
+        } else if let first = a.runIdentity, let second = b.runIdentity,
+           first.onward.last?.station != second.onward.last?.station,
+           first.onward.count != second.onward.count {
+            keep = first.onward.count > second.onward.count ? a : b
+            drop = first.onward.count > second.onward.count ? b : a
+        } else if a.running != b.running {
+            keep = a.running ? a : b
+            drop = a.running ? b : a
+        } else if a.observed != b.observed {
+            keep = a.observed ? a : b
+            drop = a.observed ? b : a
+        } else if (a.delay == nil) != (b.delay == nil) {
+            keep = a.delay != nil ? a : b
+            drop = a.delay != nil ? b : a
+        } else {
+            let chooseA = a.runIdentity?.timetabled != b.runIdentity?.timetabled
+                ? a.runIdentity?.timetabled == true
+                : (a.line.count, a.id) <= (b.line.count, b.id)
+            keep = chooseA ? a : b
+            drop = chooseA ? b : a
+        }
+        var out = keep
+        let live = [keep, drop].first { $0.delay != nil }
+            ?? [keep, drop].first { $0.observed }
+        if let live {
+            out.departure = live.departure
+            out.arrival = live.arrival
+            out.delay = live.delay
+            out.observed = live.observed
+            out.platform = live.platform ?? out.platform
+        }
+        if out.platform == nil { out.platform = drop.platform }
+        if out.typicalIntervalMinutes == nil { out.typicalIntervalMinutes = drop.typicalIntervalMinutes }
+        if let other = drop.runIdentity { out.runIdentity?.includeAliases(of: other) }
+        out.line = Journey.publishedLine(out.line, mode: out.mode)
+        return out
+    }
+
+    static func trim(_ entries: [BoardEntry], to limit: Int) -> [BoardEntry] {
+        guard entries.count > limit else { return entries }
+        var counts: [String: Int] = [:]
+        var firsts: [BoardEntry] = []
+        var extras: [BoardEntry] = []
+        firsts.reserveCapacity(min(entries.count, limit))
+        for entry in entries {
+            let line = Journey.publishedLine(entry.line, mode: entry.mode)
+            let dest = squash(localDestination(entry.to ?? ""))
+            let key = "\(entry.mode.rawValue)|\(line)|\(dest)|\(entry.stop ?? "")"
+            // The main list groups services. Keep a following occurrence for
+            // each one before frequent buses consume the remaining row budget;
+            // otherwise fixing a label alias also erases its disclosure times.
+            let count = counts[key, default: 0]
+            counts[key] = count + 1
+            if count < 2 {
+                firsts.append(entry)
+            } else {
+                extras.append(entry)
+            }
+        }
+        guard firsts.count < limit else { return firsts }
+        var out = firsts
+        out.append(contentsOf: extras.prefix(limit - firsts.count))
+        out.sort { $0.departure < $1.departure }
         return out
     }
 
@@ -3999,32 +5801,74 @@ public actor Fleet {
     /// Deliberately not folded into `journeys`: these are rows for a panel, not
     /// vehicles for the map. Adding them to the store would draw tomorrow's
     /// first bus on today's map and would have to be undrawn again on the next
-    /// tick, so they are built, read, and dropped.
+    /// tick. They enter the shared run registry without joining the active map.
     ///
-    /// Asked only when the board has room. A station whose live board is
-    /// already full has nothing to gain from the schedule, and skipping it
-    /// there is what keeps a tap on Bern as cheap as it was.
+    /// Always asked. A station whose live board is already "full" is exactly
+    /// the one that used to hide an hourly train: the next sixty rows were the
+    /// seven-minute tram, and the scan never reached S44. The timetable walk
+    /// keeps one upcoming trip per pattern past that count, so a busy station
+    /// still names every service that calls.
     ///
     /// `accepting` narrows the query from the station to the stops a *platform*
     /// board is about. Without it the schedule spends the board's whole budget
     /// on the station's other kerbs — see `TimetableStore.patterns`.
-    private func scheduled(
+    func scheduled(
         at stations: Set<String>, key: String? = nil, accepting: ((String) -> Bool)? = nil,
-        from now: Timestamp, filling count: Int, of limit: Int
+        from now: Timestamp, filling count: Int, of limit: Int, preview: Bool = false
     ) -> [Journey] {
-        guard count < limit, !stations.isEmpty, register.isReady,
+        guard !stations.isEmpty, register.isReady,
               let timetable, timetable.isReady
         else { return [] }
+        let horizon = preview ? Self.boardPreviewHorizon : Self.boardHorizon
+        let depth = preview ? Self.boardPreviewDepth : Self.boardDepth
         return timetable.journeys(
             callingAt: stations,
             key: key,
             accepting: accepting,
             from: now,
-            to: now + Timestamp(Self.boardHorizon),
-            limit: max(limit, Self.boardDepth) - count,
+            to: now + Timestamp(horizon),
+            limit: preview ? depth : max(max(limit, count), depth),
+            keepHiddenPatterns: !preview,
             place: { [register] ref in register.lookup(ref) },
             operatorName: { [operators] agency in operators.name(for: agency) }
-        )
+        ).map { runs.ingest($0) }
+    }
+
+    /// A point the serving lines are asked about, and whether the widened rail
+    /// radius may be spent on it.
+    ///
+    /// The flag is not "is this station a railway station" — at Bern that is
+    /// true of the bus poles on the forecourt too, which is the whole problem.
+    /// It is "is this point a railway platform", which is decided by
+    /// `Fleet.railPlatform(_:)` from the register.
+    public struct ServingPoint: Sendable, Equatable {
+        public var coord: Coord
+        public var rail: Bool
+
+        public init(_ coord: Coord, rail: Bool = false) {
+            self.coord = coord
+            self.rail = rail
+        }
+    }
+
+    /// Whether a registered stop is a railway platform, and so may ask the
+    /// mapped routes about itself at `servingRailSpread` rather than at
+    /// `servingSpread`.
+    ///
+    /// Two tests, both on data already held, and both required:
+    ///
+    /// - the track is numbered. The register codes a railway track with digits
+    ///   — Bern's platform 5 is `5` and its sectors are `7A-D` — and a station's
+    ///   road-side kerbs with letters: `Z`, `K1`. `trackOf` already reduces the
+    ///   sectors to their track, and `coveredTracks` already relies on the same
+    ///   convention to decide which platforms a drawn shape replaces.
+    /// - the station is a railway station. Without this a numbered bay at a bus
+    ///   terminal beside a railway would reach the same 120 m for the same wrong
+    ///   reason.
+    func railPlatform(track code: String?, at station: String) -> Bool {
+        guard let track = StopRegister.trackOf(code),
+              !track.isEmpty, track.allSatisfy(\.isNumber) else { return false }
+        return stopPlaces.place(id: station)?.rail ?? false
     }
 
     /// How far a mapped call may be from a kerb and still be that kerb's call.
@@ -4036,6 +5880,17 @@ public actor Fleet {
     /// where nothing is mapped within 30 m the list is empty, which is the
     /// honest answer rather than a nearby one.
     static let servingSpread = 30.0
+    /// Railway stop nodes sit on the platform, often tens of metres from the
+    /// register point used for a tap. Thirty metres is the right kerb radius
+    /// and misses an S-Bahn at a station the size of Bern.
+    ///
+    /// Only a numbered track at a railway station may use it — see
+    /// `ServingPoint`. Applied to every point instead, it made the bus kerbs of
+    /// a main station inherit the railway under them: Bern's stop Z is a pole
+    /// on the Bollwerk and the RBS platforms are directly beneath the forecourt
+    /// beside it, so a 120 m circle from the pole reached their stop nodes and
+    /// the kerb's board announced four S-Bahn lines "through here".
+    static let servingRailSpread = 120.0
 
     /// The lines the mapped routes say call at any of these points.
     ///
@@ -4045,16 +5900,29 @@ public actor Fleet {
     /// misses a side of the street or grows wide enough to sweep in the next
     /// stop along. The kerbs come from the register by identifier, and each is
     /// asked about on its own.
-    public func servingLines(at points: [Coord]) -> [ServingLine] {
+    public func servingLines(at points: [ServingPoint]) -> [ServingLine] {
         guard relations.isReady, !points.isEmpty else { return [] }
         var seen = Set<String>()
         var out: [ServingLine] = []
-        for point in points {
-            for line in relations.linesStopping(
-                lon: point.lon, lat: point.lat, within: Self.servingSpread
-            ) where seen.insert("\(line.mode.rawValue)|\(line.ref)").inserted {
+        func add(_ lines: [ServingLine]) {
+            for line in lines where seen.insert("\(line.mode.rawValue)|\(line.ref)").inserted {
                 out.append(line)
             }
+        }
+        for point in points {
+            add(relations.linesStopping(
+                lon: point.coord.lon, lat: point.coord.lat, within: Self.servingSpread, limit: 80
+            ))
+            // Train stop nodes at a main station sit on the platform, often
+            // farther from the tapped point than a bus kerb is. The wider circle
+            // is why a railway platform finds its S-Bahn at all, and it is spent
+            // only on the points that are themselves railway platforms, so a
+            // lettered bay does not inherit the tracks it stands over.
+            guard point.rail else { continue }
+            add(relations.linesStopping(
+                lon: point.coord.lon, lat: point.coord.lat,
+                within: Self.servingRailSpread, limit: 80
+            ).filter { $0.mode == .train || $0.mode == .metro })
         }
         return out.sorted {
             let a = Int($0.ref.prefix { $0.isNumber }), b = Int($1.ref.prefix { $0.isNumber })
@@ -4077,9 +5945,9 @@ public actor Fleet {
     /// digits and not on its decoration: the feed's `S 1` and the relation's
     /// `S1` are one line. Where the mode disagrees the row survives, which errs
     /// towards showing a line twice rather than hiding one that runs.
-    func servingLines(at points: [Coord], besides departures: [BoardEntry]) -> [ServingLine] {
+    func servingLines(at points: [ServingPoint], besides departures: [BoardEntry]) -> [ServingLine] {
         func key(_ mode: Mode, _ ref: String) -> String {
-            "\(mode.rawValue)|\(RelationStore.normaliseRef(ref))"
+            "\(mode.rawValue)|\(Journey.publishedLine(ref, mode: mode))"
         }
         let live = Set(departures.map { key($0.mode, $0.line) })
         return servingLines(at: points).filter { !live.contains(key($0.mode, $0.ref)) }
@@ -4151,8 +6019,10 @@ public actor Fleet {
     }
 
     /// The board for whichever platform a plate names.
-    public func plateBoard(id: String, at now: Timestamp) -> PlatformBoard? {
-        platformBoard(ref: id, at: now)
+    public func plateBoard(
+        id: String, at now: Timestamp, loadingOnly: Bool = false, preview: Bool = false
+    ) -> PlatformBoard? {
+        platformBoard(ref: id, at: now, loadingOnly: loadingOnly, preview: preview)
     }
 
     /// What calls at one platform, soonest first.
@@ -4161,44 +6031,53 @@ public actor Fleet {
     /// rather than a proximity guess — the same identifier join that places the
     /// vehicles. Where a journey names the station rather than the platform,
     /// the platform *code* is compared instead, sectors aside.
-    public func platformBoard(ref: String, at now: Timestamp, limit: Int = 40) -> PlatformBoard? {
+    public func platformBoard(
+        ref: String, at now: Timestamp, limit: Int = 40,
+        loadingOnly: Bool = false, preview: Bool = false
+    ) -> PlatformBoard? {
         guard register.isReady, let place = register.lookup(ref) else { return nil }
         let station = StopRegister.stationOf(ref)
 
-        var departures: [BoardEntry] = []
-        var listed = Set<String>()
-        /// One row for one run — see the station board's `list`, which this is.
-        func list(_ journey: Journey) {
-            for (i, stop) in journey.stops.enumerated() {
-                let here = stop.ref == ref || (
-                    stop.ref != nil && place.platform != nil
-                        && StopRegister.sameTrack(stop.platform, place.platform)
-                        && StopRegister.stationOf(stop.ref) == station
-                )
-                guard here else { continue }
-                if stop.dep < now - 300 { continue } // already gone
-                guard listed.insert(journey.id).inserted else { return }
-                guard listed.insert(
-                    "\(journey.mode.rawValue)|\(journey.line)|\(stop.dep)|\(journey.to ?? "")"
-                ).inserted else { return }
-                for part in journey.parts ?? [] { listed.insert(part.id) }
+        if loadingOnly {
+            return PlatformBoard(
+                id: ref, name: place.name, code: place.platform, assigned: place.assigned,
+                lon: place.lon, lat: place.lat, now: now, departures: [],
+                rail: stopPlaces.place(id: station)?.rail ?? false,
+                stationOnly: false, isLoading: true
+            )
+        }
 
-                departures.append(BoardEntry(
-                    id: journey.id, mode: journey.mode, line: journey.line, to: journey.to,
-                    from: journey.stops[0].name, departure: stop.dep, arrival: stop.arr,
-                    platform: stop.platform ?? place.platform, delay: stop.delay ?? journey.delay,
-                    observed: stop.observed, stop: nil,
-                    terminates: i == journey.stops.count - 1, originates: i == 0,
-                    running: Positioning.position(of: journey, at: now) != nil
-                ))
-                rememberBoardJourney(journey, departure: stop.dep)
-                return
-            }
+        func callsHere(_ stop: Call) -> Bool {
+            stop.ref == ref || (
+                stop.ref != nil && place.platform != nil
+                    && StopRegister.sameTrack(stop.platform, place.platform)
+                    && StopRegister.stationOf(stop.ref) == station
+            )
+        }
+
+        var departures: [BoardEntry] = []
+        /// One row for one run — see the station board's `list`, which this is.
+        var listedRuns = Set<String>()
+        func list(_ input: Journey) {
+            let journey = listedJourney(input)
+            guard let i = journey.stops.firstIndex(where: {
+                callsHere($0) && $0.dep >= Clock.displayMinute(now)
+            }) else { return }
+            let stop = journey.stops[i]
+            let occurrence = "\(journey.id)|\(stop.sched ?? stop.dep)"
+            guard listedRuns.insert(occurrence).inserted else { return }
+            departures.append(
+                boardEntry(
+                    input, journey: journey, at: i, now: now, stationName: place.name, showStop: false
+                )
+            )
+            rememberBoardJourney(journey, departure: stop.dep, as: input.id)
         }
 
         // Both ways a call can belong to this platform put it at this station,
         // so the station's own callers are the whole candidate set. See
         // `callers`: without it this walks every call in the country.
+        for journey in runs.boardValues { list(journey) }
         for journey in callers(matchingAnyOf: [station]) { list(journey) }
         // And the printed timetable for the rest of the day, for the same
         // reason the station board asks: a platform is quieter than the station
@@ -4215,11 +6094,19 @@ public actor Fleet {
                         && StopRegister.sameTrack(register.lookup(candidate)?.platform, place.platform)
                 )
             },
-            from: now, filling: departures.count, of: limit
+            from: now, filling: departures.count, of: limit, preview: preview
         ) {
             list(journey)
         }
         departures.sort { $0.departure < $1.departure }
+        departures = Self.trim(Self.collapseDuplicateRuns(departures).filter { $0.isUpcoming(at: now) }, to: limit)
+        if !preview {
+            departures = enrichBoardRows(
+                departures, now: now, stationName: place.name,
+                stations: [station], callsHere: callsHere, showStop: false
+            )
+            departures = Self.trim(Self.collapseDuplicateRuns(departures).filter { $0.isUpcoming(at: now) }, to: limit)
+        }
 
         let rail = stopPlaces.place(id: station)?.rail
             ?? departures.contains { $0.mode == .train }
@@ -4227,10 +6114,14 @@ public actor Fleet {
         return PlatformBoard(
             id: ref, name: place.name, code: place.platform, assigned: place.assigned,
             lon: place.lon, lat: place.lat, now: now,
-            departures: Self.trim(departures, to: limit), rail: rail,
+            departures: departures, rail: rail,
             stationOnly: false,
-            serving: servingLines(
-                at: [Coord(lon: place.lon, lat: place.lat)], besides: departures
+            serving: preview ? [] : servingLines(
+                at: [ServingPoint(
+                    Coord(lon: place.lon, lat: place.lat),
+                    rail: railPlatform(track: place.platform, at: station)
+                )],
+                besides: departures
             )
         )
     }
@@ -4255,18 +6146,19 @@ public actor Fleet {
     /// between tracks 1 and 2 is a single OSM relation tagged `ref="1;2"` — and
     /// standing on it you can board from either side. So the board is the union
     /// of its tracks.
-    public func shapeBoard(osmId: String, at now: Timestamp) -> PlatformBoard? {
+    public func shapeBoard(
+        osmId: String, at now: Timestamp, loadingOnly: Bool = false, preview: Bool = false
+    ) -> PlatformBoard? {
         guard let shape = platforms.lookup(osmId) else { return nil }
-        let boards = shape.sloids.compactMap { platformBoard(ref: $0, at: now) }
+        let boards = shape.sloids.compactMap {
+            platformBoard(ref: $0, at: now, loadingOnly: loadingOnly, preview: preview)
+        }
         guard let first = boards.first else { return nil }
 
         var departures: [BoardEntry] = []
-        var seen = Set<String>()
+        var events = Set<String>()
         for board in boards {
-            for entry in board.departures where !seen.contains(entry.id) {
-                seen.insert(entry.id)
-                departures.append(entry)
-            }
+            departures.append(contentsOf: board.departures.filter { events.insert($0.eventID).inserted })
         }
         departures.sort { $0.departure < $1.departure }
 
@@ -4274,15 +6166,27 @@ public actor Fleet {
             id: shape.sloids[0], name: shape.name,
             code: shape.codes.filter { !$0.isEmpty }.joined(separator: " · "),
             assigned: nil, lon: first.lon, lat: first.lat, now: now,
-            departures: Self.trim(departures, to: 40), rail: first.rail,
+            departures: Self.trim(Self.collapseDuplicateRuns(departures), to: 40), rail: first.rail,
             stationOnly: shape.stationOnly,
             // Asked again for the whole shape rather than unioning the tracks'
             // lists: a line live at one track and idle at the other is running
             // here, and each track's own list only knows about its own board.
-            serving: servingLines(
-                at: [Coord(lon: first.lon, lat: first.lat)], besides: departures
+            serving: loadingOnly || preview ? [] : servingLines(
+                at: [ServingPoint(
+                    Coord(lon: first.lon, lat: first.lat),
+                    // A shape covering several tracks is a railway platform if
+                    // any of them is one: standing on it you board from either
+                    // side, which is the same reason the board is their union.
+                    rail: shape.sloids.enumerated().contains { i, sloid in
+                        railPlatform(
+                            track: i < shape.codes.count ? shape.codes[i] : nil,
+                            at: StopRegister.stationOf(sloid)
+                        )
+                    }
+                )],
+                besides: departures
             ),
-            shape: osmId
+            isLoading: loadingOnly, shape: osmId
         )
     }
 
@@ -4308,10 +6212,18 @@ public actor Fleet {
     /// keyed on. Answering by nearest station instead is what returned Marzili
     /// for a tap on Zytglogge — the blobs are large and their centres are not
     /// where their name is.
-    public func stationBoard(osmId: String, at now: Timestamp, limit: Int = 60) -> StationBoard? {
+    public func stationBoard(
+        osmId: String, at now: Timestamp, limit: Int = 60,
+        loadingOnly: Bool = false, preview: Bool = false
+    ) -> StationBoard? {
         guard let uic = platforms.station(for: osmId) else { return nil }
         if let place = stopPlaces.place(id: uic) {
-            return stationBoard(placeId: place.id, at: now, limit: limit)
+            var result = stationBoard(
+                placeId: place.id, at: now, limit: limit,
+                loadingOnly: loadingOnly, preview: preview
+            )
+            result?.shape = osmId
+            return result
         }
         // A station abroad is in neither the drawn stop places nor the Swiss
         // numbering — Milano Centrale is a UIC and nothing else — but the
@@ -4319,7 +6231,15 @@ public actor Fleet {
         guard let ref = StopRegister.sloid(forDidok: uic) ?? (uic.allSatisfy(\.isNumber) ? uic : nil),
               let place = register.lookup(ref)
         else { return nil }
-        return board(name: place.name, id: uic, lon: place.lon, lat: place.lat, at: now, limit: limit)
+        var result = loadingOnly
+            ? StationBoard.loading(id: uic, name: place.name,
+                                   at: Coord(lon: place.lon, lat: place.lat), now: now)
+            : board(
+                name: place.name, id: uic, lon: place.lon, lat: place.lat,
+                at: now, limit: limit, preview: preview
+            )
+        result.shape = osmId
+        return result
     }
 
     /// Vehicles whose mapped route runs over any of these OSM ways.
@@ -4348,7 +6268,9 @@ public actor Fleet {
             guard let ways = journey.geometry?.ways, ways.contains(where: { wanted.contains($0) }) else { continue }
 
             out.append(BoardEntry(
-                id: journey.id, mode: journey.mode, line: journey.line, to: journey.to,
+                id: journey.id, mode: journey.mode,
+                line: Journey.badgeLine(journey.line, extra: journey.extra, mode: journey.mode),
+                to: Journey.reachedDestination(journey),
                 from: journey.from, departure: journey.stops[0].dep,
                 arrival: journey.stops[journey.stops.count - 1].arr,
                 platform: nil, delay: journey.delay, observed: false, stop: nil,
@@ -4373,6 +6295,29 @@ public actor Fleet {
         relations.isReady ? relations.linesNear(lon: lon, lat: lat, within: metres) : []
     }
 
+    /// Railway platform positions used to keep covered station tracks visible.
+    public func tunnelStationPoints(in bbox: BBox) -> [Coord] {
+        let box = bbox.padded(byMetres: TunnelIndex.stationHalfLength)
+        let stations = stopPlaces.within(box, railOnly: true, limit: .max)
+        let refs = Set(stations.compactMap { StopRegister.sloid(forDidok: $0.id) })
+        var served = Set<String>()
+        var points = Set<Coord>()
+        for stop in register.within(box, limit: .max) {
+            let ref = StopRegister.stationOf(stop.id)
+            guard refs.contains(ref) else { continue }
+            served.insert(ref)
+            points.insert(Coord(lon: stop.lon, lat: stop.lat))
+        }
+        for station in stations {
+            if let ref = StopRegister.sloid(forDidok: station.id), served.contains(ref) { continue }
+            points.insert(Coord(lon: station.lon, lat: station.lat))
+        }
+        return points.sorted { $0.lon == $1.lon ? $0.lat < $1.lat : $0.lon < $1.lon }
+    }
+
+    /// Captured once, so camera-driven track queries never queue behind fleet work.
+    public func trackOverlay() -> RailNet.TrackOverlay { railnet.trackOverlay() }
+
     /// The railway network inside a viewport, for the track overlay.
     public func trackLines(
         in bbox: BBox, limit: Int = 20_000, kindMask: UInt8 = 0,
@@ -4396,7 +6341,7 @@ public actor Fleet {
     /// be drawn.
     public func routeGeometry(relationId: Int32) -> (path: [Coord], stops: [Coord])? {
         guard relations.isReady, let relation = relations.relation(id: relationId) else { return nil }
-        return (relations.path(of: relation).toArray(), relations.stops(of: relation).toArray())
+        return (relations.pathCoords(of: relation), relations.stopCoords(of: relation))
     }
 
     /// Move journeys the new snapshot no longer carries into the retained set,
@@ -4410,6 +6355,9 @@ public actor Fleet {
         let cutoff = now - Timestamp(Self.retention)
 
         for (id, journey) in journeys where found[id] == nil {
+            // A winning feed can change the public ID of the same occurrence.
+            // That is an alias change, not a finished vehicle to retain.
+            guard found[runs.resolve(journey).id] == nil else { continue }
             guard journey.end <= now, journey.end >= cutoff else { continue }
             // Geometry is the expensive half and is rebuilt on demand. Holding
             // it for an hour of finished journeys is tens of megabytes for a
@@ -4418,7 +6366,9 @@ public actor Fleet {
             retired[id] = journey
         }
 
-        retired = retired.filter { $0.value.end >= cutoff && found[$0.key] == nil }
+        retired = retired.filter {
+            $0.value.end >= cutoff && found[runs.resolve($0.value).id] == nil
+        }
 
         if retired.count > Self.retentionLimit {
             let keep = retired.values

@@ -65,6 +65,8 @@ public final class GeometryBuilder: @unchecked Sendable {
     public func attach(to journey: Journey, refined: Bool = true) -> Journey {
         if journey.geometry != nil { return journey }
         guard journey.stops.count >= 2 else { return journey }
+        let coords = Self.workingCoords(journey.stops)
+        guard coords.filter(\.isPlaced).count >= 2 else { return journey }
 
         // Best source first: the OSM route relation for this line names the
         // ways the vehicle uses, so nothing is inferred from proximity — and it
@@ -84,35 +86,54 @@ public final class GeometryBuilder: @unchecked Sendable {
         var fromGraph = 0
 
         for i in 1..<journey.stops.count {
-            let from = journey.stops[i - 1]
-            let to = journey.stops[i]
-            let chord = [from.coord, to.coord]
+            let fromC = coords[i - 1]
+            let toC = coords[i]
+            // Never chord to the unplaced sentinel. That is a line through
+            // the Gulf of Guinea, and interpolating along it is the
+            // 40,000 km/h speed on a selected IC.
+            guard fromC.isPlaced, toC.isPlaced else {
+                let keep = fromC.isPlaced ? fromC : toC
+                legPoints.append(keep.isPlaced ? [keep, keep] : [])
+                legSources.append(.chord)
+                continue
+            }
+            let chord = [fromC, toC]
 
             // A relation does not always describe every leg — its ways can have
             // ordering gaps — so each leg falls back independently rather than
             // one bad leg costing the whole journey its geometry.
-            if let fromRelation = mapped?.legs[i - 1], fromRelation.count >= 2 {
+            if let fromRelation = mapped?.legs[i - 1], fromRelation.count >= 2,
+               Geo.plausibleRoute(fromRelation, from: fromC, to: toC) {
                 // A relation joins its ways end to end, and a way ends where
                 // its author stopped drawing rather than where the vehicle
                 // turns — so a leg out of a station a service reverses in
                 // begins with a run past the platform and back. See
                 // `Geo.withoutSpurs`.
-                legPoints.append(Geo.withoutSpurs(fromRelation))
-                legSources.append(.route)
-                fromRoute += 1
-                continue
+                let cleaned = Geo.withoutUnplaced(Geo.withoutSpurs(fromRelation))
+                if cleaned.count >= 2 {
+                    legPoints.append(cleaned)
+                    legSources.append(.route)
+                    fromRoute += 1
+                    continue
+                }
             }
 
             if routable {
-                let key = String(format: "%.5f,%.5f|%.5f,%.5f", from.lat, from.lon, to.lat, to.lon)
-                if let routed = railnet.routeLeg(key: key, from: from.coord, to: to.coord, mode: journey.mode),
+                let key = String(format: "%.5f,%.5f|%.5f,%.5f", fromC.lat, fromC.lon, toC.lat, toC.lon)
+                if let routed = railnet.routeLeg(
+                    key: key, from: fromC, to: toC, mode: journey.mode,
+                    allowLong: refined
+                ),
                    routed.count > 1 {
                     // Keep the snapped track nodes at each end: they sit on the
                     // rails, which is exactly where the line and the vehicle belong.
-                    legPoints.append(routed)
-                    legSources.append(.graph)
-                    fromGraph += 1
-                    continue
+                    let cleaned = Geo.withoutUnplaced(routed)
+                    if cleaned.count > 1 {
+                        legPoints.append(cleaned)
+                        legSources.append(.graph)
+                        fromGraph += 1
+                        continue
+                    }
                 }
             }
 
@@ -141,17 +162,25 @@ public final class GeometryBuilder: @unchecked Sendable {
         var path: [Coord] = []
         var legs: [Int] = [0]
         for (i, points) in legPoints.enumerated() {
+            let usable = Geo.withoutUnplaced(points)
             if i == 0 {
-                path.append(contentsOf: points)
+                path.append(contentsOf: usable)
+            } else if usable.isEmpty {
+                // Keep the stop on the previous vertex rather than inventing
+                // a hop to Null Island.
+            } else if path.isEmpty {
+                path.append(contentsOf: usable)
             } else {
                 // Consecutive legs usually share their join vertex; where they
                 // do not (a mapped leg meeting an inferred one) both points are
                 // kept so the line stays continuous.
-                let joined = path.last == points.first
-                path.append(contentsOf: joined ? Array(points.dropFirst()) : points)
+                let joined = path.last == usable.first
+                path.append(contentsOf: joined ? Array(usable.dropFirst()) : usable)
             }
-            legs.append(path.count - 1)
+            legs.append(max(0, path.count - 1))
         }
+        path = Geo.withoutUnplaced(path)
+        guard path.count >= 2 else { return journey }
 
         journey.legsFromRoute = fromRoute
         journey.legsFromGraph = fromGraph
@@ -169,6 +198,43 @@ public final class GeometryBuilder: @unchecked Sendable {
             refined: refined
         )
         return journey
+    }
+
+    /// Coordinates GeometryBuilder is allowed to treat as places.
+    ///
+    /// Unplaced calls are written as `(0, 0)`. Using that as a vertex draws a
+    /// line through the Gulf of Guinea and interpolating along it reports
+    /// tens of thousands of km/h. A hole in the middle is filled from its
+    /// placed neighbours; a hole at either end sits on the nearest placed
+    /// call rather than in the sea.
+    static func workingCoords(_ stops: [Call]) -> [Coord] {
+        var coords: [Coord?] = stops.map { $0.isPlaced ? $0.coord : nil }
+        for i in coords.indices where coords[i] == nil {
+            var prev: (Int, Coord)?
+            var next: (Int, Coord)?
+            var j = i - 1
+            while j >= 0 {
+                if let found = coords[j] { prev = (j, found); break }
+                j -= 1
+            }
+            j = i + 1
+            while j < coords.count {
+                if let found = coords[j] { next = (j, found); break }
+                j += 1
+            }
+            if let prev, let next {
+                let t0 = Double(stops[prev.0].dep)
+                let t1 = Double(stops[next.0].arr)
+                let t = Double(stops[i].dep)
+                let f = t1 > t0 ? min(1, max(0, (t - t0) / (t1 - t0))) : 0.5
+                coords[i] = Geo.interpolate(prev.1, next.1, f)
+            } else if let prev {
+                coords[i] = prev.1
+            } else if let next {
+                coords[i] = next.1
+            }
+        }
+        return coords.map { $0 ?? Coord(lon: 0, lat: 0) }
     }
 
     /// Per-leg geometry, matching each numbered leg separately when the journey
@@ -418,7 +484,72 @@ public final class GeometryBuilder: @unchecked Sendable {
             }
         }
         Self.trace?("declined off \(Int(offBy))m|" + what)
+        // The graph could not cross without reversing. The vehicle still has
+        // to stand on the booked rail — otherwise an R12 into Frutigen 3 is
+        // drawn on 1.
+        if snapToLanding(&legPoints[leg], tail: tail, stop: stop, mode: journey.mode) {
+            Self.trace?("snapped off \(Int(offBy))m|" + what)
+        }
         return false
+    }
+
+    /// Slide this end onto the booked platform's own rail, without asking the
+    /// graph for a crossover.
+    ///
+    /// The bend above will not take a route that reverses through the far
+    /// throat: at Frutigen that is the Lötschberg junction south of the
+    /// station, a 150 m U-turn that puts the train through platform 1 and out
+    /// the other side. OSM's R12 relation is already on 1, and the north
+    /// throat has no mapped crossover onto 3, so every hinge declines.
+    ///
+    /// What is left is a shallow slide from a close hinge. Fourteen metres
+    /// across over a hundred and twenty is a couple of degrees, not the white
+    /// line across five tracks at Bern — that cut was a sideways step at the
+    /// platform itself, which this is not. The endpoint is the foot of the
+    /// perpendicular on the booked rail, so the vehicle stands where the
+    /// register says.
+    @discardableResult
+    private func snapToLanding(
+        _ points: inout [Coord], tail: Bool, stop: Call, mode: Mode
+    ) -> Bool {
+        guard mode.hasThroats, points.count >= 2,
+              let landing = railnet.platformLanding(lon: stop.lon, lat: stop.lat, mode: mode)
+        else { return false }
+        let end = tail ? points[points.count - 1] : points[0]
+        let slide = Geo.flatMetres(end.lon, end.lat, landing.lon, landing.lat)
+        guard slide >= Self.bendIfOffByMetres else { return false }
+        let closer = Geo.flatMetres(landing.lon, landing.lat, stop.lon, stop.lat)
+            < Geo.flatMetres(end.lon, end.lat, stop.lon, stop.lat)
+        guard closer else { return false }
+
+        let reach = min(RailNet.approachMetres, max(120, slide * 8))
+        if let walked = walkIn(points, fromTail: tail, reach: reach, exact: true) {
+            if tail {
+                var kept = Array(points[0..<walked.index])
+                if let last = kept.last,
+                   Geo.flatMetres(last.lon, last.lat, walked.at.lon, walked.at.lat) < 0.5 {
+                    kept[kept.count - 1] = walked.at
+                } else {
+                    kept.append(walked.at)
+                }
+                kept.append(landing)
+                points = kept
+            } else {
+                var kept = Array(points[(walked.index + 1)...])
+                if let first = kept.first,
+                   Geo.flatMetres(first.lon, first.lat, walked.at.lon, walked.at.lat) < 0.5 {
+                    kept[0] = walked.at
+                } else {
+                    kept.insert(walked.at, at: 0)
+                }
+                points = [landing] + kept
+            }
+        } else if tail {
+            points[points.count - 1] = landing
+        } else {
+            points[0] = landing
+        }
+        return true
     }
 
     /// How far back from the platform to hinge, in the order the hinges are
@@ -493,13 +624,19 @@ public final class GeometryBuilder: @unchecked Sendable {
         // nor the shape of its crossing was ever the problem. See `reaches`.
         let throated = journey.mode.hasThroats
         guard let walked = walkIn(points, fromTail: tail, reach: reach, exact: throated)
-        else { return false }
+        else {
+            Self.trace?("miss:hinge@\(Int(reach))|\(journey.line)|\(stop.name)|\(stop.platform ?? "-")")
+            return false
+        }
         let hinge = walked.index
         let at = walked.at
         let key = String(format: "%.5f,%.5f|%.5f,%.5f", at.lat, at.lon, stop.lat, stop.lon)
         guard let routed = railnet.routeApproach(
             key: key, from: at, to: stop.coord, mode: journey.mode, reach: RailNet.approachMetres
-        ), routed.count >= 2 else { return false }
+        ), routed.count >= 2 else {
+            Self.trace?("miss:route@\(Int(reach))|\(journey.line)|\(stop.name)|\(stop.platform ?? "-")")
+            return false
+        }
 
         // The graph answers from the hinge outward; a departure needs it the
         // other way.
@@ -811,6 +948,7 @@ public enum Positioning {
         // journey in the country passes through on every frame, so the field is
         // read where it lies. See `answer`, which says the same thing.
         guard !journey.stops.isEmpty else { return 0 }
+        if let split = journey.splitAppearance { return split }
         let early = journey.stops[0].dep - preDepartureLead
         guard let held = journey.heldUntil else { return early }
         return max(early, held + 1)
@@ -824,6 +962,15 @@ public enum Positioning {
     /// timetable's final arrival and departure are the same second.
     public static func position(of journey: Journey, at now: Timestamp) -> VehiclePosition? {
         position(of: journey, at: Double(now))
+    }
+
+    /// An open card can outlive the map marker. Keep it at the last call after
+    /// the run ends, or at the first call before it begins, without extending
+    /// the lifetime used by map queries.
+    public static func panelPosition(of journey: Journey, at now: Timestamp) -> VehiclePosition? {
+        if let current = position(of: journey, at: now) { return current }
+        let bounded = min(max(now, appearsAt(journey)), standsUntil(journey))
+        return position(of: journey, at: Double(bounded), settling: false)
     }
 
     /// The same question asked to better than a second.
@@ -901,22 +1048,7 @@ public enum Positioning {
         }
         let left = 1 - age / settle.over
 
-        // Two different shapes, because the two directions are not the same
-        // thing to watch.
-        //
-        // A correction that moves the vehicle *forward* — the run turned out to
-        // be earlier than the map thought — is eased out: most of the ground
-        // covered early and arriving gently, which reads as the map correcting
-        // itself. Nothing about it can look wrong, because going forward is
-        // what a vehicle does.
-        //
-        // A correction that moves it *backwards* is given back at a constant
-        // rate instead, spread over the rest of the leg so that the rate is
-        // always slower than the vehicle's own progress. The wound-on clock
-        // therefore still runs forward, only slower, and the vehicle is drawn
-        // losing the ground it never made up rather than reversing over it.
-        // See `settleOver`.
-        return settle.seconds > 0 ? settle.seconds * left : settle.seconds * left * left
+        return settle.seconds * (settle.linear ? left : left * left)
     }
 
     /// The position the stop list alone puts this vehicle at, with no
@@ -931,6 +1063,7 @@ public enum Positioning {
         if now < Double(stops[0].dep) {
             let on = trackPoint(journey, 0)
             let at = on ?? stops[0].coord
+            guard at.isPlaced else { return nil }
             return VehiclePosition(
                 lon: at.lon, lat: at.lat,
                 bearing: (on.flatMap { _ in trackBearing(journey, 0) })
@@ -985,6 +1118,7 @@ public enum Positioning {
             // station and back.
             let on = trackPoint(journey, i)
             let at = on ?? stops[i].coord
+            guard at.isPlaced else { return nil }
             let next = i + 1 < stops.count ? stops[i + 1].coord : nil
             return VehiclePosition(
                 lon: at.lon, lat: at.lat,
@@ -1017,6 +1151,7 @@ public enum Positioning {
         }
 
         let here = stops[i].coord, next = stops[i + 1].coord
+        guard here.isPlaced, next.isPlaced else { return nil }
         let point = Geo.interpolate(here, next, f)
         return VehiclePosition(
             lon: point.lon, lat: point.lat, bearing: Geo.bearing(here, next),
@@ -1170,6 +1305,11 @@ public enum Positioning {
     /// vehicle travelling a route it never took, so it snaps.
     static let settleCeiling: Double = 30 * 60
 
+    /// Minute-granular timetable data and second-precise live answers can
+    /// disagree this much without describing a different trip. Preserve
+    /// forward progress while those small differences are absorbed.
+    static let smallRetimeLimit: Double = 60
+
     /// How long a correction of `shift` seconds takes to walk off.
     ///
     /// Short, and only weakly longer for a bigger jump. The glide is there to
@@ -1178,62 +1318,11 @@ public enum Positioning {
     /// over a second and a half reads as a train that has slipped its brakes
     /// rather than as a map that has just learned something.
     static func settleOver(_ shift: Double, arrivingIn remaining: Double) -> Double {
-        // A run that turned out to be *earlier* is eased forward over a
-        // fraction of a second. Nothing about going forwards can look wrong, so
-        // there is nothing to spread.
-        guard shift > 0 else { return 0.45 + min(0.55, abs(shift) / 240) }
-
-        // A run that turned out to be later has to give ground back, and there
-        // is exactly one way to give ground back without running backwards:
-        // run slow. So it is given back over *the rest of the leg* — the time
-        // the vehicle still has before the call it is running towards, on the
-        // times it has just been handed.
-        //
-        // Which is not an arbitrary duration, it is the only honest one. The
-        // fold moved that arrival later by the same `shift` it moved everything
-        // else, so the room to give the ground back in always contains the
-        // ground to give: the rate below is `shift / (remaining + shift)`,
-        // strictly under one, and the vehicle therefore always goes forwards.
-        // It is spent exactly when the vehicle reaches the platform, so the
-        // correction never outlives the leg it landed on and the map is never
-        // wrong about a stop by the time anybody is standing at it.
-        //
-        // And it is what a late train *is*. A train two minutes down did not
-        // reverse two minutes; it ran slow, or stood at a signal, and this
-        // draws precisely that — the vehicle loses the time over the run in
-        // rather than giving it back in one place.
-        //
-        // Bounded, though, and that bound wins over landing exactly at the
-        // platform: the rest of the leg is only enough room if giving the
-        // ground back over it leaves the vehicle still visibly moving. Where it
-        // does not, the correction outlives the leg rather than the vehicle
-        // being drawn crawling. See `settleAbsorbFastest`.
-        return max(0.45, remaining, shift / settleAbsorbFastest)
+        // A forecast correction is new information, not evidence that the
+        // vehicle spent minutes slowing down. Briefly ease it along its rails,
+        // then use the live clock for both the marker and the next-stop card.
+        0.45 + min(0.55, abs(shift) / 240)
     }
-
-    /// The most of its own progress a correction may ever eat, as a share.
-    ///
-    /// **This is the number that decides whether the correction can be seen at
-    /// all**, and it is a hard cap rather than a backstop.
-    ///
-    /// Spreading a correction over the rest of the leg is the right *shape* —
-    /// it is what a late train does, and it lands the vehicle exactly right at
-    /// the platform. What it is not is bounded: a run that turns out to be two
-    /// minutes down with one minute left to the next stop needs two thirds of
-    /// its remaining progress to give that back, and a vehicle drawn at a third
-    /// of its speed beside traffic moving normally does not read as a late
-    /// train. At the extreme it reads as a train that has stopped dead, which
-    /// is a bug report rather than a correction — and the speedometer beside it
-    /// goes on reporting the *scheduled* speed, so the two visibly disagree.
-    ///
-    /// So the rate is capped here and the duration gives way instead. At a
-    /// quarter the vehicle runs at three quarters of its booked speed, which
-    /// beside its neighbours is nothing anybody can pick out, and a correction
-    /// that needs longer than the leg simply takes longer than the leg — by
-    /// which time it is small, and most likely superseded by the next tick
-    /// anyway. Being imperceptibly ahead of the truth for a few minutes is a
-    /// far better trade than being conspicuously stopped for one.
-    static let settleAbsorbFastest: Double = 0.25
 
     /// Where this vehicle sits in its own timetable, read before a fold so the
     /// fold can be measured as the distance it moves the vehicle.
@@ -1270,6 +1359,9 @@ public enum Positioning {
         /// vehicle is actually drawn at, and `Motion.elapsed` puts the clock
         /// back to it.
         var along: Double?
+        /// Departure of the leg being run. Updating only this boundary can
+        /// move a train back to its platform even if the next arrival is unchanged.
+        var leaves: Timestamp?
     }
 
     /// Take that reading, for a journey that is currently on the map.
@@ -1282,29 +1374,15 @@ public enum Positioning {
         guard stops.count >= 2 else { return nil }
         guard now >= appearsAt(journey), now <= standsUntil(journey) else { return nil }
 
-        // Fields read one at a time rather than through a bound `let stop`,
-        // for the reason `answer` gives: the binding retains six strings.
-        var index = stops.count - 1
-        for i in stops.indices where stops[i].arr >= now {
-            index = i
-            break
-        }
-
-        // And how far along the leg that leads to it, where it is running one.
-        // The two numbers are exactly the pair `answer` interpolates between,
-        // so the fraction taken here is the one that reproduces the drawn
-        // position and not an approximation of it.
-        var along: Double?
-        if index >= 1 {
-            let leaves = Double(departsAt(journey, index - 1))
-            let arrives = Double(stops[index].arr)
-            if Double(now) > leaves, Double(now) < arrives, arrives > leaves {
-                let span = arrives - leaves
-                along = Motion.profile((Double(now) - leaves) / span, seconds: span).distance
-            }
-        }
+        // Include a correction already in flight. Anchoring to the uncorrected
+        // timetable made a second response start from a place never drawn.
+        guard let drawn = position(of: journey, at: now) else { return nil }
+        let index = drawn.moving ? drawn.index + 1 : drawn.index
+        guard stops.indices.contains(index) else { return nil }
         return Retime(
-            index: index, arr: stops[index].arr, dep: stops[index].dep, along: along
+            index: index, arr: stops[index].arr, dep: stops[index].dep,
+            along: drawn.moving ? drawn.progress : nil,
+            leaves: drawn.moving ? departsAt(journey, drawn.index) : nil
         )
     }
 
@@ -1354,9 +1432,16 @@ public enum Positioning {
         // A terminus has no departure of its own — `Call` fills it equal to the
         // arrival — so both move together there and either reads the same.
         let movedArrival = Double(journey.stops[anchor.index].arr - anchor.arr)
+        let movedDeparture = Double(journey.stops[anchor.index].dep - anchor.dep)
+        let movedLeaves = anchor.leaves.map {
+            Double(departsAt(journey, anchor.index - 1) - $0)
+        } ?? 0
         let fold = movedArrival != 0
             ? movedArrival
-            : Double(journey.stops[anchor.index].dep - anchor.dep)
+            : movedDeparture
+        let magnitude = max(abs(movedArrival), abs(anchor.along == nil ? movedDeparture : movedLeaves))
+        // Identical answers must not restart a correction on every refresh.
+        guard magnitude > 0 else { return }
 
         // **How big a fold this is, and how far it moves the vehicle, are two
         // different questions, and the ceiling is asking the first one.**
@@ -1365,19 +1450,15 @@ public enum Positioning {
         // be standing when it lands — the same hour on a call a vehicle has
         // nearly reached moves it a few minutes' worth of track, which would
         // read as an ordinary correction and be glided across.
-        guard abs(fold) <= settleCeiling else { return }
+        guard magnitude <= settleCeiling else {
+            journey.settle = nil
+            return
+        }
 
         // The correction itself, which is the other question. See `Retime.along`.
-        let shift = windToFraction(journey, anchor, at: now) ?? fold
-        let floor = shift > 0 ? settleFloorBackwards : settleFloor
-        guard abs(shift) >= floor else { return }
-
-        // Added to whatever is still in flight rather than replacing it. Two
-        // folds inside one glide — a sweep landing on the frame a tap does —
-        // would otherwise throw away the ground the first had left to cover and
-        // put the vehicle back where it started.
-        let outstanding = settleShift(journey, at: Double(now)) ?? 0
-        let total = shift + outstanding
+        // This is measured from the drawn position, so it already includes
+        // any outstanding correction. Adding that again would move it twice.
+        let total = windToFraction(journey, anchor, at: now) ?? fold
         guard abs(total) >= (total > 0 ? settleFloorBackwards : settleFloor) else {
             journey.settle = nil
             return
@@ -1410,9 +1491,17 @@ public enum Positioning {
             return
         }
         let spend = total > 0 ? windable : total
+        let preservesProgress = spend > 0 && magnitude <= smallRetimeLimit && spend <= smallRetimeLimit
+        // For a quadratic decay, a duration of at least 2 * shift keeps
+        // d(now + shift)/dt nonnegative. If arrival is closer, use a linear
+        // decay bounded by that arrival instead; duration >= shift still
+        // guarantees forward motion and the correction is gone at the stop.
+        let over = preservesProgress
+            ? min(max(0.45, 2 * spend), remaining)
+            : settleOver(spend, arrivingIn: remaining)
         journey.settle = Journey.Settle(
             seconds: spend, from: Double(now),
-            over: settleOver(spend, arrivingIn: remaining)
+            over: over, linear: preservesProgress && over < 2 * spend
         )
     }
 
@@ -1497,9 +1586,26 @@ public enum Positioning {
         return now > standsUntil(journey) + 120
     }
 
+    /// Next stop a passenger can board, on the same clock the stop list uses.
+    ///
+    /// Not `index + 1`. The interpolator can already be on the following leg
+    /// while the printed arrival is still ahead — a bus held for a minimum
+    /// dwell, a re-time walked forward, a zero-length leg that never matches.
+    /// The card then named Seeblick while Strandbad was still an empty ring.
+    /// The first uncancelled, non-technical call whose arrival is still in the
+    /// future is the same stop that ring is waiting on.
+    public static func nextStopIndex(_ stops: [Call], at now: Timestamp) -> Int? {
+        stops.indices.first { i in
+            let stop = stops[i]
+            guard !stop.cancelled, !StopNaming.isTechnical(stop.name) else { return false }
+            return stop.expectedArrival > now
+        }
+    }
+
     /// Next stop the vehicle will call at, for the info panel.
     public static func nextStop(_ journey: Journey, _ now: Timestamp) -> Call? {
-        journey.stops.first { $0.arr > now }
+        guard let index = nextStopIndex(journey.stops, at: now) else { return nil }
+        return journey.stops[index]
     }
 }
 

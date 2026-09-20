@@ -269,10 +269,18 @@ extension RelationStore {
         // A relation for this line number first; only then the wider search, so
         // an unrelated line can never outrank the one the service is numbered.
         let match = matchRoute(slice) ?? (depth < Self.maxSegmentDepth ? matchSegment(slice) : nil)
+        if match == nil, stops.count == 2,
+           let bridged = bridgeLeg(from: stops[0], to: stops[1], mode: probe.mode) {
+            legs[from] = bridged.path
+            relationIds.append(contentsOf: bridged.ids)
+            ways.append(contentsOf: bridged.ways)
+            names.append(contentsOf: bridged.names)
+            return
+        }
         guard let match else { return }
 
         let relation = self.relation(at: match.relationIndex)
-        let (path, cuts) = projectStops(self.path(of: relation).toArray(), stops, probe.mode)
+        let (path, cuts) = projectStops(self.pathCoords(of: relation), stops, probe.mode)
 
         var filled = [Bool](repeating: false, count: stops.count - 1)
         for i in 1..<stops.count {
@@ -285,7 +293,15 @@ extension RelationStore {
             // should start and end at. Handing back only the interior and
             // letting the caller cap it with the stop's own coordinate is what
             // put a spike on the map at every station.
-            legs[from + i - 1] = Array(path[a...b])
+            let slice = Array(path[a...b])
+            // A relation whose members were concatenated out of order still
+            // projects every stop onto *some* visit of the corridor, and the
+            // slice between them then includes the jump back to the start.
+            // Those legs are not this run; leave them for a better relation
+            // or for the graph.
+            guard Geo.plausibleRoute(slice, from: stops[i - 1].coord, to: stops[i].coord)
+            else { continue }
+            legs[from + i - 1] = slice
             filled[i - 1] = true
         }
 
@@ -309,6 +325,101 @@ extension RelationStore {
             while end < filled.count && !filled[end] { end += 1 }
             cover(probe, from + i, from + end, &legs, &relationIds, &ways, &names, depth + 1)
             i = end
+        }
+    }
+
+    struct BridgedLeg {
+        var path: [Coord]
+        var ids: [Int32]
+        var ways: [Int64]
+        var names: [String]
+    }
+
+    /// Two relations that meet at a station neither journey lists — ICE 43
+    /// ends at Basel, IC 61 starts there, and the feed's three calls skip it.
+    func bridgeLeg(from: Call, to: Call, mode: Mode) -> BridgedLeg? {
+        let kinds = Self.modeRoutes[mode] ?? []
+        let leaving = relationsCalling(near: from.coord, within: Self.projection(for: mode).reject)
+            .filter { kinds.contains(self.relation(at: $0).route) }
+        let arriving = relationsCalling(near: to.coord, within: Self.projection(for: mode).reject)
+            .filter { kinds.contains(self.relation(at: $0).route) }
+        guard !leaving.isEmpty, !arriving.isEmpty else { return nil }
+
+        var best: BridgedLeg?
+        var bestScore = Double.infinity
+        let direct = max(1, Geo.metres(from.coord, to.coord))
+
+        for aIndex in leaving {
+            for bIndex in arriving where bIndex != aIndex {
+                let a = relation(at: aIndex)
+                let b = relation(at: bIndex)
+                guard let join = sharedCall(a, b) else { continue }
+                let via = Call(
+                    key: "via", name: "via",
+                    lat: join.lat, lon: join.lon,
+                    arr: from.arr, dep: from.dep
+                )
+                let (pathA, cutsA) = projectStops(pathCoords(of: a), [from, via], mode)
+                let (pathB, cutsB) = projectStops(pathCoords(of: b), [via, to], mode)
+                guard let a0 = cutsA[0], let a1 = cutsA[1], a1 > a0,
+                      let b0 = cutsB[0], let b1 = cutsB[1], b1 > b0
+                else { continue }
+                var path = Array(pathA[a0...a1])
+                path.append(contentsOf: pathB[b0...b1].dropFirst())
+                let length = Geo.length(of: path)
+                guard path.count >= 3, length <= direct * Self.maxBridgeDetour else { continue }
+                let score = length
+                if score < bestScore {
+                    bestScore = score
+                    var names: [String] = []
+                    if let name = a.name { names.append(name) }
+                    if let name = b.name { names.append(name) }
+                    best = BridgedLeg(
+                        path: path,
+                        ids: [a.id, b.id],
+                        ways: ways(of: a) + ways(of: b),
+                        names: names
+                    )
+                }
+            }
+        }
+        return best
+    }
+
+    /// How far a bridged pair may wander relative to the chord it replaces.
+    static let maxBridgeDetour = 3.0
+
+    func sharedCall(_ a: RouteRelation, _ b: RouteRelation) -> Coord? {
+        let aStops = stopCoords(of: a)
+        let bStops = stopCoords(of: b)
+        var best: (Double, Coord)?
+        for p in aStops {
+            for q in bStops {
+                let d = Geo.metres(p, q)
+                if d <= Self.joinMetres, best.map({ d < $0.0 }) ?? true {
+                    best = (d, p)
+                }
+            }
+        }
+        return best?.1
+    }
+
+    func relationsCalling(near coord: Coord, within metres: Double) -> [Int] {
+        buildStopIndexIfNeeded()
+        let span = Int32(max(1, ceil(metres / 1000 / (Self.trackCellDegrees * 111))))
+        let centre = Self.trackCell(coord.lon, coord.lat)
+        var candidates = Set<Int>()
+        for dx in -span...span {
+            for dy in -span...span {
+                for i in stopIndex[TrackCell(x: centre.x + dx, y: centre.y + dy)] ?? [] {
+                    candidates.insert(Int(i))
+                }
+            }
+        }
+        return candidates.filter { i in
+            stopCoords(of: relation(at: i)).contains {
+                Geo.metres(coord, $0) <= metres
+            }
         }
     }
 }

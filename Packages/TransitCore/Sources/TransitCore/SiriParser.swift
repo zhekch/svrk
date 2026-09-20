@@ -244,7 +244,11 @@ public final class SiriParser {
         let category = text(raw, body, Self.tags.productCategory)
             .flatMap { $0.split(separator: ":").last.map(String.init) }
             .flatMap { $0.isEmpty ? nil : $0 }
-        let line = text(raw, body, Self.tags.publishedLine) ?? category ?? "?"
+        let published = text(raw, body, Self.tags.publishedLine) ?? category ?? "?"
+        let line = {
+            let pretty = Journey.publishedLine(published, mode: mode)
+            return pretty.isEmpty ? published : pretty
+        }()
 
         // The journey reference is stable for the vehicle's whole run and
         // unique across the country, which is what the old
@@ -304,8 +308,10 @@ public final class SiriParser {
         let realArrival = instant(raw, range, recorded ? Self.tags.actualArrival : Self.tags.expectedArrival)
         let realDeparture = instant(raw, range, recorded ? Self.tags.actualDeparture : Self.tags.expectedDeparture)
 
-        let arrival = realArrival ?? aimedArrival
-        let departure = realDeparture ?? aimedDeparture
+        let departureShift = realDeparture.flatMap { live in aimedDeparture.map { live - $0 } }
+        let arrivalShift = realArrival.flatMap { live in aimedArrival.map { live - $0 } }
+        let arrival = realArrival ?? aimedArrival.map { $0 + (departureShift ?? 0) }
+        let departure = realDeparture ?? aimedDeparture.map { $0 + (arrivalShift ?? 0) }
         guard arrival != nil || departure != nil else { return nil }
 
         // The platform the feed prints for this call, which is also how a call
@@ -313,10 +319,12 @@ public final class SiriParser {
         // before the place for exactly that reason.
         let stated = text(raw, range, Self.tags.departurePlatform) ?? text(raw, range, Self.tags.arrivalPlatform)
         let stopName = text(raw, range, Self.tags.stopPointName)
+        if StopNaming.isTechnical(stopName ?? "") { return nil }
 
         // The name travels too, because for a foreign station whose UIC the two
         // sources spell differently it is the only thing left to join on.
         guard let place = resolve(ref, stated, stopName) else { return nil }
+        if StopNaming.isTechnical(place.name) { return nil }
 
         // A call often carries a real-time value for only one of its two times:
         // a terminus has no departure, an origin no arrival. Whichever half the
@@ -350,7 +358,8 @@ public final class SiriParser {
             // Sought within this call only, which is what separates the two
             // scopes the one element is used at.
             cancelled: contains(raw, range, Self.tags.cancellation),
-            extra: contains(raw, range, Self.tags.extraCall)
+            extra: contains(raw, range, Self.tags.extraCall),
+            scheduledArrival: aimedArrival ?? aimedDeparture
         ), place.fromSupplement)
     }
 
@@ -375,7 +384,7 @@ public final class SiriParser {
     /// delay is worth printing is a question for whatever draws the board — see
     /// `Format.delay` — while whether an eleven-hour one is *true* is a question
     /// about the data, and this is where the data is read.
-    static func reportableDelay(_ seconds: Int?) -> Int? {
+    public static func reportableDelay(_ seconds: Int?) -> Int? {
         guard let seconds else { return nil }
         let minutes = Int((Double(seconds) / 60).rounded())
         guard abs(minutes) <= implausibleDelayMinutes else { return nil }

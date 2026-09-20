@@ -56,6 +56,17 @@ enum VehicleModels {
     static let buried = "transit-vehicle-models-tunnel"
     static let followBuried = "transit-vehicle-models-followed-tunnel"
 
+    /// Layers a tap can ask the renderer about, including the part-way tunnel
+    /// bands a wagon occupies for a few seconds in a portal.
+    static var tapLayers: [String] {
+        var ids = [models, followModels, fill, followFill, buried, followBuried]
+        for band in fadeBands where !band.suffix.isEmpty {
+            ids.append(models + band.suffix)
+            ids.append(followModels + band.suffix)
+        }
+        return ids
+    }
+
     /// Tunnel fade, as stacked layers rather than as `model-opacity` on one.
     ///
     /// `model-opacity` is documented as not data-driven over GeoJSON, and a
@@ -72,11 +83,25 @@ enum VehicleModels {
     }
 
     private static let fadeBands: [FadeBand] = [
-        FadeBand(suffix: "", from: 0.80, to: 1.01, opacity: 1),
+        // Upper bound is exclusive and only has to clear 1; 2 leaves room
+        // for a float that landed a hair over solid.
+        FadeBand(suffix: "", from: 0.80, to: 2, opacity: 1),
         FadeBand(suffix: "-f70", from: 0.55, to: 0.80, opacity: 0.70),
         FadeBand(suffix: "-f40", from: 0.28, to: 0.55, opacity: 0.40),
         FadeBand(suffix: "-f12", from: 0.06, to: 0.28, opacity: 0.14),
     ]
+
+    /// The opacity the follow lane actually writes. The ease still runs on a
+    /// fine clock; the layers only have these four bands plus buried, so a
+    /// write per refresh would re-parse the rake without changing the picture.
+    static func snappedOpacity(_ opacity: Double) -> Double {
+        if opacity < 0.06 { return 0 }
+        for band in fadeBands where opacity >= band.from && opacity < band.to {
+            return band.opacity
+        }
+        return 1
+    }
+
     /// Debug outlines and labels, one per wagon. See `hitboxes`.
     static let hitboxes = "transit-vehicle-hitboxes"
     static let hitboxLabels = "transit-vehicle-hitbox-labels"
@@ -268,15 +293,10 @@ enum VehicleModels {
         wagons.modelScale = .expression(
             Exp(.array) { "number"; 3; Exp(.get) { Placed.scale } }
         )
-        // Rotation eases; scale does not. Each wagon carries a stable feature
-        // id, so the renderer interpolates from the heading it already has
-        // rather than from identity — without the id, a 300 ms ease from
-        // `[0, 0, 0]` left every coach at a fraction of its yaw and the rake
-        // read as a staircase. With the id, the same ease is the short arc
-        // from the last heading to this one, which is what hides the snap
-        // when a coach crosses a vertex of its path. Scale must not join in:
-        // eased from `[1, 1, 1]` a body inflates as the camera turns.
-        wagons.modelRotationTransition = StyleTransition(duration: 0.35, delay: 0)
+        // Position and attitude describe one rigid placement. Easing only the
+        // rotation leaves a wagon turning around yesterday's coupler alignment
+        // after source/tile changes, making the rake appear to stretch.
+        wagons.modelRotationTransition = .zero
         wagons.modelScaleTransition = .zero
         wagons.modelTranslationTransition = .zero
         wagons.modelOpacityTransition = .zero
@@ -305,9 +325,7 @@ enum VehicleModels {
         // which is nearly always nothing: the correction for a wagon spanning
         // a dip, whose two ends would otherwise be under the surface. See
         // `Rest.lifts`, and `MapCoordinator.rest` for the measuring.
-        wagons.modelTranslation = .expression(
-            Exp(.array) { "number"; 3; Exp(.get) { Placed.translation } }
-        )
+        wagons.modelTranslation = .expression(Self.modelTranslationExpression)
         wagons.modelOpacity = .constant(0)
         // The same reasoning as the extrusions had: a vehicle is the one thing
         // this app draws that is genuinely in the scene, so it takes the
@@ -352,6 +370,49 @@ enum VehicleModels {
     /// **Underground is the exception.** A wagon in a tunnel fades to nothing
     /// on the rails it is standing on; the line number is what is left to
     /// follow. See `fadeBands`.
+    static var followModelLayers: [String] {
+        var ids = [followBuried]
+        for band in fadeBands { ids.append(followModels + band.suffix) }
+        return ids
+    }
+
+    /// Data-driven lift: `[0, 0, metres]` per wagon. Restored when the
+    /// followed rake's wagons actually differ in lift, which is rare.
+    private static var modelTranslationExpression: Exp {
+        Exp(.array) { "number"; 3; Exp(.get) { Placed.translation } }
+    }
+
+    /// Keep followed wagons on their GeoJSON points. Only the vertical lift
+    /// is applied here.
+    ///
+    /// XY `model-translation` is not along-track in this renderer: `[east,
+    /// north]`, `[north, -east]`, and both body-frame slots all walked the
+    /// rake off the rails (left or right). Position between ticks is the
+    /// follow source, rebuilt on the model clock.
+    static func setFollowModelTranslation(
+        _ style: MapboxMap, east: Double, north: Double, lift: Double
+    ) {
+        let value = [0, 0, lift]
+        for id in followModelLayers {
+            guard style.layerExists(withId: id) else { continue }
+            try? style.setLayerProperty(
+                for: id, property: "model-translation", value: value
+            )
+        }
+    }
+
+    static func restoreFollowModelTranslation(_ style: MapboxMap) {
+        let expression: [Any] = [
+            "array", "number", 3, ["get", Placed.translation],
+        ]
+        for id in followModelLayers {
+            guard style.layerExists(withId: id) else { continue }
+            try? style.setLayerProperty(
+                for: id, property: "model-translation", value: expression
+            )
+        }
+    }
+
     static func setModelSolidity(_ style: MapboxMap, _ shown: Bool) {
         for band in fadeBands {
             for base in [models, followModels] {
@@ -402,6 +463,11 @@ enum VehicleModels {
         features.reserveCapacity(footprints.count * 4)
         for print in footprints {
             if let excluded, print.id == excluded { continue }
+            // A newly encountered livery can take several bake jobs. Keep the
+            // complete flat train until every wagon has a model, instead of
+            // adding disconnected 3D sections as those jobs finish.
+            guard !print.placements.isEmpty,
+                  print.placements.allSatisfy({ names[$0.model] != nil }) else { continue }
             // No answer about the ground yet — the elevation tiles under this
             // vehicle have not arrived — so its wagons are drawn level, which
             // is where the renderer stands them anyway and is what they will go
@@ -416,18 +482,19 @@ enum VehicleModels {
             // Every wagon of it, or it is not standing up: a train with two of
             // its four coaches baked is a train that still needs its footprint
             // painted, or the two that are missing are missing from the map.
-            var whole = !print.placements.isEmpty
             var wagonLifts = [Double](repeating: 0, count: print.placements.count)
             var wagonOp = [Double](repeating: 1, count: print.placements.count)
             for (index, placement) in print.placements.enumerated() {
-                guard let name = names[placement.model] else { whole = false; continue }
+                guard let name = names[placement.model] else { continue }
                 // On the rails, gone in half a second. Each wagon eases on
                 // its own clock so a rake is swallowed coach by coach as
                 // each one crosses the arch, not as a 36 m gradient that
-                // left half a train hanging around the portal. Off, the
-                // body ignores the bore — see `AppModel.ghostTunnels`.
-                let inside = ghostTunnels && tunnels.onTrack(
-                    print.rails(at: placement.alongTrain),
+                // left half a train hanging around the portal. Short covers
+                // and the stub of bore between an underground platform and
+                // daylight never count as inside — see `TunnelIndex.hiding`.
+                // Off, the body ignores the bore — see `AppModel.ghostTunnels`.
+                let inside = ghostTunnels && !print.stoppedAtStation && tunnels.hiding(
+                    at: print.rails(at: placement.alongTrain),
                     heading: placement.heading
                 ) != nil
                 let opacity: Double
@@ -480,6 +547,7 @@ enum VehicleModels {
                 let heightScale = min(placement.heightScale, VehicleShape.maxHeightScale)
                 feature.properties = [
                     VehicleShapes.Kind.key: .string(VehicleShapes.Kind.model),
+                    VehicleShapes.vehicleIdKey: .string(print.id),
                     Placed.model: .string(name),
                     Placed.rotation: .array(euler.map { .number($0) }),
                     // **`[across, along, up]`, and the middle one is the whole
@@ -522,7 +590,7 @@ enum VehicleModels {
             }
             allLifts[print.id] = wagonLifts
             allOpacities[print.id] = wagonOp
-            if whole { stood.insert(print.id) }
+            stood.insert(print.id)
         }
         return (features, stood, allLifts, allOpacities)
     }
@@ -912,6 +980,7 @@ enum VehicleModels {
                 var feature = Feature(geometry: geometry)
                 feature.properties = [
                     VehicleShapes.Kind.key: .string(VehicleShapes.Kind.solid),
+                    VehicleShapes.vehicleIdKey: .string(print.id),
                     Key.colour: .string(marked ? VehicleShapes.selectionColour : slab.fill),
                     Key.base: .number(slab.base),
                     Key.height: .number(slab.top),

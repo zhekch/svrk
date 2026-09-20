@@ -420,6 +420,17 @@ public enum WagonCatalogue {
             || raw.hasPrefix("RABE511") || raw.hasPrefix("RABE512")
             || raw.hasPrefix("RABE514") || raw.hasPrefix("RABE515")
             || raw.hasPrefix("RABE516")
+            // Zürich DPZ coaches: B-NDW is the low-floor double-decker, AB+
+            // and BT+ the mixed and driving cars of the same rake. None of
+            // them carry `(2E)` in the register.
+            || raw.hasPrefix("BNDW") || raw.hasPrefix("AB+") || raw.hasPrefix("BT+")
+    }
+
+    /// The cobalt Zürich S-Bahn set: Re 450 + DPZ coaches, or a DTZ.
+    static func isZurichSBahnBlue(_ raw: String) -> Bool {
+        raw.hasPrefix("RE450") || raw.hasPrefix("BNDW")
+            || raw.hasPrefix("AB+") || raw.hasPrefix("BT+")
+            || raw.hasPrefix("RABE514") || raw.hasPrefix("RABDE514")
     }
 
     static func isMetreGauge(_ raw: String) -> Bool {
@@ -1097,6 +1108,7 @@ public enum WagonCatalogue {
     /// narrow: inventing colours for classes nobody has checked would make the
     /// map confidently wrong, which is worse than uniformly approximate.
     public static func livery(for type: WagonType?, base: Livery) -> Livery {
+        if let type, isZurichSBahnBlue(type.raw) { return LayoutLibrary.zurichSBahn }
         guard let type, traits(of: type).powered else { return base }
         // The company's locomotive colour, promoted to the body — so a Re 460
         // at the head of a grey IC2000 rake is drawn red, which is the one unit

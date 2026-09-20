@@ -20,6 +20,55 @@ import Foundation
 /// at a known minute, and that triple identifies them almost uniquely. Only 6 of
 /// 6,644 such matches were ambiguous.
 public enum Reconcile {
+    /// A cancelled or delayed timetable run reissued under a new ID.
+    ///
+    /// Require the complete ordered route. Sharing a line number or being
+    /// nearby is not an identity. Live extra times may already include delay,
+    /// so compare both runs' booked slots, using the reported delay to recover
+    /// the extra's schedule — an 8-minute delay after a platform change is
+    /// still the same train. A 60-second window on live times dropped every
+    /// delayed replacement, leaving the map with a scheduled ghost and an
+    /// "unscheduled" extra that carried no delay badge.
+    static func isPlatformReplacement(_ replacement: Journey, of original: Journey) -> Bool {
+        // An unresolved OJP route is labelled `ext` locally, not by the
+        // operator. It cannot supply a product comparison. In that case require
+        // at least three booked calls and let the caller reject ambiguous twins.
+        let unnamed = replacement.extra && (replacement.line.isEmpty || replacement.line == "ext")
+        guard replacement.mode == original.mode,
+              unnamed || (!replacement.line.isEmpty && fold(replacement.line) == fold(original.line)),
+              original.stops.count >= (unnamed ? 3 : 2),
+              replacement.stops.count >= original.stops.count else { return false }
+        var platformChanged = false
+        var delayed = false
+        var at = replacement.stops.startIndex
+        for old in original.stops {
+            guard let oldRef = old.ref else { return false }
+            let station = StopRegister.stationOf(oldRef)
+            var found = false
+            while at < replacement.stops.endIndex {
+                let new = replacement.stops[at]
+                at = replacement.stops.index(after: at)
+                guard let newRef = new.ref,
+                      StopRegister.stationOf(newRef) == station else { continue }
+                let booked = old.sched ?? old.dep
+                // A later live time is only this run's delay when the feed's
+                // booked time agrees. A broad live-time window merges distinct
+                // extras on frequent lines, even after a platform change.
+                guard abs((new.sched ?? new.dep) - booked) <= 60 else { return false }
+                let delta = new.dep - booked
+                if abs(delta) > 60 { delayed = true }
+                if newRef != oldRef { platformChanged = true }
+                found = true
+                break
+            }
+            if !found { return false }
+        }
+        // Same platforms and same times is a duplicate extra, not a
+        // replacement — unless the extra also carries an exceptional halt.
+        return platformChanged || delayed
+            || replacement.stops.count > original.stops.count
+    }
+
     /// A structural fingerprint of a run: what it is called, where it starts,
     /// and when it is booked to leave.
     ///

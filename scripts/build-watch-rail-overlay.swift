@@ -1,4 +1,5 @@
 import Foundation
+import TransitCore
 
 private extension Data {
     mutating func appendInteger<T: FixedWidthInteger>(_ value: T) {
@@ -124,20 +125,45 @@ private enum BuildWatchRailOverlay {
             return .other
         }
 
-        let national = clipped(
-            railnet.lines(
-                    in: country,
-                    limit: 50_000,
-                    kindMask: mainMask,
-                    minLength: 3_000,
-                    simplify: 150
-                )
-                .map { OverlayLine(points: $0.points, style: railStyle(for: $0.kind)) },
-            to: swissBoundary
+        // National zoom is a handful of long strokes, so 40 m of simplification
+        // still looks like a curve on a watch while staying well under a
+        // megabyte. The previous 150 m pass left most runs as two- or
+        // three-point chords.
+        // Keep short junction pieces long enough to weld a corridor back
+        // together, then drop leftover stubs. Filtering by length first left
+        // the overlay as two-point chords that no longer touched.
+        let national = welded(
+            clipped(
+                welded(
+                    railnet.lines(
+                            in: country,
+                            limit: 50_000,
+                            kindMask: mainMask,
+                            minLength: 40,
+                            simplify: 40
+                        )
+                        .map { OverlayLine(points: $0.points, style: railStyle(for: $0.kind)) },
+                    within: 12
+                ).filter { Geo.length(of: $0.points) >= 800 },
+                to: swissBoundary
+            ),
+            within: 12
         )
-        let local = clipped(
-            serviceCorridors(from: relations, in: country),
-            to: swissBoundary
+        // City zoom uses the physical graph, not fragmented route relations.
+        // Join junction-to-junction runs into continuous alignments *before*
+        // dropping parallel tracks, otherwise the overlap filter eats the
+        // connectors and the overlay falls back into short chords.
+        let local = welded(
+            clipped(
+                collapsedPhysicalCorridors(
+                    from: railnet,
+                    in: country,
+                    kindMask: mainMask | tram | light | funicular,
+                    style: railStyle
+                ),
+                to: swissBoundary
+            ),
+            within: 10
         )
         let bands = [
             Band(level: 0, lines: national),
@@ -425,58 +451,58 @@ private enum BuildWatchRailOverlay {
         )
     }
 
-    /// Build the local band as one physical centreline per OSM transit
-    /// corridor. This is done in the downloadable/bundled archive builder, not
-    /// on the watch: the watch should decode one line, never merge three rails
-    /// every time its camera moves.
+    /// One drawable centreline per physical corridor, built from the routing
+    /// graph rather than from OSM route relations.
     ///
-    /// Exact snapped-edge deduplication is insufficient. Two tracks only a few
-    /// metres apart frequently land on neighbouring grid cells and survive as
-    /// parallel strokes. Instead, a claimed corridor occupies its own cell and
-    /// the eight neighbours. A later relation contributes only the genuinely
-    /// new branches outside that corridor. Branch endpoints reuse the nearest
-    /// claimed coordinate, keeping junctions visibly connected.
-    private static func serviceCorridors(
-        from store: RelationStore,
-        in bounds: BBox
+    /// Relation members are already a simplification of the same ways, and the
+    /// previous pass then chopped them into 96-point pieces and dropped any
+    /// overlap with an earlier corridor. The result on a watch was a field of
+    /// short straight chords. `RailNet.lines` walks degree-2 nodes, so each
+    /// run is already a continuous alignment; collapsing only lines that lie
+    /// almost entirely on an already-kept neighbour drops parallel tracks
+    /// without breaking the line that remains.
+    private static func collapsedPhysicalCorridors(
+        from railnet: RailNet,
+        in bounds: BBox,
+        kindMask: UInt8,
+        style: (UInt8) -> RailStyle
     ) -> [OverlayLine] {
-        struct Candidate {
-            var style: RailStyle
-            var points: [Coord]
-            var length: Double
+        let raw = railnet.lines(
+            in: bounds,
+            limit: 80_000,
+            kindMask: kindMask,
+            minLength: 40,
+            simplify: 6
+        )
+        var grouped: [RailStyle: [[Coord]]] = [:]
+        for line in raw {
+            grouped[style(line.kind), default: []].append(line.points)
         }
 
-        struct Sample {
-            var point: Coord
-            var node: PointKey
-        }
-
-        // A cell maps to the actual smooth coordinate that claimed it. Keeping
-        // that coordinate lets a truly coincident branch reuse the junction;
-        // nearby parallel tracks are merely deduplicated and never connected.
-        var claimed: [PointKey: Coord] = [:]
         var output: [OverlayLine] = []
-
-        func style(for route: String) -> RailStyle? {
-            switch route {
-            case "train": return .heavy
-            case "tram": return .tram
-            case "light_rail", "subway", "monorail": return .lightRail
-            case "funicular": return .funicular
-            default: return nil
-            }
+        for railStyle in [RailStyle.tram, .lightRail, .funicular, .heavy, .narrow, .other] {
+            guard let group = grouped[railStyle] else { continue }
+            let joined = Geo.join(group, within: 10)
+            let candidates = joined.map { points in
+                (points: points, length: Geo.length(of: points))
+            }.sorted { $0.length > $1.length }
+            output.append(contentsOf: collapseParallels(candidates, style: railStyle))
         }
+        return output
+    }
 
-        // Samples still use a grid for a cheap neighbourhood lookup, but a
-        // neighbouring cell alone is not proof that two tracks connect. The
-        // old code accepted the full 3x3 neighbourhood (up to roughly 45 m at
-        // a cell corner) and then drew a straight join to it. In station
-        // throats that manufactured the triangular chords this archive is
-        // specifically meant to avoid.
-        let gridMetres = 18.0
-        let corridorMetres = 18.0
-        let joinMetres = 6.0
+    /// Drop a line only when most of it already sits in a kept corridor of the
+    /// same style. A line that merely shares a station throat with a longer
+    /// neighbour is kept whole, which is what stops the overlay fragmenting
+    /// into the stubs the previous emitter produced.
+    private static func collapseParallels(
+        _ candidates: [(points: [Coord], length: Double)],
+        style: RailStyle
+    ) -> [OverlayLine] {
+        let gridMetres = 16.0
         let longitudeScale = 111_320.0 * cos(47.0 * .pi / 180)
+        var claimed: Set<PointKey> = []
+        var output: [OverlayLine] = []
 
         func node(_ point: Coord) -> PointKey {
             PointKey(
@@ -485,151 +511,68 @@ private enum BuildWatchRailOverlay {
             )
         }
 
-        func nearestClaim(to sample: Sample) -> Coord? {
-            var nearest: (point: Coord, distance: Double)?
+        func isClaimed(_ point: Coord) -> Bool {
+            let key = node(point)
             for longitudeOffset in -1 ... 1 {
                 for latitudeOffset in -1 ... 1 {
                     let nearby = PointKey(
-                        lon: sample.node.lon + Int32(longitudeOffset),
-                        lat: sample.node.lat + Int32(latitudeOffset)
+                        lon: key.lon + Int32(longitudeOffset),
+                        lat: key.lat + Int32(latitudeOffset)
                     )
-                    guard let point = claimed[nearby] else { continue }
-                    let distance = Geo.metres(sample.point, point)
-                    if nearest == nil || distance < nearest!.distance {
-                        nearest = (point, distance)
-                    }
+                    if claimed.contains(nearby) { return true }
                 }
             }
-            guard let nearest, nearest.distance <= corridorMetres else { return nil }
-            return nearest.point
+            return false
         }
 
-        func samples(of points: [Coord]) -> [Sample] {
+        func samples(of points: [Coord]) -> [Coord] {
             guard points.count >= 2 else { return [] }
-            var result: [Sample] = []
-            for segment in 0 ..< points.count - 1 {
-                let first = points[segment]
-                let second = points[segment + 1]
-                let distance = max(1, Geo.metres(first, second))
-                let steps = max(1, Int(ceil(distance / 8)))
+            var result: [Coord] = []
+            for index in 0 ..< points.count - 1 {
+                let first = points[index]
+                let second = points[index + 1]
+                let distance = max(1, Geo.flatMetres(first.lon, first.lat, second.lon, second.lat))
+                let steps = max(1, Int(ceil(distance / 12)))
                 for step in 0 ... steps {
-                    if segment > 0, step == 0 { continue }
+                    if index > 0, step == 0 { continue }
                     let progress = Double(step) / Double(steps)
-                    let point = Coord(
-                        lon: first.lon + (second.lon - first.lon) * progress,
-                        lat: first.lat + (second.lat - first.lat) * progress
+                    result.append(
+                        Coord(
+                            lon: first.lon + (second.lon - first.lon) * progress,
+                            lat: first.lat + (second.lat - first.lat) * progress
+                        )
                     )
-                    let sample = Sample(point: point, node: node(point))
-                    if result.last?.node != sample.node { result.append(sample) }
                 }
             }
             return result
         }
 
-        func emit(_ raw: [Coord], style: RailStyle) {
-            let points = Geo.simplify(raw, toleranceMetres: 10)
-            guard points.count >= 2 else { return }
-            let chunkPoints = 96
-            var start = 0
-            while start < points.count - 1 {
-                let end = min(points.count, start + chunkPoints)
-                let chunk = Array(points[start ..< end])
-                let box = BBox(
-                    west: chunk.map(\.lon).min()!,
-                    south: chunk.map(\.lat).min()!,
-                    east: chunk.map(\.lon).max()!,
-                    north: chunk.map(\.lat).max()!
-                )
-                if bounds.intersects(box) {
-                    output.append(OverlayLine(points: chunk, style: style))
-                }
-                start = end - 1
-            }
-        }
-
-        var candidates: [Candidate] = []
-        candidates.reserveCapacity(store.count)
-        for index in 0 ..< store.count {
-            let relation = store.relation(at: index)
-            guard let style = style(for: relation.route) else { continue }
-            let path = store.path(of: relation)
-            guard path.count >= 2 else { continue }
-
-            // OSM relations occasionally walk to the end of a way and back
-            // before continuing. Those folds are valid member ordering but
-            // invalid drawable geometry. Clean them once here rather than
-            // spending watch CPU on them for every viewport.
-            var cleaned = Geo.withoutSpurs(path.toArray())
-            cleaned = Geo.withoutFolds(cleaned)
-            cleaned = Geo.withoutEndStubs(cleaned)
-            let simplified = Geo.simplify(cleaned, toleranceMetres: 12)
-            guard simplified.count >= 2 else { continue }
-            let length = zip(simplified, simplified.dropFirst()).reduce(0.0) {
-                $0 + Geo.metres($1.0, $1.1)
-            }
-            candidates.append(Candidate(style: style, points: simplified, length: length))
-        }
-
-        // Prefer the visually useful local modes, then the longest continuous
-        // representative. Train relations sharing those rails are collapsed
-        // too, so the result is one stroke rather than one per mode/route.
-        candidates.sort { lhs, rhs in
-            let lhsPriority = railPriority(lhs.style)
-            let rhsPriority = railPriority(rhs.style)
-            if lhsPriority != rhsPriority { return lhsPriority > rhsPriority }
-            return lhs.length > rhs.length
-        }
-
         for candidate in candidates {
-            let pathSamples = samples(of: candidate.points).filter {
-                bounds.contains(lon: $0.point.lon, lat: $0.point.lat)
-            }
+            let pathSamples = samples(of: candidate.points)
             guard pathSamples.count >= 2 else { continue }
-            let wasClaimed = pathSamples.map { nearestClaim(to: $0) }
-
-            var branchStart: Int?
-            var newSampleCount = 0
-
-            func finishBranch(at end: Int) {
-                guard let start = branchStart else { return }
-                defer {
-                    branchStart = nil
-                    newSampleCount = 0
-                }
-                // Ignore sub-40-metre switches and mapping jitter. They are
-                // expensive texture on a watch, not useful route context.
-                guard newSampleCount >= 5, end > start else { return }
-                var branch = pathSamples[start ... end].map(\.point)
-                // Reuse a claimed coordinate only for a genuinely coincident
-                // OSM junction. Parallel tracks may be close enough to share
-                // one visual corridor, but drawing a connector between them
-                // invents track that does not exist.
-                if let anchor = wasClaimed[start],
-                   Geo.metres(branch[0], anchor) <= joinMetres {
-                    branch[0] = anchor
-                }
-                if let anchor = wasClaimed[end],
-                   Geo.metres(branch[branch.count - 1], anchor) <= joinMetres {
-                    branch[branch.count - 1] = anchor
-                }
-                emit(branch, style: candidate.style)
-
-                for sample in pathSamples[start ... end] where nearestClaim(to: sample) == nil {
-                    claimed[sample.node] = sample.point
-                }
+            let claimedCount = pathSamples.reduce(into: 0) { count, point in
+                if isClaimed(point) { count += 1 }
             }
-
-            for index in pathSamples.indices {
-                if wasClaimed[index] == nil {
-                    if branchStart == nil { branchStart = max(pathSamples.startIndex, index - 1) }
-                    newSampleCount += 1
-                } else if branchStart != nil {
-                    finishBranch(at: index)
-                }
+            if Double(claimedCount) / Double(pathSamples.count) >= 0.82 {
+                continue
             }
-            if branchStart != nil { finishBranch(at: pathSamples.index(before: pathSamples.endIndex)) }
+            output.append(OverlayLine(points: candidate.points, style: style))
+            for point in pathSamples {
+                claimed.insert(node(point))
+            }
         }
         return output
+    }
+
+    private static func welded(
+        _ lines: [OverlayLine],
+        within metres: Double
+    ) -> [OverlayLine] {
+        Dictionary(grouping: lines, by: \.style).flatMap { style, group in
+            Geo.join(group.map(\.points), within: metres).map { points in
+                OverlayLine(points: points, style: style)
+            }
+        }
     }
 
     private static func railPriority(_ style: RailStyle) -> Int {

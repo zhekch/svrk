@@ -58,6 +58,24 @@ public struct TripUpdate: Sendable {
     public var delay: Int?
     public var stops: [StopTimeUpdate]
 
+    /// OJP added trips embed the operator's journey reference before the
+    /// service-date suffix. Keep it for renumbered trains and subsequent OJP /
+    /// formation requests; the synthetic GTFS id is not a journey reference.
+    var journeyReference: String? {
+        guard tripID.hasPrefix("ojp:"),
+              let marker = tripID.range(of: "_ch:1:sjyid:"),
+              let end = tripID[marker.upperBound...].firstIndex(of: "_") else { return nil }
+        let reference = String(tripID[tripID.index(after: marker.lowerBound)..<end])
+        let parts = reference.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 5, !parts[3].isEmpty, parts[3].allSatisfy(\.isNumber),
+              let number = parts[4].split(separator: "-").first,
+              !number.isEmpty, number.allSatisfy(\.isNumber) else { return nil }
+        let date = String(tripID[tripID.index(after: end)...])
+        guard date.count == 8, date.allSatisfy(\.isNumber),
+              startDate == nil || startDate == date else { return nil }
+        return reference
+    }
+
     /// Whether this run is one the timetable cannot contain.
     ///
     /// All four of these describe a working that was not planned, and all four
@@ -87,6 +105,7 @@ public struct TripUpdate: Sendable {
 /// One call, as it is now expected to happen.
 public struct StopTimeUpdate: Sendable {
     public var stopID: String?
+    public var assignedStopID: String?
     public var sequence: Int?
     /// Absolute times where the producer gives them, which this feed does.
     public var arrival: Timestamp?
@@ -94,21 +113,27 @@ public struct StopTimeUpdate: Sendable {
     public var arrivalDelay: Int?
     public var departureDelay: Int?
     /// The vehicle passes without serving this stop — the counterpart to
-    /// SIRI's cancelled call.
+    /// a cancelled call.
     public var skipped: Bool
+    /// An extra halt that is not in the static trip — GTFS-RT
+    /// `UNSCHEDULED`. SBB's "exceptional stop".
+    public var extra: Bool
 
     public init(
         stopID: String? = nil, sequence: Int? = nil,
         arrival: Timestamp? = nil, departure: Timestamp? = nil,
-        arrivalDelay: Int? = nil, departureDelay: Int? = nil, skipped: Bool = false
+        arrivalDelay: Int? = nil, departureDelay: Int? = nil, skipped: Bool = false,
+        assignedStopID: String? = nil, extra: Bool = false
     ) {
         self.stopID = stopID
+        self.assignedStopID = assignedStopID
         self.sequence = sequence
         self.arrival = arrival
         self.departure = departure
         self.arrivalDelay = arrivalDelay
         self.departureDelay = departureDelay
         self.skipped = skipped
+        self.extra = extra
     }
 }
 
@@ -278,7 +303,18 @@ enum Protobuf {
                 if arriving { out.arrival = time; out.arrivalDelay = delay }
                 else { out.departure = time; out.departureDelay = delay }
             case (5, 0):
-                out.skipped = reader.varint() == 1
+                // StopTimeUpdate.schedule_relationship: SCHEDULED=0,
+                // SKIPPED=1, NO_DATA=2, UNSCHEDULED=3 (extra halt).
+                let relationship = Int(reader.varint())
+                out.skipped = relationship == 1
+                out.extra = relationship == 3
+            case (6, 2):                          // StopTimeProperties
+                let range = reader.region()
+                var properties = Reader(raw, from: range.lowerBound, to: range.upperBound)
+                while let (field, wire) = properties.next() {
+                    if field == 1, wire == 2 { out.assignedStopID = properties.string() }
+                    else { properties.skip(wire) }
+                }
             default:
                 reader.skip(wire)
             }

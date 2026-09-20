@@ -1,18 +1,7 @@
 import SwiftUI
 import TransitCore
 
-/// One line, whole.
-///
-/// The end of a chain of questions the app could already start and not finish.
-/// A stop's board says an RE1 to Bern calls here; the "lines running through
-/// here" list says so even when nothing is running; and until now both stopped
-/// there. This is where it goes — every stop in order, and the run itself drawn
-/// on the map behind the sheet.
-///
-/// It comes from the mapped routes rather than from the timetable, and the
-/// panel says so at the bottom rather than pretending otherwise. That is also
-/// why there are no times on it: a relation describes a line, not a working, so
-/// it knows the order of the stops and nothing whatever about the hour.
+/// A route on the main map, with the ordered stops as navigation links.
 struct LinePanel: View {
     @Bindable var model: AppModel
     let line: RouteLine
@@ -22,7 +11,9 @@ struct LinePanel: View {
     /// The same trim `ServingRow` makes, for the same reason: OSM names a
     /// relation `Tram 8: Zoo → Hardturm`, and beside a badge reading **8** the
     /// first two words are said twice.
-    private var headline: String { RouteNaming.trim(line.headline, ref: line.ref) }
+    private var headline: String {
+        StopNaming.displayRoute(RouteNaming.trim(line.headline, ref: line.ref))
+    }
 
     var body: some View {
         List {
@@ -31,14 +22,20 @@ struct LinePanel: View {
                     LineBadge(line: line.ref.isEmpty ? line.mode.label : line.ref,
                               mode: line.mode)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(headline).font(.callout)
-                        if let operatorName = line.operatorName {
-                            Text(operatorName).font(.caption2).foregroundStyle(.secondary)
+                        if let to = line.to, !to.isEmpty {
+                            Text(to).font(.headline)
+                        } else if !headline.isEmpty {
+                            Text(headline).font(.headline)
+                        }
+                        if let from = line.from {
+                            Text("from \(from)").font(.subheadline).foregroundStyle(.secondary)
                         }
                     }
                     Spacer(minLength: 4)
                 }
                 .padding(.vertical, 2)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("Route endpoints")
             }
 
             if line.stops.isEmpty {
@@ -60,21 +57,17 @@ struct LinePanel: View {
                             row(stop)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel(StopNaming.display(stop.name))
+                        .accessibilityIdentifier("Route stop")
                     }
                 }
             }
 
-            Section {
-                Text("""
-                From the mapped routes rather than from the timetable, so it \
-                answers at any hour — and shows one direction of the line as it \
-                is mapped, with no times.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
         }
         .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .menuAnimation(value: line.stops.map(\.id))
+        .accessibilityIdentifier("Route stops")
         .navigationTitle(line.ref.isEmpty ? line.mode.label : line.ref)
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -82,7 +75,7 @@ struct LinePanel: View {
     private func row(_ stop: RouteStop) -> some View {
         HStack(spacing: 10) {
             marker(stop)
-            Text(stop.name)
+            Text(StopNaming.display(stop.name))
                 .font(.callout)
                 .foregroundStyle(.primary)
                 .lineLimit(1)
@@ -110,35 +103,5 @@ struct LinePanel: View {
                 Circle().fill(line.mode.color).frame(width: 5, height: 5)
             }
         }
-    }
-}
-
-/// Naming a relation for a reader, in one place because two panels do it.
-enum RouteNaming {
-    /// `Tram 8: Zoo → Hardturm` beside a badge reading **8** is `Zoo → Hardturm`.
-    ///
-    /// Only where the part before the colon really is the label — within a
-    /// couple of words of it — so a name that happens to contain a colon for
-    /// some other reason is left exactly as it was mapped.
-    static func trim(_ headline: String, ref: String) -> String {
-        let withoutRef: String
-        guard !ref.isEmpty, let colon = headline.firstIndex(of: ":") else {
-            return arrows(in: headline)
-        }
-        let prefix = headline[..<colon]
-        guard prefix.hasSuffix(ref), prefix.count <= ref.count + 14 else {
-            return arrows(in: headline)
-        }
-        withoutRef = headline[headline.index(after: colon)...]
-            .trimmingCharacters(in: .whitespaces)
-        return arrows(in: withoutRef)
-    }
-
-    /// OSM route names commonly carry the ASCII `=>`. Use the actual arrow the
-    /// rest of the app uses, without changing either endpoint's spelling.
-    private static func arrows(in headline: String) -> String {
-        headline
-            .replacingOccurrences(of: " => ", with: " → ")
-            .replacingOccurrences(of: "=>", with: " → ")
     }
 }

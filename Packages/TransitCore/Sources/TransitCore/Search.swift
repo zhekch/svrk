@@ -82,18 +82,13 @@ extension Journey {
         return Journey.trimZeros(String(head))
     }
 
-    static func trimZeros(_ text: String) -> String {
-        let trimmed = text.drop { $0 == "0" }
-        return trimmed.isEmpty ? "0" : String(trimmed)
-    }
-
     /// The line as it is compared: no case, no spaces, no punctuation.
     ///
     /// "IC 8", "ic8" and "IC-8" are one line typed three ways, and a search that
     /// told them apart would be a search that fails for the two thirds of people
     /// who do not type it the way the feed spells it.
     var searchableLine: String {
-        line.uppercased().filter { $0.isLetter || $0.isNumber }
+        Self.publishedLine(line, mode: mode)
     }
 }
 
@@ -175,11 +170,7 @@ extension Fleet {
 
     /// `ch:1:sloid:3000` → `8503000`, which is how the place register spells it.
     static func didok(forSloid sloid: Substring) -> String? {
-        guard let colon = sloid.lastIndex(of: ":") else { return nil }
-        let number = sloid[sloid.index(after: colon)...]
-        guard !number.isEmpty, number.count <= 5, number.allSatisfy(\.isNumber)
-        else { return nil }
-        return "85" + String(repeating: "0", count: 5 - number.count) + number
+        StopRegister.didok(forSloid: String(sloid))
     }
 
     /// Services whose line or number matches.
@@ -222,7 +213,7 @@ extension Fleet {
             let hit = VehicleHit(
                 id: journey.id, mode: journey.mode, line: journey.line,
                 category: journey.category, number: journey.trainNumber,
-                from: journey.from, to: journey.to,
+                from: journey.from, to: Journey.reachedDestination(journey),
                 departure: journey.stops[0].dep,
                 arrival: journey.stops[journey.stops.count - 1].arr,
                 lon: coord.lon, lat: coord.lat, running: position != nil

@@ -3,9 +3,8 @@ import MapboxMaps
 /// The railway network, in OpenRailwayMap's own colours.
 ///
 /// The app's own overlay — `transit-tracks` in `MapCoordinator` — is drawn from
-/// the routing graph: two flat colours at whatever opacity the dial is set to,
-/// which is exactly right as a hint under the vehicles and nearly invisible
-/// when what you actually want to read is the railway itself.
+/// the routing graph: two colours, the same red and green as the vehicles,
+/// which is the Simple overlay on the map settings.
 ///
 /// This is the other answer, and it is ORM's: the same standard style the web
 /// map draws, where an orange line is a main line, yellow a branch, olive a
@@ -105,8 +104,8 @@ enum RailwayLines {
                     Exp(.exponential) { 1.2 }
                     Exp(.zoom)
                     8; serviceWidth
-                    15; serviceWidth
-                    16; 2
+                    14; serviceWidth
+                    16; 1.0
                 }
             )
         ),
@@ -125,9 +124,9 @@ enum RailwayLines {
                 Exp(.interpolate) {
                     Exp(.exponential) { 1.2 }
                     Exp(.zoom)
-                    8; 1.5
-                    14; 1.5
-                    16; 2
+                    8; 1.8
+                    14; 1.4
+                    16; 1.0
                 }
             )
         ),
@@ -225,8 +224,8 @@ enum RailwayLines {
             Exp(.interpolate) {
                 Exp(.exponential) { 1.2 }
                 Exp(.zoom)
-                0; 0.5
-                7; 2
+                0; 1.2
+                7; 2.4
             }
         )
     )
@@ -236,9 +235,9 @@ enum RailwayLines {
             Exp(.interpolate) {
                 Exp(.exponential) { 1.2 }
                 Exp(.zoom)
-                7; 2
-                14; 2
-                16; 3
+                7; 2.5
+                12; 1.8
+                16; 1.1
             }
         )
     }
@@ -282,11 +281,10 @@ enum RailwayLines {
             var source = VectorSource(id: id)
             source.url = url
             source.attribution = RailwayShapes.attribution
-            // No blurred-up placeholder from a coarser tile: the overlay is off
-            // by default, and when it is on the tiles it wants are the ones on
-            // screen. Fetching a second set to tide it over is a request ORM
-            // pays for and nobody looks at.
-            source.prefetchZoomDelta = 0
+            // A coarser vector tile covers the view while detailed tracks load.
+            // One zoom level limits the extra traffic while giving camera moves
+            // a quick first drawing. Hidden layers still request no tiles.
+            source.prefetchZoomDelta = 1
             try style.addSource(source)
         }
     }

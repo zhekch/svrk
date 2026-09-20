@@ -53,6 +53,16 @@ enum VehicleShapes {
     static let followXray = "transit-vehicle-shapes-followed-xray"
     static let followOutline = "transit-vehicle-shapes-followed-outline"
 
+    /// Layers a tap can ask the renderer about. The flat fill is empty once a
+    /// vehicle has stood up as a mesh; the x-ray line is what remains visible
+    /// through a station building.
+    static var tapLayers: [String] {
+        [fill, followFill, xray, followXray, outline, followOutline, fill + "-selected", outline + "-selected"]
+    }
+
+    /// Property carrying the vehicle id on every drawn feature.
+    static let vehicleIdKey = Key.vehicle
+
     /// Which of the three drawings a feature belongs to.
     ///
     /// One source now holds all of them — the flat footprint, the solid it
@@ -112,6 +122,8 @@ enum VehicleShapes {
         static let lift = "z"
         /// How much of this drawing is left, 1 in the open, 0 in a tunnel.
         static let opacity = "op"
+        /// The vehicle this polygon belongs to, so a tap can name it.
+        static let vehicle = "vid"
     }
 
     /// Install the two layers, on top of whatever has been installed so far.
@@ -136,6 +148,31 @@ enum VehicleShapes {
                     outline: Self.followOutline, xray: Self.followXray)
     }
 
+    /// Split the existing source by ownership; no second footprint upload.
+    static func raiseSelectedFootprint(_ style: MapboxMap, above anchor: String) throws {
+        var topmost = anchor
+        for base in [casing, fill, ghost, outline] {
+            let id = base + "-selected"
+            if !style.layerExists(withId: id) {
+                var properties = try style.layerProperties(for: base)
+                let filter = properties["filter"] ?? ["literal", true]
+                properties["id"] = id
+                properties["slot"] = "top"
+                properties["filter"] = ["all", filter, ["get", "route-owner"]]
+                try style.addLayer(with: properties, layerPosition: .above(topmost))
+                try style.setLayerProperty(for: base, property: "filter",
+                                          value: ["all", filter, ["!", ["get", "route-owner"]]])
+            }
+            topmost = id
+        }
+        // This source already contains only the followed vehicle. Keep its
+        // existing layers so its renderer-owned translation remains shared.
+        for id in [followCasing, followFill, followGhost, followOutline, followXray] {
+            try style.moveLayer(withId: id, to: .above(topmost))
+            topmost = id
+        }
+    }
+
     private static func install(
         _ style: MapboxMap, source sourceId: String,
         casing: String, fill: String, ghost: String, outline: String,
@@ -147,6 +184,16 @@ enum VehicleShapes {
         // large enough to be worth simplifying. Both of those are the opposite
         // of what tiling a GeoJSON source is for.
         source.tolerance = 0
+        // This source also owns whole 3D models. A tile buffer copies their
+        // point anchors into neighbouring tiles; unlike a flat polygon, a
+        // model cannot be clipped at the tile edge. Camera movement can expose
+        // both copies while those tiles are being replaced. Keep each anchor
+        // in its owning tile, for both the fleet and the follow source.
+        source.buffer = 0
+        // Do not seed this moving source with coarse parent tiles. Their
+        // quantised anchors and older positions can briefly coexist with the
+        // requested tiles during a pan, tilt or rotation.
+        source.prefetchZoomDelta = 0
         if !style.sourceExists(withId: sourceId) {
             try style.addSource(source)
         }
@@ -191,6 +238,9 @@ enum VehicleShapes {
         // ground under the vehicle it belongs to.
         bodies.filter = lying
         bodies.fillColor = .expression(Exp(.get) { Key.colour })
+        // Partial source updates retain a stable drawing order as vehicles
+        // enter/leave. The follow and 3D lanes use their existing source order.
+        bodies.fillSortKey = .expression(Exp(.coalesce) { Exp(.get) { "draw-order" }; 0 })
         // On. Everything here is a small polygon at an arbitrary angle — a
         // coach on a curve is never axis-aligned — and an aliased edge on a
         // seven-point-wide body is a visible staircase.
@@ -211,6 +261,7 @@ enum VehicleShapes {
         var seen = FillLayer(id: ghost, source: sourceId)
         seen.filter = lying
         seen.fillColor = .expression(Exp(.get) { Key.colour })
+        seen.fillSortKey = bodies.fillSortKey
         seen.fillOpacity = .constant(ghostOpacity)
         seen.fillAntialias = .constant(true)
         try style.addLayer(seen)
@@ -296,6 +347,12 @@ enum VehicleShapes {
         // the map is still looking straight down.
         through.visibility = .constant(.none)
         try style.addLayer(through)
+        // Ground fills are not drawn. Vehicles go from dots to 3D models;
+        // these layers stay installed so a style reload does not have to
+        // rebuild them, but they never paint.
+        for id in [casing, fill, ghost, outline] {
+            try style.setLayerProperty(for: id, property: "visibility", value: "none")
+        }
         // Lifted to the wagon, not draped on the mountain over it. A line on
         // the ground is *on* the terrain, so the terrain cannot occlude it and
         // `line-occlusion-opacity` has nothing to show through a hill. At the
@@ -343,16 +400,35 @@ enum VehicleShapes {
     /// would paint a plan around the base of every standing train. See the note
     /// on the x-ray layer in `install`.
     static func setXray(_ style: MapboxMap, solids: Bool, occluders: Bool) {
-        let ghostVisible = occluders && !solids
-        for layer in [ghost, followGhost] where style.layerExists(withId: layer) {
-            try? style.setLayerProperty(
-                for: layer, property: "visibility", value: ghostVisible ? "visible" : "none"
-            )
+        // Camera properties apply before an asynchronous GeoJSON upload. When
+        // models switch off, ignore the old upload's `stood` flag immediately;
+        // otherwise neither the old solid nor its flat fallback can draw.
+        let flat: [Any] = ["==", ["get", Kind.key], Kind.flat]
+        let lying: [Any] = solids ? ["all", flat, ["!", ["get", Key.stood]]] : flat
+        func apply(_ base: String, _ filter: [Any]) {
+            guard style.layerExists(withId: base) else { return }
+            let selected = base + "-selected"
+            if style.layerExists(withId: selected) {
+                try? style.setLayerProperty(for: base, property: "filter",
+                                           value: ["all", filter, ["!", ["get", "route-owner"]]])
+                try? style.setLayerProperty(for: selected, property: "filter",
+                                           value: ["all", filter, ["get", "route-owner"]])
+            } else {
+                try? style.setLayerProperty(for: base, property: "filter", value: filter)
+            }
         }
-        let xrayVisible = occluders && solids
-        for layer in [xray, followXray] where style.layerExists(withId: layer) {
+        for layer in [fill, followFill, ghost, followGhost] { apply(layer, lying) }
+        for layer in [outline, followOutline] { apply(layer, ["all", lying, ["get", Key.body]]) }
+        for layer in [casing, followCasing] { apply(layer, ["all", lying, ["get", Key.body], ["get", Key.above]]) }
+        let ground = [
+            fill, followFill, ghost, followGhost, outline, followOutline,
+            casing, followCasing, xray, followXray,
+            fill + "-selected", ghost + "-selected",
+            outline + "-selected", casing + "-selected",
+        ]
+        for layer in ground where style.layerExists(withId: layer) {
             try? style.setLayerProperty(
-                for: layer, property: "visibility", value: xrayVisible ? "visible" : "none"
+                for: layer, property: "visibility", value: "none"
             )
         }
     }
@@ -391,6 +467,7 @@ enum VehicleShapes {
     static func features(
         _ footprints: [VehicleFootprint], excluding excluded: String? = nil,
         flatness: Double = 1, stood: Set<String> = [],
+        omitStandingDetails: Bool = true,
         lifts: [String: [Double]] = [:],
         opacities: [String: [Double]] = [:]
     ) -> [Feature] {
@@ -446,7 +523,7 @@ enum VehicleShapes {
                 // `Terrain3D.groundLayers`. Eighteen invisible polygons per
                 // wagon is most of the source, and on a tilted map it is most
                 // of the work of drawing one.
-                if standing, part.role != .body { continue }
+                if standing, omitStandingDetails, part.role != .body { continue }
                 var ring = part.ring.map {
                     CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
                 }
@@ -471,10 +548,12 @@ enum VehicleShapes {
                 )
                 feature.properties = [
                     Kind.key: .string(Kind.flat),
+                    Key.vehicle: .string(print.id),
                     Key.colour: .string(Palette.rgba(part.fill, alpha: drawn)),
                     Key.body: .boolean(isBody),
                     Key.stroke: .string(edge),
                     Key.selected: .boolean(print.ringed),
+                    "route-owner": .boolean(print.selected),
                     Key.above: .boolean(print.aboveGround),
                     Key.shade: .string(shade(drawn)),
                     Key.casing: .number(casingWidth),

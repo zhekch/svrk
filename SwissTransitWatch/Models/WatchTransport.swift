@@ -6,7 +6,8 @@ enum WatchTransitPolicy {
 
     /// Vehicle coordinates are cheap timetable interpolation, not radio or GPS
     /// samples. Five seconds is visibly current on a watch without asking
-    /// MapKit to redraw at phone-like frame rates.
+    /// MapKit to redraw at phone-like frame rates, and already slower than
+    /// the 1 Hz ceiling a phone-style national walk would need.
     static let mapPositionInterval: TimeInterval = 5
 
     /// Pull new runs and prognosis changes much less often than dots move. The

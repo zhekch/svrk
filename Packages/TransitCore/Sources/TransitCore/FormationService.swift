@@ -540,12 +540,12 @@ extension FormationResponse {
             // no business in a drawing of the train, but it is the only thing
             // that says which sectors lie beyond it — so it travels alongside.
             let filed = FormationShortString.parse(stop.formationShort?.formationShortString ?? "")
-            var coaches = filed.filter { $0.kind != .fictitious }
+            var coaches = filed.filter(\.isTrainVehicle)
 
             // Which way round the train is standing *here*.
             let vehicles = Self.vehicles(for: coaches, among: lists)
 
-            if coaches.isEmpty {
+            if filed.isEmpty {
                 // No realtime string for this stop — the origin of a run
                 // sometimes has none. Fall back to the vehicle list, which has
                 // no types but does have the sectors.
@@ -558,12 +558,16 @@ extension FormationResponse {
             }
 
             // Both halves are now ordered from the front of the train as it
-            // stands here, so they join on position.
+            // stands here, so they join on position. Closed status is already
+            // on the short-string coaches; FOS `closed` is only used when
+            // there is no string to read — see `Coach.apply`.
             for i in coaches.indices {
                 guard let vehicle = vehicles.first(where: { $0.position == coaches[i].position })
                     ?? vehicles[safe: coaches[i].position - 1]
                 else { continue }
-                coaches[i].apply(vehicle, at: vehicle.stop(uic: uic))
+                coaches[i].apply(
+                    vehicle, at: vehicle.stop(uic: uic), overlayClosed: filed.isEmpty
+                )
             }
 
             let sectors = orderedSectors(of: coaches)
@@ -659,20 +663,29 @@ extension FormationResponse {
     /// take the best. A train with one orientation, or a stop whose string
     /// carries no numbers, scores nothing either way and keeps the first list —
     /// which is what this did before.
+    ///
+    /// Number matches can tie: IC 737 answers four copies of the same sixteen
+    /// coaches, two of them numbered 1…8 the same way round, and one of those
+    /// two marks the leading pair closed. The short string (and SBB) do not.
+    /// Closed-status agreement is the tie-break, so a stale FOS copy does not
+    /// beat a later one that actually matches the stop.
     static func vehicles(for coaches: [Coach], among lists: [[Vehicle]]) -> [Vehicle] {
         guard lists.count > 1 else { return lists.first ?? [] }
         var best = lists[0]
         var bestScore = -1
+        var bestClosed = -1
         for list in lists {
             var score = 0
+            var closed = 0
             for coach in coaches {
-                guard let printed = coach.number else { continue }
                 let vehicle = list.first { $0.position == coach.position }
                     ?? list[safe: coach.position - 1]
-                if vehicle?.number == printed { score += 1 }
+                if let printed = coach.number, vehicle?.number == printed { score += 1 }
+                if coach.isClosed == (vehicle?.vehicleProperties?.closed == true) { closed += 1 }
             }
-            if score > bestScore {
+            if score > bestScore || (score == bestScore && closed > bestClosed) {
                 bestScore = score
+                bestClosed = closed
                 best = list
             }
         }
@@ -719,7 +732,8 @@ private extension FormationResponse.Vehicle {
 
 private extension Coach {
     mutating func apply(
-        _ vehicle: FormationResponse.Vehicle, at stop: FormationResponse.Vehicle.VehicleStop?
+        _ vehicle: FormationResponse.Vehicle, at stop: FormationResponse.Vehicle.VehicleStop?,
+        overlayClosed: Bool
     ) {
         // The vehicle list numbers coaches for reservation; the short string
         // carries the same number and usually agrees. Where only one of them
@@ -754,7 +768,15 @@ private extension Coach {
         length = properties.length
         wheelchairSpaces = properties.accessibilityProperties?.numberWheelchairSpaces
         wheelchairToilet = properties.accessibilityProperties?.wheelchairToilet
-        if properties.closed == true { status.insert(.closed) }
+        // FOS `closed` is not stop-specific and is not trustworthy across the
+        // orientations the response repeats. IC 737 at Bern carries four copies
+        // of the same rake; one of them marks the two leading first-class
+        // coaches closed, the CUS short string (and SBB) do not — the locked
+        // half is the coupled set at the back, encoded as `-` on those vehicles.
+        // Overlaying the flag dashed the front of a train whose open coaches
+        // the passenger can walk into. The short string is the stop-specific
+        // answer; this flag is only applied when there is no string to read.
+        if overlayClosed, properties.closed == true { status.insert(.closed) }
     }
 }
 

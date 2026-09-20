@@ -227,15 +227,15 @@ actor WatchNationalTimetableService {
                     && max($0.arr, $0.dep) >= nowStamp - 2 * 60
             }) else { return nil }
             let call = journey.stops[callIndex]
-            let line = journey.line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let line = Journey.publishedLine(journey.line, mode: journey.mode)
             let vehicle = Self.vehicle(
                 from: journey,
                 at: nowStamp,
                 includeUpcoming: true
             )
-            let destination = journey.to ?? "—"
+            let destination = Journey.reachedDestination(journey, from: callIndex) ?? "—"
             let displayLine = line.isEmpty
-                ? (journey.number ?? journey.mode.rawValue.capitalized)
+                ? (journey.number ?? (journey.extra ? "ext" : journey.mode.rawValue.capitalized))
                 : line
             let direction = journey.stops.dropFirst(callIndex + 1).compactMap { next -> String? in
                     guard let reference = next.ref else { return nil }
@@ -422,6 +422,7 @@ actor WatchNationalTimetableService {
                 && $0.lat.isFinite && $0.lon.isFinite
                 && (-90 ... 90).contains($0.lat)
                 && (-180 ... 180).contains($0.lon)
+                && !StopNaming.isTechnical($0.name)
         }
         guard calls.count >= 2,
               now <= calls[calls.count - 1].dep + 2 * 60
@@ -441,7 +442,7 @@ actor WatchNationalTimetableService {
             return nil
         }
 
-        let line = journey.line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let line = Journey.publishedLine(journey.line)
         let stops = calls.map { call in
             WatchTransitStop(
                 id: call.key,
@@ -457,8 +458,10 @@ actor WatchNationalTimetableService {
         return WatchTransitVehicle(
             id: journey.id,
             mode: journey.mode.rawValue,
-            line: line.isEmpty ? (journey.number ?? journey.mode.rawValue.capitalized) : line,
-            destination: journey.to,
+            line: line.isEmpty
+                ? (journey.number ?? (journey.extra ? "ext" : journey.mode.rawValue.capitalized))
+                : line,
+            destination: Journey.reachedDestination(journey),
             origin: journey.from,
             operatorName: journey.operatorName,
             delayMinutes: position.delay,

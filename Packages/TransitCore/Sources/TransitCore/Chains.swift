@@ -8,11 +8,23 @@ import Foundation
 /// vanishing at the junction and an unrelated dot appearing beside it, when in
 /// reality one train rolled through.
 ///
-/// The feed carries no "continues as" field, so continuations are inferred. The
-/// inference is deliberately cautious: a wrong link teleports a train across the
-/// country, which is far worse than leaving two legs unlinked. Every candidate
-/// must clear `candidateScore`, and the two journeys must each be the other's
-/// best match before they are joined.
+/// The feed states this outright, and that is what is used: GTFS files a
+/// through-service as `transfer_type=4`, the packed timetable carries the
+/// national graph of them, and the realtime formation service adds the ones put
+/// together this morning. See `ThroughGraph`.
+///
+/// Where the feed has said something about a working, its word is taken whole —
+/// including its silence about a successor that is simply not on screen. The
+/// inference below runs only for the workings the feed does not mention at all:
+/// runs added in the last hour, foreign operators, the 7.4% of trips carrying
+/// no journey reference. It is deliberately cautious, because a wrong link
+/// teleports a train across the country, which is far worse than leaving two
+/// legs unlinked.
+///
+/// This ordering is the whole point. Guessing *alongside* stated fact is what
+/// drew two dots on one platform at Spiez: the inference chained the arriving
+/// RE1 to one of its two halves and the other half appeared beside it as a
+/// vehicle of its own.
 public enum Chains {
     /// A continuation departs after the arrival, but not much later.
     ///
@@ -46,6 +58,7 @@ public enum Chains {
     /// Score a possible A→B continuation, or nil if it fails a hard
     /// requirement. Lower is better.
     static func candidateScore(_ a: Journey, _ b: Journey) -> Int? {
+        guard !a.cancelled, !b.cancelled else { return nil }
         if a.id == b.id { return nil }
         if a.mode != b.mode { return nil }
         // Trip numbers are only unique per operator, and a handover between two
@@ -65,7 +78,10 @@ public enum Chains {
         if let endRef = end.ref, let beginRef = begin.ref, endRef != beginRef { return nil }
 
         let gap = begin.dep - end.arr
-        let sameLine = a.line == b.line
+        // A product such as "IC" is shared by unrelated numbered trains.
+        // Only an actual line (IC8, RE1, S1, …) earns the longer dwell window.
+        let sameLine = a.line == b.line && !a.line.isEmpty
+            && Categories.mode(of: a.line) == .other
         if gap < minGap { return nil }
 
         if sameLine {
@@ -113,26 +129,106 @@ public enum Chains {
         //
         // Comparing whole stop lists rather than just the turn is what catches
         // it: a genuine through-service carries on to new stations, while a
-        // turnback revisits the ones it has just left.
-        let called = Set(a.stops.dropLast().map(\.name))
-        for stop in b.stops.dropFirst() where called.contains(stop.name) { return nil }
+        // turnback revisits the ones it has just left. Station identity, not
+        // the printed name: "Domodossola, stazione" and "Domodossola (I)" are
+        // one call, and joining those halves drew both directions of the RE1
+        // as one vehicle.
+        guard carriesOn(a, b) else { return nil }
 
         return gap + (sameLine ? 0 : 10 * 60)
+    }
+
+    /// A published through-destination can connect numbered portions whose
+    /// junction platforms differ, as with RE1 at Spiez. Matching line labels
+    /// and nearby times alone must never override `candidateScore`'s rejection.
+    static func passengerContinuationScore(_ a: Journey, _ b: Journey) -> Int? {
+        guard !a.cancelled, !b.cancelled, a.id != b.id, a.mode == b.mode else { return nil }
+        if (a.operatorName ?? "") != (b.operatorName ?? "") { return nil }
+        guard let end = a.stops.last, let begin = b.stops.first else { return nil }
+        guard stationKey(end) == stationKey(begin) else { return nil }
+        let gap = begin.dep - end.arr
+        guard a.line == b.line, gap >= minGap, gap <= maxGapSameLine else { return nil }
+        guard !a.line.isEmpty, Categories.mode(of: a.line) == .other,
+              let advertised = a.to, let destination = b.stops.last?.name else { return nil }
+        let destinations = advertised.split(separator: "|").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        guard destinations.contains(where: {
+            !StopNaming.sameBoardDestination($0, end.name)
+                && StopNaming.sameBoardDestination($0, destination)
+        }) else { return nil }
+        guard carriesOn(a, b) else { return nil }
+        return gap
+    }
+
+    /// One station, however the two workings spelled it.
+    static func stationKey(_ call: Call) -> String {
+        let station = StopRegister.stationOf(call.ref)
+        if !station.isEmpty { return "id:\(station)" }
+        var name = call.name
+        if let paren = name.lastIndex(of: "(") { name = String(name[..<paren]) }
+        if let comma = name.firstIndex(of: ",") { name = String(name[..<comma]) }
+        return "name:\(Fleet.squash(name))"
+    }
+
+    /// Whether `b` carries the run onward rather than back over `a`'s route.
+    ///
+    /// A working that heads back the way it came is the same vehicle and a
+    /// different service. The feed says so too — a bus turnaround is published
+    /// as an in-seat transfer, because the passenger genuinely can stay on —
+    /// but `join` concatenates stop lists, so drawing the pair as one vehicle
+    /// gives a journey that runs out and back: every stop listed twice in the
+    /// panel, and no route match at all, because matching walks stops in order.
+    ///
+    /// Comparing whole stop lists rather than just the turn is what catches it.
+    /// Station identity, not the printed name: "Domodossola, stazione" and
+    /// "Domodossola (I)" are one call, and joining those halves drew both
+    /// directions of the RE1 as one vehicle.
+    static func carriesOn(_ a: Journey, _ b: Journey) -> Bool {
+        if let origin = a.stops.first, let dest = b.stops.last,
+           stationKey(origin) == stationKey(dest) {
+            return false
+        }
+        let called = Set(a.stops.dropLast().map(stationKey))
+        return !b.stops.dropFirst().contains { called.contains(stationKey($0)) }
     }
 
     /// Group journeys into one entry per physical vehicle.
     ///
     /// Unlinked journeys come back unchanged; linked ones are flattened into a
     /// single journey carrying `parts`.
-    public static func build(_ journeys: some Sequence<Journey>) -> [Journey] {
+    public static func build(
+        _ journeys: some Sequence<Journey>,
+        published: ThroughGraph = .empty
+    ) -> [Journey] {
         let all = Array(journeys)
         guard !all.isEmpty else { return [] }
 
-        // Index by the station a journey starts from, so finding the
-        // continuations of a journey ending at X does not mean scanning the
-        // entire fleet.
+        let stated = Stated(published, in: all)
+
+        var next: [Int: Int] = [:]
+        var hasPrev = Set<Int>()
+
+        // --- what the feed says ---
+
+        for (from, successors) in stated.successors {
+            // A working the feed says parts has not continued, and folding
+            // either half into it would draw that half twice — once inside the
+            // parent and once beside it. Both are held instead; see
+            // `markHandovers`.
+            guard !stated.parts(from), successors.count == 1, let to = successors.first
+            else { continue }
+            // Two workings arriving and one leaving is a join, and only one of
+            // them can carry the number onward without drawing it twice.
+            guard stated.principal(into: to) == from else { continue }
+            next[from] = to
+            hasPrev.insert(to)
+        }
+
+        // --- and, only where it says nothing, what can be inferred ---
+
         var startingAt: [String: [Int]] = [:]
-        for (i, j) in all.enumerated() {
+        for (i, j) in all.enumerated() where !stated.mentions(i) {
             guard let first = j.stops.first else { continue }
             startingAt[first.name, default: []].append(i)
         }
@@ -140,7 +236,7 @@ public enum Chains {
         var bestNext: [Int: Link] = [:]
         var bestPrev: [Int: (index: Int, score: Int, runnerUp: Int)] = [:]
 
-        for (i, a) in all.enumerated() {
+        for (i, a) in all.enumerated() where !stated.mentions(i) {
             guard let last = a.stops.last else { continue }
             var winner = -1
             var winnerScore = Int.max
@@ -177,14 +273,14 @@ public enum Chains {
         // A's best successor is B, and B has no other predecessor that fits
         // nearly as well. This is what keeps busy junctions from inventing
         // through-services.
-        var next: [Int: Int] = [:]
-        var hasPrev = Set<Int>()
         for (a, link) in bestNext {
             guard let prev = bestPrev[link.index], prev.index == a else { continue }
             if prev.runnerUp != Int.max && prev.runnerUp - prev.score < ambiguityMargin { continue }
             next[a] = link.index
             hasPrev.insert(link.index)
         }
+
+        // --- walk the links out into chains ---
 
         var chains: [[Int]] = []
         var used = Set<Int>()
@@ -193,29 +289,45 @@ public enum Chains {
             var chain = [head]
             used.insert(head)
 
-            // Stations the chain has already called at, so a third leg cannot
-            // double back over the first. `candidateScore` compares each link
-            // against its immediate predecessor only, which is enough for a
-            // pair but not for a chain: a bus running out, back, and out again
+            // Stations the chain has already called at, so a leg cannot double
+            // back over an earlier one: a bus running out, back, and out again
             // passed every pairwise test and arrived as one 28-stop vehicle
             // that visited Uster three times.
-            var visited = Set(all[head].stops.dropLast().map(\.name))
+            //
+            // This applies to a published link too, and that is not the feed
+            // being wrong. `transfer_type=4` says the passenger stays on board,
+            // and on a city bus that is routinely true *through a turnaround* —
+            // 945 of the Ascona line 1 workings continue as the return run. The
+            // vehicle really is the same one. But `join` concatenates stop
+            // lists, so drawing it as one vehicle produces a journey that runs
+            // out and back: the panel shows every stop twice and route matching,
+            // which walks stops in order, matches nothing. The limit is the
+            // app's model of a vehicle, not the feed's honesty, so the two
+            // halves stay two vehicles and the platform handover below keeps
+            // them from being drawn at once.
+            var visited = Set(all[head].stops.dropLast().map(stationKey))
 
             var link = next[head]
             while let current = link, chain.count < maxChainLength {
                 if used.contains(current) { break } // a cycle would loop forever
-                if all[current].stops.dropFirst().contains(where: { visited.contains($0.name) }) { break }
+                if all[current].stops.dropFirst().contains(where: { visited.contains(stationKey($0)) }) {
+                    break
+                }
 
                 chain.append(current)
                 used.insert(current)
-                for stop in all[current].stops.dropLast() { visited.insert(stop.name) }
+                for stop in all[current].stops.dropLast() { visited.insert(stationKey(stop)) }
                 link = next[current]
             }
             chains.append(chain)
         }
 
-        // Any journey caught in a cycle never became a head; emit it on its own
-        // so it still appears on the map.
+        // A journey that was linked to but never reached still has to be drawn.
+        // Two ways that happens: it is caught in a cycle, or its chain broke at
+        // the doubling-back guard above — a published turnaround, whose halves
+        // are two vehicles on purpose. Either way it is emitted on its own, and
+        // `markLayovers` holds whatever it follows on the platform until it
+        // actually leaves.
         for i in all.indices where !used.contains(i) {
             used.insert(i)
             chains.append([i])
@@ -225,6 +337,7 @@ public enum Chains {
             chain.count == 1 ? all[chain[0]] : join(chain.map { all[$0] })
         }
         markLayovers(vehicles)
+        stated.markHandovers(in: vehicles, of: all)
         return vehicles
     }
 
@@ -265,6 +378,8 @@ public enum Chains {
         for vehicle in vehicles {
             vehicle.layover = nil
             vehicle.heldUntil = nil
+            vehicle.splitAppearance = nil
+            vehicle.splitContinuations = []
         }
 
         for vehicle in vehicles {
@@ -276,7 +391,7 @@ public enum Chains {
                 guard let begin = candidate.stops.first,
                       begin.dep > end.arr,
                       begin.dep - end.arr <= maxLayover,
-                      begin.dep < nextDep,
+                      (begin.dep < nextDep || (begin.dep == nextDep && candidate.id < (next?.id ?? ""))),
                       StopRegister.sameTrack(end.platform, begin.platform)
                 else { continue }
                 next = candidate
@@ -296,7 +411,18 @@ public enum Chains {
             // The other half of the same fact, written where the departure can
             // read it: this train is already on the map until then, so the
             // working it becomes must not draw a second dot beside it.
-            next.heldUntil = nextDep - 1
+            // Co-timed departures can be the two halves of a split. Delay
+            // every compatible working, not whichever dictionary entry won.
+            var coDepartures = 0
+            for child in startingAt[end.name] ?? [] where child !== vehicle {
+                guard let begin = child.stops.first, begin.dep == nextDep,
+                      child.mode == vehicle.mode,
+                      (child.operatorName ?? "") == (vehicle.operatorName ?? ""),
+                      StopRegister.sameTrack(end.platform, begin.platform) else { continue }
+                child.heldUntil = max(child.heldUntil ?? Timestamp.min, nextDep - 1)
+                coDepartures += 1
+            }
+            if coDepartures > 1 { vehicle.layover = Layover(until: nextDep - 1) }
         }
     }
 
@@ -325,10 +451,15 @@ public enum Chains {
         }
 
         let terminus = chain[chain.count - 1]
+        // Packed GTFS already prints coupled portions as "Brig | Zweisimmen"
+        // on the incoming working. The continuation's own headsign is one
+        // branch; keep the published split so a board does not collapse to
+        // whichever half we happened to join.
+        let advertised = chain.compactMap(\.to).first(where: { $0.contains("|") })
         let joined = Journey(
             id: head.id, mode: head.mode, category: head.category, line: head.line,
             number: head.number, operatorName: head.operatorName, operatorFull: head.operatorFull,
-            to: terminus.to, from: stops[0].name,
+            to: advertised ?? terminus.to, from: stops[0].name,
             delay: head.delay, start: stops[0].dep, end: stops[stops.count - 1].arr,
             complete: head.complete, monitored: head.monitored, cancelled: head.cancelled,
             source: head.source, stops: stops,
@@ -337,7 +468,7 @@ public enum Chains {
             parts: chain.enumerated().map { i, p in
                 JourneyPart(
                     id: p.id, line: p.line, number: p.number, category: p.category,
-                    operatorName: p.operatorName, mode: p.mode, to: p.to,
+                    operatorName: p.operatorName, mode: p.mode, to: p.stops.last?.name ?? p.to,
                     from: p.stops.first?.name ?? "—",
                     start: ranges[i].start, end: ranges[i].end,
                     journeyRef: p.journeyRef
@@ -354,6 +485,7 @@ public enum Chains {
         // to walk off, and the glide that was meant to hide the jump becomes
         // the jump. Expiry is by wall clock, so copying a spent one is inert.
         joined.settle = head.settle
+        joined.journeyRef = head.journeyRef
         return joined
     }
 }

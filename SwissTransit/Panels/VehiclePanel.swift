@@ -18,6 +18,7 @@ struct PanelFoldKey: PreferenceKey {
 
 /// One vehicle: what it is, where it is, and every call it makes.
 struct VehiclePanel: View {
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Bindable var model: AppModel
     let vehicle: VehicleSnapshot
     /// The working this vehicle arrived on, where the panel is showing the one
@@ -26,34 +27,134 @@ struct VehiclePanel: View {
     /// The stop-time row that opened a scheduled (not currently running)
     /// service. Nil for an actual vehicle selected on the map.
     var boardDeparture: Timestamp? = nil
+    /// Landscape resting card: the overview sits on the sheet itself, with no
+    /// nested list chrome and no navigation title.
+    var compactOverview = false
 
     /// Which half of a splitting train the stop list is following. Nil until
     /// the reader picks one, which is what makes the first direction the
     /// default without having to copy it into state and keep it in step.
     @State private var direction: String?
+    @State private var cableSummary: CableService.Summary?
+    @State private var cableSummaryVehicleID: String?
 
     private var now: Timestamp { model.clock.nowSeconds() }
+    private var showsCableService: Bool {
+        vehicle.mode == .cable
+            && (cableSummary?.usesServiceCard == true || CableService.isPointLift(vehicle))
+    }
+    private var showsFormation: Bool {
+        guard case let .ready(formation) = model.formationState else { return false }
+        return formationStop(of: formation) != nil
+    }
+    private var cableQueryKey: String {
+        guard vehicle.mode == .cable else { return "" }
+        return "\(vehicle.id)|\(now / 900)"
+    }
+
+    /// Side by side on iPhone landscape, where the sheet is short and wide.
+    private var usesColumns: Bool { verticalSizeClass == .compact }
+
+    /// The inset around the landscape overview. The measurement includes it,
+    /// so the sheet is sized to hold the last line rather than clip it.
+    private static let landscapeInset: CGFloat = 16
+
+    /// Less underneath than above, because the sheet is not finished where the
+    /// card is: it keeps a strip below everything laid out in it for the home
+    /// indicator, and that strip is already a bottom margin. A full inset on
+    /// top of it put half again as much air under the last line as over the
+    /// first one, which is what made the card look bottom-heavy even once it
+    /// was no longer too tall.
+    private static let landscapeBottomInset: CGFloat = 4
 
     var body: some View {
+        Group {
+            if usesColumns {
+                VStack(spacing: 0) {
+                    compactLandscapeCard
+                    if !compactOverview {
+                        List { listSections }
+                            .listStyle(.insetGrouped)
+                            .scrollContentBackground(.hidden)
+                            .contentMargins(.top, 4, for: .scrollContent)
+                    }
+                }
+            } else {
+                fullList
+            }
+        }
+        .menuAnimation(value: rows.map(\.id))
+        .menuAnimation(value: showsFormation)
+        .menuAnimation(value: model.vehicleAlerts.map(\.id))
+        .menuAnimation(value: model.vehicleWorks.map(\.id))
+        .menuAnimation(value: model.vehicleLoad != nil)
+        .menuAnimation(value: cableSummary)
+        .navigationTitle(compactOverview ? "" : vehicle.displayLine)
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: vehicle.id) { direction = nil }
+        .task(id: cableQueryKey) {
+            guard vehicle.mode == .cable else {
+                cableSummary = nil
+                cableSummaryVehicleID = nil
+                return
+            }
+            // A refresh of this lift must not remove and reinsert its card.
+            if cableSummaryVehicleID != vehicle.id {
+                cableSummary = nil
+                cableSummaryVehicleID = vehicle.id
+            }
+            let summary = await model.fleet.cableService(for: vehicle, at: now)
+            await model.waitForPanelPresentation()
+            guard !Task.isCancelled else { return }
+            cableSummary = summary
+        }
+    }
+
+    /// One blur window: destination and next stop on the sheet itself.
+    private var compactLandscapeCard: some View {
+        overviewCard
+            .padding(.horizontal, Self.landscapeInset)
+            .padding(.top, Self.landscapeInset)
+            .padding(.bottom, Self.landscapeBottomInset)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: PanelFoldKey.self, value: proxy.size.height.rounded()
+                    )
+                }
+            )
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    private var fullList: some View {
         List {
             // One row rather than two, with its own rule between the halves:
             // the sheet opens exactly this tall, and a section that is one row
             // has one height to measure.
             Section {
-                VStack(alignment: .leading, spacing: 10) {
-                    header
-                    Divider()
-                    journeyAhead
-                }
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: PanelFoldKey.self, value: proxy.size.height.rounded()
-                        )
-                    }
-                )
+                overviewCard
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: PanelFoldKey.self, value: proxy.size.height.rounded()
+                            )
+                        }
+                    )
             }
+            .id("overview")
 
+            listSections
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        // A thumb's width of nothing above the line badge, which is what pushed
+        // the next stop off the bottom of the sheet.
+        .contentMargins(.top, 4, for: .scrollContent)
+    }
+
+    @ViewBuilder
+    private var listSections: some View {
             // The train itself, between what it does next and the list of
             // everywhere it calls — which is where the question comes up. You
             // have read that it stops at Bern in four minutes; the next thing
@@ -64,13 +165,7 @@ struct VehiclePanel: View {
                 // is not one the panel raises.
                 EmptyView()
             case .loading:
-                Section("Formation") {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Looking up the coaches…")
-                            .font(.callout).foregroundStyle(.secondary)
-                    }
-                }
+                EmptyView()
             case let .ready(formation):
                 if let stop = formationStop(of: formation) {
                     Section("Formation") {
@@ -86,22 +181,10 @@ struct VehiclePanel: View {
                         // margin is put back inside the view, around the words.
                         .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
                     }
+                    .id("formation")
                 }
             case .unavailable:
-                Section("Formation") {
-                    // Said rather than left blank. This is a railway that does
-                    // publish formations, so a reader who can see the coaches in
-                    // the operator's own app is owed the difference between "we
-                    // did not ask" and "we asked and there was nothing" — most
-                    // often around midnight, when the realtime system has let go
-                    // of yesterday and not yet filled in today.
-                    Label(
-                        "No formation published for this train right now.",
-                        systemImage: "questionmark.circle"
-                    )
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                }
+                EmptyView()
             }
 
             // Above the stop list, because a cancelled connection changes
@@ -113,23 +196,7 @@ struct VehiclePanel: View {
                             .listRowBackground(Situation.alertBackground)
                     }
                 }
-            }
-
-            if let parts = vehicle.parts, parts.count > 1 {
-                Section("Runs as") {
-                    // A renumbering shown rather than hidden. The feed files
-                    // each numbered leg as its own journey; this vehicle is the
-                    // join of them.
-                    ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
-                        HStack {
-                            LineBadge(line: part.line, mode: part.mode)
-                            Text(part.from)
-                            Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.tertiary)
-                            Text(part.to ?? "—")
-                        }
-                        .font(.callout)
-                    }
-                }
+                .id("disruptions")
             }
 
             // The count belongs on the heading of the list it counts, not in a
@@ -138,12 +205,42 @@ struct VehiclePanel: View {
                 ForEach(rows) { row in
                     switch row.kind {
                     case let .call(stop, index):
-                        CallRow(
-                            stop: stop, index: index, vehicle: vehicle, now: now,
-                            occupancy: model.vehicleLoad?.at(stop.ref)
-                        )
+                        Group {
+                            if showsCableService {
+                                HStack {
+                                    Image(systemName: "smallcircle.filled.circle")
+                                        .foregroundStyle(.orange)
+                                    Text(stop.name)
+                                }
+                            } else {
+                                CallRow(
+                                    stop: stop, index: index, vehicle: vehicle, now: now,
+                                    occupancy: model.vehicleLoad?.at(stop.ref)
+                                )
+                            }
+                        }
                             .contentShape(Rectangle())
                             .onTapGesture { open(stop) }
+                            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                                if isWatchable(stop) {
+                                    watchAction(stop, index: index)
+                                }
+                            }
+                            .accessibilityAction(named: watchLabel(stop, index: index)) {
+                                if isWatchable(stop) { pinStop(stop, index: index) }
+                            }
+                            .contextMenu {
+                                if isWatchable(stop) {
+                                    Button {
+                                        pinStop(stop, index: index)
+                                    } label: {
+                                        Label(
+                                            watchLabel(stop, index: index),
+                                            systemImage: "clock.badge"
+                                        )
+                                    }
+                                }
+                            }
                     case let .parting(text):
                         partingRow(text)
                     }
@@ -158,6 +255,7 @@ struct VehiclePanel: View {
                 // and a station name shouted in a picker is unreadable.
                 .textCase(nil)
             }
+            .id("stops")
 
             // Below the stop list. Works scheduled in August are background a
             // reader may want and never the first thing they need — and put at
@@ -168,6 +266,7 @@ struct VehiclePanel: View {
                         DisruptionRow(situation: situation, prominent: false)
                     }
                 }
+                .id("works")
             }
 
             Section {
@@ -175,16 +274,19 @@ struct VehiclePanel: View {
             } header: {
                 Text("Source")
             }
+            .id("source")
+    }
+
+    private var cableServiceDetails: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let frequency = cableSummary?.frequencyText {
+                LabeledContent("Scheduled frequency", value: frequency)
+            }
+            if let duration = cableSummary?.journeyTimeText {
+                LabeledContent("Journey time", value: duration)
+            }
         }
-        .listStyle(.insetGrouped)
-        // A thumb's width of nothing above the line badge, which is what pushed
-        // the next stop off the bottom of the sheet.
-        .contentMargins(.top, 4, for: .scrollContent)
-        .navigationTitle(vehicle.line)
-        .navigationBarTitleDisplayMode(.inline)
-        // A direction picked about one train should not survive the panel
-        // moving on to another.
-        .onChange(of: vehicle.id) { direction = nil }
+        .font(.subheadline)
     }
 
     // MARK: - Which way, for a train that splits
@@ -205,17 +307,20 @@ struct VehiclePanel: View {
     }
 
     private var directions: [Direction] {
-        guard let split, split.portions.count > 1 else { return [] }
+        guard let split else { return [] }
         var out: [Direction] = []
 
         // The reader's own half first, so a train that carries on opens on the
         // stops it was opened to see.
-        if let mine = vehicle.to, !Self.sameStop(mine, split.stopName) {
+        if let mine = vehicle.stops.last?.name, !Self.sameStop(mine, split.stopName) {
             let portion = split.portions.first {
                 $0.destination.map { Self.sameStop($0, mine) } ?? false
+            } ?? split.portions.first {
+                $0.destination.map { !Self.sameStop($0, split.stopName) } ?? false
             }
             out.append(Direction(
-                id: "own", label: mine,
+                id: "own",
+                label: portion?.destination ?? mine,
                 coaches: portion.map { $0.fromPosition...max($0.fromPosition, $0.toPosition) },
                 calls: []
             ))
@@ -240,7 +345,10 @@ struct VehiclePanel: View {
         Menu {
             Picker("Direction", selection: Binding(
                 get: { chosen?.id ?? "" },
-                set: { direction = $0 }
+                set: {
+                    direction = $0
+                    model.preferredSplitJourneyID = model.selectedBranches.first { $0.id == direction }?.journeyID
+                }
             )) {
                 ForEach(directions) { option in
                     Text(option.coaches.map { "\(option.label) · coaches \($0.lowerBound)–\($0.upperBound)" }
@@ -277,10 +385,17 @@ struct VehiclePanel: View {
     /// was found, it is simply the train's own calls — which is what it always
     /// was.
     private var rows: [StopRow] {
-        let own = vehicle.stops.enumerated().map { index, stop in
-            StopRow(id: "own.\(index).\(stop.key)", kind: .call(stop, index))
+        // Extending a through service can prepend calls. An array index made
+        // every existing row new; only count repetitions of the same call key
+        // to disambiguate legs that reuse their visit numbers.
+        var ownVisits: [String: Int] = [:]
+        let own = vehicle.stops.enumerated().compactMap { index, stop -> StopRow? in
+            guard !StopNaming.isTechnical(stop.name) else { return nil }
+            let visit = ownVisits[stop.key, default: 0]
+            ownVisits[stop.key] = visit + 1
+            return StopRow(id: "own.\(stop.key).\(visit)", kind: .call(stop, index))
         }
-        guard let split, split.portions.count > 1,
+        guard let split, splitIsShown,
               let parting = vehicle.stops.firstIndex(where: {
                   Self.sameStop($0.name, split.stopName)
               })
@@ -312,8 +427,14 @@ struct VehiclePanel: View {
         let joined = branch.first.flatMap {
             Self.sameStop($0.name, split.stopName) ? $0 : nil
         }
-        let onward = branch.enumerated().dropFirst(joined == nil ? 0 : 1).map { index, stop in
-            StopRow(id: "branch.\(index).\(stop.key)", kind: .call(stop, index))
+        var branchVisits: [String: Int] = [:]
+        let onward = branch.dropFirst(joined == nil ? 0 : 1).compactMap { stop -> StopRow? in
+            guard !StopNaming.isTechnical(stop.name) else { return nil }
+            // This index is not an index in the trunk snapshot. Let the
+            // branch's times determine its marker instead.
+            let visit = branchVisits[stop.key, default: 0]
+            branchVisits[stop.key] = visit + 1
+            return StopRow(id: "branch.\(stop.key).\(visit)", kind: .call(stop, -1))
         }
 
         var out = Array(own[..<parting])
@@ -369,54 +490,76 @@ struct VehiclePanel: View {
 
     /// Where this train parts company, and which coaches go where.
     ///
-    /// From the formation rather than from the halves the feed could be made to
-    /// give up: the coach goals say a train splits and where its portions are
-    /// bound long before either half can be found as a journey, and half the
-    /// splits in the country never name a journey at all.
-    private var split: TrainFormation.Split? { model.formation?.split }
-
-    /// The destinations of a split that this train's own heading does not
-    /// already name.
-    private var otherDestinations: [String] {
-        (split?.portions ?? []).compactMap(\.destination).filter { destination in
-            guard let mine = vehicle.to else { return true }
-            return !Self.sameStop(mine, destination)
-        }
-    }
-
-    /// Both destinations for a train that splits, one for a train that does not.
+    /// Where this train parts company, and which coaches go where.
     ///
-    /// A reader standing on the platform at Bern is looking at one train, and
-    /// half of it is going somewhere the old heading never mentioned. Two names
-    /// fit a heading; three do not, and where a train parts into more than the
-    /// reader's own half plus one, the halves are left to the line under it.
+    /// `AppModel.vehicleSplit` rather than the formation, and that is the
+    /// difference between a card that says so now and one that says so when a
+    /// network request comes back. The packed through-services name both halves
+    /// offline for every operator in the timetable; the formation service adds
+    /// the coach goals and replaces it when it answers. Reading the formation
+    /// here meant the picker and the branch stops appeared only once the
+    /// drawing did — and never at all for a company that publishes no
+    /// formation.
+    private var split: TrainFormation.Split? {
+        guard let split = model.vehicleSplit, split.isUpcoming(for: vehicle, at: now) else { return nil }
+        return split
+    }
+
+    /// The junction is a change of working, not the passenger destination.
     private var headline: String {
-        guard let mine = vehicle.to else { return "—" }
-        guard otherDestinations.count == 1 else { return mine }
-        return "\(mine) / \(otherDestinations[0])"
-    }
-
-    /// The line under the heading that says a train parts, and what goes where.
-    private var splitNote: String? {
-        guard let split, split.portions.count > 1 else { return nil }
-        let halves = split.portions.compactMap { portion -> String? in
-            guard let destination = portion.destination else { return nil }
-            return "coaches \(portion.fromPosition)–\(portion.toPosition) to \(destination)"
+        guard let split else { return vehicle.displayDestination ?? "—" }
+        var resolved: [Int: String] = [:]
+        for branch in model.selectedBranches {
+            if let position = branch.coaches?.lowerBound, let destination = branch.destination {
+                resolved[position] = destination
+            }
         }
-        guard !halves.isEmpty else { return nil }
-        return "Splits at \(split.stopName) — " + halves.joined(separator: ", ")
+        var names = split.destinations(resolved: resolved)
+        // A half with no coach goal of its own is still somewhere this train
+        // goes. Without this the card that found Zweisimmen as a working and
+        // not as a goal printed "Domodossola (I)" over a stop list offering
+        // both — the title contradicting the picker under it.
+        for branch in model.selectedBranches {
+            guard let destination = branch.destination,
+                  !names.contains(where: { Self.sameStop($0, destination) })
+            else { continue }
+            names.append(destination)
+        }
+        return names.isEmpty ? (vehicle.to ?? "—") : names.joined(separator: " | ")
     }
 
-    private var header: some View {
+    /// Whether there is a parting worth drawing a line across the list for.
+    ///
+    /// Two coach goals say so on their own. One goal, or none, and the
+    /// separation relationship is what said it — RE1 4177 files all twelve
+    /// coaches to Domodossola and parts at Spiez all the same — so the
+    /// evidence is the other half having been found rather than the goals.
+    private var splitIsShown: Bool {
+        guard let split else { return false }
+        return split.portions.count > 1 || !model.selectedBranches.isEmpty
+    }
+
+    /// Destinations already appear in the heading.
+    private var splitNote: String? {
+        guard let split, splitIsShown else { return nil }
+        return "Splits at \(split.stopName)"
+    }
+
+    /// `operatorOnOriginLine` puts the operator at the right-hand end of the
+    /// "from …" row instead of on a line of its own. The landscape columns use
+    /// it: the origin is the last thing the left column has to say, and a
+    /// fainter line under it made that column outrun the right one, leaving a
+    /// hole beside the quietest word on the card. See `columnOverview`.
+    private func header(operatorOnOriginLine: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                LineBadge(line: vehicle.line, mode: vehicle.mode)
+                LineBadge(line: vehicle.displayLine, mode: vehicle.mode)
                 Text(headline).font(.headline)
                 Spacer()
-                if let delay = Format.delay(vehicle.delay) {
+                if !showsCableService, let delay = Format.delay(vehicle.delay, mode: vehicle.mode) {
                     Text(delay)
                         .font(.subheadline.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(vehicle.delay! > 0 ? .orange : .green)
+                        .foregroundStyle(Format.delayColor)
                 }
             }
             if let splitNote {
@@ -427,13 +570,12 @@ struct VehiclePanel: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if let arrivedAs, shouldShowArrivalAs(arrivedAs) {
+            if let arrivedAs = arrivedAs ?? (vehicle.isTurningAround ? vehicle : nil),
+               shouldShowArrivalAs(arrivedAs) {
                 // Said out loud, because otherwise the panel simply *is* a
                 // different train from the one that was tapped. A terminating
-                // S6 is shown as the S52 it leaves as — which is the departure
-                // anybody on that platform is waiting for — while the map keeps
-                // its ring on the dot labelled S6, and with nothing joining the
-                // two that reads as the wrong train, not as a turnback.
+                // S6 is shown as the S52 it leaves as on both map and card;
+                // retain the arriving name to explain that change.
                 Label(
                     "Arrived as \(arrivedAs.line) from \(arrivedAs.from)",
                     systemImage: "arrow.uturn.left"
@@ -441,17 +583,29 @@ struct VehiclePanel: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
-            if !startsWhereItStands {
+            if showsOriginLine {
                 // Left off where the train is standing at the station it
                 // started from: "from Bern" directly above "AT THIS STOP ·
                 // Bern" is the same word twice, and the second one is the one
                 // carrying information.
-                Text("from \(vehicle.from)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("from \(vehicle.from)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    if operatorOnOriginLine, let operatorName = vehicle.operatorName {
+                        Spacer(minLength: 6)
+                        Text(operatorName)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                }
             }
-            if let operatorName = vehicle.operatorName {
-                Text(vehicle.operatorFull ?? operatorName)
+            // A line of its own only where it has nowhere else to go: the
+            // stacked card, or a working standing at the station it starts
+            // from, whose origin line the header has already suppressed.
+            if !(operatorOnOriginLine && showsOriginLine), let operatorName = vehicle.operatorName {
+                Text(operatorName)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -463,7 +617,7 @@ struct VehiclePanel: View {
             // A run nobody can look up is exactly the one a passenger doubts,
             // so it says so rather than passing itself off as timetabled.
             if vehicle.extra {
-                Label("Unscheduled service", systemImage: "plus.circle.fill")
+                Text("Unscheduled service")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.teal)
             }
@@ -491,6 +645,10 @@ struct VehiclePanel: View {
         }
     }
 
+    /// Whether the header names where this working came from. Left off where
+    /// the train is standing at the station it starts from — see `header`.
+    private var showsOriginLine: Bool { showsCableService || !startsWhereItStands }
+
     /// Whether the train is standing at the station it starts from.
     private var startsWhereItStands: Bool {
         guard !vehicle.moving, vehicle.stops.indices.contains(vehicle.index) else { return false }
@@ -502,7 +660,8 @@ struct VehiclePanel: View {
     /// useful distinction (for example, "3 from Weissenbühl" above "3
     /// Weissenbühl").
     private func shouldShowArrivalAs(_ arrivedAs: VehicleSnapshot) -> Bool {
-        guard let destination = vehicle.to else { return true }
+        if arrivedAs.line != vehicle.displayLine { return true }
+        guard let destination = vehicle.displayDestination else { return true }
         return !Self.sameStop(destination, arrivedAs.from)
     }
 
@@ -523,13 +682,99 @@ struct VehiclePanel: View {
         return key(a) == key(b)
     }
 
+    @ViewBuilder
+    private var overviewCard: some View {
+        if usesColumns, !showsCableService {
+            columnOverview
+        } else {
+            stackedOverview
+        }
+    }
+
+    private var stackedOverview: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            header()
+            Divider()
+            if showsCableService {
+                cableServiceDetails
+            } else {
+                journeyAhead
+                if vehicle.mode == .cable, let frequency = cableSummary?.frequencyText {
+                    Divider()
+                    LabeledContent("Scheduled frequency", value: frequency)
+                        .font(.subheadline)
+                }
+            }
+        }
+    }
+
+    /// Destination on the left, next stop and occupancy on the right — occupancy
+    /// sits with the next call so the left column does not grow a third row.
+    private var columnOverview: some View {
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Going to".uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                header(operatorOnOriginLine: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.trailing, 12)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                nextStopColumn
+                if let ahead = model.vehicleLoad?.ahead(of: vehicle.index, in: vehicle.stops) {
+                    OccupancySummary(occupancy: ahead)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 12)
+        }
+    }
+
+    @ViewBuilder
+    private var nextStopColumn: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let index = boardDepartureIndex, index + 1 < vehicle.stops.count {
+                let next = vehicle.stops[index + 1]
+                block(
+                    caption: isTerminalStop(index + 1) ? "Terminal stop" : "Next stop",
+                    trailing: nil,
+                    stop: next,
+                    phrase: "arrives",
+                    at: next.displayedArrival
+                )
+            } else if boardDepartureIndex == nil, let next = nextIndex {
+                let stop = vehicle.stops[next]
+                block(
+                    caption: isTerminalStop(next) ? "Terminal stop" : "Next stop",
+                    trailing: vehicle.moving ? "\(Int(vehicle.speed)) km/h" : nil,
+                    stop: stop,
+                    phrase: "arrives",
+                    at: stop.displayedArrival
+                )
+            } else if !vehicle.moving, vehicle.stops.indices.contains(vehicle.index) {
+                let stop = vehicle.stops[vehicle.index]
+                block(
+                    caption: atTerminus ? "Terminal stop" : "Currently at",
+                    trailing: nil,
+                    stop: stop,
+                    detail: standingDetail,
+                    delayed: Format.delay(stop.delay, mode: vehicle.mode) != nil
+                )
+            }
+        }
+    }
+
     /// What happens next, which is the whole of what this panel is for.
     ///
     /// It used to open with departure, arrival, stop count and speed. Three of
     /// those are written again in the call list a thumb's width below — the
     /// first line and the last line of it — and the fourth answers a question
     /// nobody standing on a platform is asking. What they are asking is where
-    /// this thing stops next, when, and which side to stand on.
+    /// this thing stops next, and when.
     @ViewBuilder
     private var journeyAhead: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -546,54 +791,67 @@ struct VehiclePanel: View {
                     caption: "Departure",
                     trailing: nil,
                     stop: stop,
-                    detail: "departs \(Format.time(stop.dep)) · \(when(stop.dep))",
-                    side: nil
+                    phrase: "departs",
+                    at: stop.expectedDeparture
                 )
                 if index + 1 < vehicle.stops.count {
                     Divider()
                     let next = vehicle.stops[index + 1]
                     block(
-                        caption: index + 1 == vehicle.stops.count - 1
+                        caption: isTerminalStop(index + 1)
                             ? "Terminal stop" : "Next stop",
                         trailing: nil,
                         stop: next,
-                        detail: "arrives \(Format.time(next.arr)) · \(when(next.arr))",
-                        side: vehicle.platformSide(at: index + 1)
+                        phrase: "arrives",
+                        at: next.displayedArrival
                     )
                 }
             } else if !vehicle.moving, vehicle.stops.indices.contains(vehicle.index) {
+                let stop = vehicle.stops[vehicle.index]
                 block(
                     caption: atTerminus ? "Terminal stop" : "Currently at",
                     trailing: nil,
-                    stop: vehicle.stops[vehicle.index],
+                    stop: stop,
                     detail: standingDetail,
-                    side: nil
+                    delayed: Format.delay(stop.delay, mode: vehicle.mode) != nil
                 )
             }
             if boardDepartureIndex == nil, let next = nextIndex {
                 if !vehicle.moving { Divider() }
                 let stop = vehicle.stops[next]
                 block(
-                    caption: next == vehicle.stops.count - 1 ? "Terminal stop" : "Next stop",
+                    caption: isTerminalStop(next) ? "Terminal stop" : "Next stop",
                     // The one number worth keeping from the old row, and this is
                     // where it belongs: beside the arrival it explains.
                     trailing: vehicle.moving ? "\(Int(vehicle.speed)) km/h" : nil,
                     stop: stop,
-                    detail: "arrives \(Format.time(stop.arr)) · \(when(stop.arr))",
-                    side: vehicle.platformSide(at: next)
+                    phrase: "arrives",
+                    at: stop.displayedArrival
                 )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// One stop, said in full: what it is, which platform, when, which side.
+    /// One stop, said in full: what it is, which platform, when.
     ///
     /// Tappable, like every other stop this panel names — the question a reader
     /// has next is what else calls there, and it was answerable from the list
     /// below but not from the one line about it above.
     private func block(
-        caption: String, trailing: String?, stop: Call, detail: String, side: PlatformSide?
+        caption: String, trailing: String?, stop: Call, phrase: String, at time: Timestamp
+    ) -> some View {
+        block(
+            caption: caption,
+            trailing: trailing,
+            stop: stop,
+            detail: "\(phrase) \(Format.time(time)) · \(when(time))",
+            delayed: Format.delay(stop.delay, mode: vehicle.mode) != nil
+        )
+    }
+
+    private func block(
+        caption: String, trailing: String?, stop: Call, detail: String, delayed: Bool = false
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
@@ -614,21 +872,7 @@ struct VehiclePanel: View {
             }
             Text(detail)
                 .font(.subheadline.monospacedDigit())
-                .foregroundStyle(.secondary)
-            if let side {
-                // The arrow sits on the side it is pointing at: leading it for a
-                // left-hand exit, trailing it for a right-hand one, so the row
-                // reads as the gesture it describes rather than as a label with
-                // a fixed icon well.
-                let arrow = Image(systemName: side == .left ? "arrow.left" : "arrow.right")
-                HStack(spacing: 6) {
-                    if side == .left { arrow }
-                    Text(side == .left ? "Exit on the left" : "Exit on the right")
-                    if side == .right { arrow }
-                }
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-            }
+                .foregroundStyle(delayed ? Format.delayColor : Color.secondary)
         }
         .contentShape(Rectangle())
         .onTapGesture { open(stop) }
@@ -639,6 +883,49 @@ struct VehiclePanel: View {
     /// The question a reader has next: this train stops there — what else does?
     private func open(_ stop: Call) {
         Task { await model.selectStation(call: stop) }
+    }
+
+    /// A past call has already happened; pinning it would be a countdown to a
+    /// time behind the clock.
+    private func isWatchable(_ stop: Call) -> Bool {
+        if stop.cancelled || StopNaming.isTechnical(stop.name) { return false }
+        return stop.displayedArrival >= now - 30 || stop.dep >= now - 30
+    }
+
+    /// The origin, or a halt the vehicle is still standing at: the live
+    /// question is when it leaves, not when it arrived.
+    private func watchesDeparture(_ stop: Call, index: Int) -> Bool {
+        if !vehicle.moving, vehicle.index == index { return true }
+        return index == 0 && stop.dep >= now - 30
+    }
+
+    private func watchLabel(_ stop: Call, index: Int) -> String {
+        watchesDeparture(stop, index: index) ? "Watch departure" : "Watch arrival"
+    }
+
+    private func watchAction(_ stop: Call, index: Int) -> some View {
+        Button {
+            pinStop(stop, index: index)
+        } label: {
+            Image(systemName: "clock.badge")
+        }
+        .tint(.orange)
+        .accessibilityLabel(watchLabel(stop, index: index))
+        .accessibilityIdentifier(watchLabel(stop, index: index))
+    }
+
+    private func pinStop(_ stop: Call, index: Int) {
+        Task {
+            if watchesDeparture(stop, index: index) {
+                await model.liveActivities.watchDeparture(
+                    vehicle: vehicle, stop: stop, now: now
+                )
+            } else {
+                await model.liveActivities.watchArrival(
+                    vehicle: vehicle, stop: stop, now: now
+                )
+            }
+        }
     }
 
     /// The stop the formation is drawn for: the one the card above it is
@@ -674,7 +961,16 @@ struct VehiclePanel: View {
             .min { a, b in a.distance(from: when) < b.distance(from: when) }
     }
 
-    private var atTerminus: Bool { vehicle.index == vehicle.stops.count - 1 }
+    private func isTerminalStop(_ index: Int) -> Bool {
+        guard index == vehicle.stops.count - 1, vehicle.stops.indices.contains(index) else { return false }
+        if let split, Self.sameStop(vehicle.stops[index].name, split.stopName),
+           split.portions.contains(where: { portion in
+               portion.destination.map { !Self.sameStop($0, split.stopName) } ?? false
+           }) { return false }
+        return true
+    }
+
+    private var atTerminus: Bool { isTerminalStop(vehicle.index) }
 
     /// Match the board row by its published departure, not by name: one
     /// journey may call at two stops with similar names, while this timestamp
@@ -685,10 +981,17 @@ struct VehiclePanel: View {
     }
 
     private var nextIndex: Int? {
-        // Standing at call `i` or running the leg out of it, the stop ahead is
-        // the same one either way.
-        let next = vehicle.index + 1
-        return next < vehicle.stops.count ? next : nil
+        let upcoming = Positioning.nextStopIndex(vehicle.stops, at: now)
+        // Standing at a platform: the next stop is the one after this call,
+        // never the same name twice ("Currently at Kiesen" / "Next stop Kiesen").
+        if !vehicle.moving, vehicle.stops.indices.contains(vehicle.index),
+           upcoming == nil || upcoming! <= vehicle.index {
+            return vehicle.stops.indices[(vehicle.index + 1)...].first { i in
+                let stop = vehicle.stops[i]
+                return !stop.cancelled && !StopNaming.isTechnical(stop.name)
+            }
+        }
+        return upcoming
     }
 
     /// What the vehicle standing here is doing, in the fewest words that stay
@@ -712,20 +1015,12 @@ struct VehiclePanel: View {
             guard shown > stop.arr else { return arrived }
             return "\(arrived) · stands until \(Format.time(shown))"
         }
-        return "departs \(Format.time(stop.dep)) · \(when(stop.dep))"
+        return "departs \(Format.time(stop.expectedDeparture)) · \(when(stop.expectedDeparture))"
     }
 
-    /// "in 4 min", "now", "2 min ago".
-    ///
-    /// The same words as `Format.relative`, which stops at an hour and prints a
-    /// clock time instead: on a board that is right beside the time it replaces,
-    /// and in a sentence it is a gap.
+    /// Use the same relative duration in the card and the station board.
     private func when(_ stamp: Timestamp) -> String {
-        let minutes = Int((Double(stamp - now) / 60).rounded())
-        if minutes == 0 { return "now" }
-        if minutes < 0 { return "\(-minutes) min ago" }
-        if minutes < 60 { return "in \(minutes) min" }
-        return "in \(minutes / 60) h \(minutes % 60) min"
+        Format.relative(stamp, from: now)
     }
 
     /// The panel says which of the three sources is in play, because the
@@ -734,37 +1029,55 @@ struct VehiclePanel: View {
     @ViewBuilder
     private var geometryNote: some View {
         let geometry = vehicle.geometry
-        let mapped = geometry?.legSources.count { $0 == .route } ?? 0
-        let routed = geometry?.legSources.count { $0 == .graph } ?? 0
-        let straight = geometry?.legSources.count { $0 == .chord } ?? 0
-        let total = max(1, mapped + routed + straight)
-
-        VStack(alignment: .leading, spacing: 8) {
-            if geometry == nil {
-                if boardDeparture != nil {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Loading mapped route…")
-                    }
-                    .font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Text("No data yet.")
-                        .font(.caption).foregroundStyle(.secondary)
+        let branch = model.selectedBranches.first { $0.id == chosen?.id }
+        VStack(alignment: .leading, spacing: 12) {
+            if let geometry {
+                geometryDetails(geometry)
+            } else if model.selectedGeometryLoading {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading mapped route…")
                 }
+                .font(.caption).foregroundStyle(.secondary)
             } else {
+                Text("Route data unavailable.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let branchGeometry = branch?.geometry, branchGeometry != geometry {
+                Divider()
+                if let destination = branch?.destination {
+                    Text(destination).font(.caption.weight(.medium))
+                }
+                geometryDetails(branchGeometry)
+            }
+        }
+    }
+
+    private func geometryDetails(_ geometry: JourneyGeometry) -> some View {
+        let mapped = geometry.legSources.count { $0 == .route }
+        let routed = geometry.legSources.count { $0 == .graph }
+        let straight = geometry.legSources.count { $0 == .chord }
+        let total = max(1, mapped + routed + straight)
+        return VStack(alignment: .leading, spacing: 8) {
+            if let relation = geometry.relation, relation > 0,
+               let url = URL(string: "https://www.openstreetmap.org/relation/\(relation)") {
+                Link(destination: url) {
+                    sourceRow("Mapped OSM route", mapped, total, .green,
+                              "Open route in OpenStreetMap ↗")
+                }
+                .buttonStyle(.plain)
+            } else if mapped > 0 {
                 sourceRow("Mapped OSM route", mapped, total, .green,
                           "Full detail available.")
-                if routed > 0 {
-                    sourceRow("Auto routed", routed, total, .yellow,
-                              "Inferred track.")
-                }
-                if straight > 0 {
-                    sourceRow("Straight line", straight, total, .orange,
-                              "Not possible to route.")
-                }
-                if let name = geometry?.routeName {
-                    Text(name).font(.caption).foregroundStyle(.tertiary)
-                }
+            }
+            if routed > 0 {
+                sourceRow("Auto routed", routed, total, .yellow, "Inferred track.")
+            }
+            if straight > 0 {
+                sourceRow("Straight line", straight, total, .orange, "Not possible to route.")
+            }
+            if let name = geometry.routeName {
+                Text(name).font(.caption).foregroundStyle(.tertiary)
             }
         }
     }
@@ -812,10 +1125,17 @@ struct CallRow: View {
             marker
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(stop.name)
-                    .font(.callout)
-                    .strikethrough(stop.cancelled, color: .red)
-                    .foregroundStyle(nameColour)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(stop.name)
+                        .font(.callout)
+                        .strikethrough(stop.cancelled, color: .red)
+                        .foregroundStyle(nameColour)
+                    if !stop.cancelled, let delay = Format.delay(stop.delay, mode: vehicle.mode) {
+                        Text(delay)
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(Format.delayColor)
+                    }
+                }
                 // Said in words as well as struck through: a strikethrough is
                 // a style, and a style is not a statement — at a glance down a
                 // column of thirty rows it reads as emphasis of some kind
@@ -823,7 +1143,7 @@ struct CallRow: View {
                 if stop.cancelled {
                     Text("Cancelled").font(.caption2).foregroundStyle(.red)
                 } else if stop.extra {
-                    Text("Additional stop").font(.caption2).foregroundStyle(.teal)
+                    Text("Exceptional stop").font(.caption2).foregroundStyle(.red)
                 }
                 if let note = Format.note(stop.note) {
                     Text(note).font(.caption2).foregroundStyle(.tertiary)
@@ -840,17 +1160,17 @@ struct CallRow: View {
             PlatformChip(stop: stop)
 
             VStack(alignment: .trailing, spacing: 1) {
-                Text(times)
+                Text(originalTimes)
                     .font(.callout.monospacedDigit())
                     // The time is the timetable's, and the timetable is what
                     // has been withdrawn; printed plainly it is a promise the
                     // vehicle will not keep.
                     .strikethrough(stop.cancelled, color: .red)
                     .foregroundStyle(stop.cancelled ? Color.secondary : .primary)
-                if let delay = Format.delay(stop.delay) {
-                    Text(delay)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.orange)
+                if let live = delayedTimes {
+                    Text(live)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(Format.delayColor)
                 }
             }
         }
@@ -870,10 +1190,33 @@ struct CallRow: View {
     ///
     /// The departure rather than the arrival, because it is the one a passenger
     /// acts on: miss it and the train is gone.
-    private var times: String {
-        stop.dep - stop.arr <= Self.dwellWorthTwoTimes
-            ? Format.time(stop.dep)
-            : "\(Format.time(stop.arr))–\(Format.time(stop.dep))"
+    private func times(arr: Timestamp, dep: Timestamp) -> String {
+        dep - arr <= Self.dwellWorthTwoTimes
+            ? Format.time(dep)
+            : "\(Format.time(arr))–\(Format.time(dep))"
+    }
+
+    /// Printed slot, before delay. The live clock sits underneath in orange.
+    private var originalTimes: String {
+        times(arr: originalArr, dep: originalDep)
+    }
+
+    /// Live arrival/departure, only when it differs from the printed slot.
+    private var delayedTimes: String? {
+        guard Format.delay(stop.delay, mode: vehicle.mode) != nil else { return nil }
+        let live = times(arr: stop.arr, dep: stop.dep)
+        return live == originalTimes ? nil : live
+    }
+
+    private var originalDep: Timestamp {
+        if let sched = stop.sched { return sched }
+        if let delay = stop.delay, delay > 0 { return stop.dep - delay * 60 }
+        return stop.dep
+    }
+
+    private var originalArr: Timestamp {
+        let dwell = max(0, stop.dep - stop.arr)
+        return originalDep - dwell
     }
 
     /// The dot lights up once the call is behind the vehicle.
@@ -937,8 +1280,13 @@ struct LineBadge: View {
     let line: String
     let mode: Mode
 
+    private var label: String {
+        let published = Journey.publishedLine(line, mode: mode)
+        return published.isEmpty ? "ext" : published
+    }
+
     var body: some View {
-        Text(line)
+        Text(label)
             .font(.caption.weight(.bold))
             // One line, always. The line column on a board is a fixed width, so
             // a designation the length of `BN-M75` wrapped inside the plate and

@@ -110,25 +110,34 @@ public actor SituationService {
 
     /// Everything wrong with one vehicle at one moment.
     ///
-    /// Three joins, strongest first, and only the first of them is exact:
-    ///
-    /// - **By journey id.** The works catalogue names the individual journeys
-    ///   it affects with the same reference the estimated timetable keys on, so
-    ///   this is an identity, not a guess.
-    /// - **By stop place.** A notice about a closed stop is about every vehicle
-    ///   that calls there.
-    /// - **By line and operator.** The incident wire carries no journey
-    ///   references at all, and its `LineRef` is in the Swiss `85:…` numbering
-    ///   the timetable never uses — so the only thing left to join on is the
-    ///   number on the front, qualified by who runs it.
+    /// Explicit journey references take precedence. Otherwise, every supplied
+    /// stop, line and operator restriction must agree: sharing Bern does not
+    /// make an RE1 affected by works on S5/S52. Line-only notices are qualified
+    /// by operator because published line numbers are not nationally unique.
     public func forVehicle(
         id: String, parts: [String] = [], line: String, operatorName: String?,
-        stopRefs: [String], at moment: Timestamp
+        stopRefs: [String], journeyRefs: [String] = [], at moment: Timestamp
     ) -> [Situation] {
-        var found = Set<Int>()
-        for journey in [id] + parts { found.formUnion(byJourney[journey] ?? []) }
-        for ref in stopRefs { found.formUnion(byStopPlace[StopRegister.stationOf(ref)] ?? []) }
-        if let operatorName { found.formUnion(byLine["\(line)|\(operatorName)"] ?? []) }
+        let journeys = Set([id] + parts + journeyRefs)
+        let stops = Set(stopRefs.map { StopRegister.stationOf($0) })
+        var exact = Set<Int>()
+        for journey in journeys { exact.formUnion(byJourney[journey] ?? []) }
+        var candidates = exact
+        for ref in stops { candidates.formUnion(byStopPlace[ref] ?? []) }
+        if let operatorName { candidates.formUnion(byLine["\(line)|\(operatorName)"] ?? []) }
+        let found = candidates.filter { index in
+            let notice = situations[index]
+            if !notice.journeys.isEmpty { return exact.contains(index) }
+            if !notice.lines.isEmpty && !notice.lines.contains(line) { return false }
+            if !notice.operators.isEmpty {
+                guard let operatorName,
+                      notice.operators.contains(where: { self.operatorName($0) == operatorName })
+                else { return false }
+            }
+            return notice.stopPlaces.isEmpty || notice.stopPlaces.contains {
+                stops.contains(StopRegister.stationOf($0))
+            }
+        }
         return resolve(found, at: moment)
     }
 
@@ -159,8 +168,16 @@ public actor SituationService {
     ///
     /// Returns whether anything changed, so a caller can avoid rebuilding a
     /// view for a refresh that found the same notices as last time.
+    ///
+    /// `allowPlanned` is the launch valve. The works catalogue is 4 MB on the
+    /// wire and ~113 MB of XML to parse, and a session used to pay that on
+    /// every cold start because the timers were not restored. The map does
+    /// not need it to open; the caller lets this through once the first frame
+    /// is up and the radio is cheap.
     @discardableResult
-    public func refresh(now: Date = Date(), force: Bool = false) async -> Bool {
+    public func refresh(
+        now: Date = Date(), force: Bool = false, allowPlanned: Bool = true
+    ) async -> Bool {
         guard client != nil else { return false }
         var changed = false
 
@@ -171,8 +188,8 @@ public actor SituationService {
                 unplannedAt = now
             }
         }
-        if includesPlanned,
-           force || plannedAt.map({ now.timeIntervalSince($0) >= Self.plannedInterval }) ?? true {
+        if includesPlanned, allowPlanned,
+           force || plannedRefreshDue(at: now) {
             if let fresh = await load(OTDClient.siriSx, planned: true, now: now) {
                 changed = changed || fresh != planned
                 planned = fresh
@@ -182,6 +199,11 @@ public actor SituationService {
 
         if changed { reindex(); save() }
         return changed
+    }
+
+    /// Whether the six-hour works catalogue is due another download.
+    public func plannedRefreshDue(at now: Date = Date()) -> Bool {
+        plannedAt.map { now.timeIntervalSince($0) >= Self.plannedInterval } ?? true
     }
 
     private func load(_ api: OTDClient.API, planned: Bool, now: Date) async -> [Situation]? {
@@ -253,27 +275,47 @@ public actor SituationService {
               let held = try? JSONDecoder().decode(Held.self, from: data)
         else { return }
 
+        let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate
         unplanned = held.unplanned
+        // Restored, so a force-quit five minutes later does not spend another
+        // request on incidents the file already holds. The two-minute cadence
+        // still fires once the stamp is old.
+        unplannedAt = held.unplannedAt ?? modified
         // Only if it is wanted. A stored catalogue from a session when this was
         // on would otherwise be silently indexed on every later launch, which
         // is the toggle appearing not to work.
-        planned = includesPlanned ? held.planned : []
-        // The timers are *not* restored: a launch should ask, and the stored
-        // copy exists to fill the seconds before the answer, not to excuse not
-        // asking. The planned half is the exception in spirit — six hours is
-        // long — but a cheap re-read of something already parsed is not worth a
-        // special case.
+        if includesPlanned {
+            planned = held.planned
+            // Six hours, and the whole point of keeping the catalogue on disk.
+            // Without this stamp a launch always treated the works feed as due
+            // and parsed 113 MB of XML in front of a map that had already
+            // opened — the minute or two that a cold start seemed to hang
+            // after the curtain dropped.
+            plannedAt = held.plannedAt ?? modified
+        } else {
+            planned = []
+            plannedAt = nil
+            if !held.planned.isEmpty { save() }
+        }
         reindex()
     }
 
     private struct Held: Codable {
         var unplanned: [Situation]
         var planned: [Situation]
+        var unplannedAt: Date?
+        var plannedAt: Date?
     }
 
     private func save() {
         guard let file = store?.appendingPathComponent("situations.json"),
-              let data = try? JSONEncoder().encode(Held(unplanned: unplanned, planned: planned))
+              let data = try? JSONEncoder().encode(
+                Held(
+                    unplanned: unplanned, planned: planned,
+                    unplannedAt: unplannedAt, plannedAt: plannedAt
+                )
+              )
         else { return }
         try? data.write(to: file, options: .atomic)
     }
